@@ -16,6 +16,127 @@ import requests
 import threading
 import webbrowser
 from pathlib import Path
+import ssl
+import certifi
+from datetime import datetime
+import pickle
+import random
+from PIL import Image, ImageTk
+
+
+# ===================================================================
+# ОПРЕДЕЛЕНИЕ ПУТИ К ФАЙЛУ НАСТРОЕК
+# ===================================================================
+
+def get_settings_path():
+    """Возвращает ЕДИНЫЙ путь к файлу настроек"""
+    docs_path = os.path.join(os.path.expanduser("~"), "Documents", "67Launcher")
+
+    try:
+        os.makedirs(docs_path, exist_ok=True)
+    except:
+        pass
+
+    settings_path = os.path.join(docs_path, "launcher_settings.json")
+    return settings_path
+
+
+# ===================================================================
+# FIX SSL ДЛЯ WINDOWS И PYINSTALLER
+# ===================================================================
+
+def get_resource_path(relative_path):
+    """Получает правильный путь к ресурсам для PyInstaller"""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+def get_cert_path():
+    """Находит путь к сертификату"""
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    cert_path = os.path.join(exe_dir, "cacert.pem")
+    if os.path.exists(cert_path):
+        return cert_path
+
+    cert_path = os.path.join(os.path.dirname(exe_dir), "cacert.pem")
+    if os.path.exists(cert_path):
+        return cert_path
+
+    cert_path = os.path.join(os.getcwd(), "cacert.pem")
+    if os.path.exists(cert_path):
+        return cert_path
+
+    try:
+        cert_path = get_resource_path("cacert.pem")
+        if os.path.exists(cert_path):
+            return cert_path
+    except:
+        pass
+
+    try:
+        import certifi
+        return certifi.where()
+    except:
+        return None
+
+
+def fix_ssl_for_windows():
+    """Исправляет проблемы с SSL на Windows"""
+    try:
+        cert_path = get_cert_path()
+
+        if cert_path and os.path.exists(cert_path):
+            print(f"✅ Найден сертификат: {cert_path}")
+            os.environ['SSL_CERT_FILE'] = cert_path
+            os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+
+            ssl_context = ssl.create_default_context(cafile=cert_path)
+
+            try:
+                import urllib.request
+                https_handler = urllib.request.HTTPSHandler(context=ssl_context)
+                opener = urllib.request.build_opener(https_handler)
+                urllib.request.install_opener(opener)
+            except:
+                pass
+
+            try:
+                import requests
+                requests.packages.urllib3.disable_warnings()
+                session = requests.Session()
+                session.verify = cert_path
+                requests.sessions.session = lambda: session
+            except:
+                pass
+
+            try:
+                import certifi
+                if hasattr(certifi, 'where'):
+                    def new_where():
+                        return cert_path
+
+                    certifi.where = new_where
+            except:
+                pass
+
+            print("✅ SSL fix applied")
+            return True
+        else:
+            return False
+
+    except Exception as e:
+        print(f"⚠️ SSL fix error: {e}")
+        return False
+
+
+if sys.platform == "win32":
+    try:
+        fix_ssl_for_windows()
+    except Exception as e:
+        print(f"⚠️ SSL fix error: {e}")
 
 # ===================================================================
 # НАСТРОЙКА ВНЕШНЕГО ВИДА
@@ -28,27 +149,45 @@ ctk.set_default_color_theme("blue")
 # 1. НАСТРОЙКИ И ПЕРЕМЕННЫЕ
 # ===================================================================
 
-GAME_DIR = os.path.join(os.environ['APPDATA'], ".ionux")
+DEFAULT_GAME_DIR = os.path.join(os.environ['APPDATA'], ".minecraft")
+GAME_DIR = DEFAULT_GAME_DIR
 MINECRAFT_DIR = GAME_DIR
+
+# Файлы настроек
+SETTINGS_FILE = get_settings_path()
+STATS_FILE = os.path.join(os.path.dirname(SETTINGS_FILE), "launcher_stats.json")
 
 ACCOUNTS_FILE = os.path.join(MINECRAFT_DIR, "accounts.json")
 PROFILES_FILE = os.path.join(MINECRAFT_DIR, "profile.json")
 LAUNCHER_PROFILES_FILE = os.path.join(MINECRAFT_DIR, "launcher_profiles.json")
 
 REQUIRED_FOLDERS = [
-    "assets",
-    "config",
-    "libraries",
-    "logs",
-    "mods",
-    "resourcepacks",
-    "resources",
-    "runtime",
-    "saves",
-    "stats",
-    "texturepacks",
-    "versions"
+    "assets", "config", "libraries", "logs", "mods",
+    "resourcepacks", "resources", "runtime", "saves",
+    "skins", "stats", "texturepacks", "versions"
 ]
+
+
+# ПРИНУДИТЕЛЬНО ИСПРАВЛЯЕМ ПУТЬ В НАСТРОЙКАХ
+def fix_game_path():
+    """Принудительно исправляет путь к папке игры в настройках"""
+    settings_path = SETTINGS_FILE
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+
+            old_path = settings.get("game_dir", "")
+            if ".ionux" in old_path or old_path != DEFAULT_GAME_DIR:
+                settings["game_dir"] = DEFAULT_GAME_DIR
+                with open(settings_path, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, indent=2, ensure_ascii=False)
+                print(f"✅ Путь исправлен с '{old_path}' на '{DEFAULT_GAME_DIR}'")
+        except Exception as e:
+            print(f"⚠️ Ошибка исправления пути: {e}")
+
+
+fix_game_path()
 
 log_callback = None
 
@@ -64,6 +203,130 @@ def log_message(message):
         log_callback(message)
 
 
+# ===================================================================
+# 2. РАБОТА С НАСТРОЙКАМИ ЛАУНЧЕРА
+# ===================================================================
+
+def load_launcher_settings():
+    """Загружает настройки лаунчера"""
+    default_settings = {
+        "game_dir": DEFAULT_GAME_DIR,
+        "last_version": "",
+        "last_account": "",
+        "last_skin": "",
+        "ram": "2G",
+        "java_path": "",
+        "snapshots": False,
+        "launch_count": 0,
+        "hygiene_reminders": True,
+        "support_shown_5": False,
+        "theme": "dark"
+    }
+
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+
+                if 'support_shown' in settings:
+                    del settings['support_shown']
+
+                for key in default_settings:
+                    if key not in settings:
+                        settings[key] = default_settings[key]
+
+                return settings
+        except Exception as e:
+            return default_settings
+    else:
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(default_settings, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+        return default_settings
+
+
+def save_launcher_settings(settings):
+    """Сохраняет настройки лаунчера"""
+    try:
+        if 'support_shown' in settings:
+            del settings['support_shown']
+
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+
+        return True
+    except Exception as e:
+        return False
+
+
+# ===================================================================
+# 3. СТАТИСТИКА
+# ===================================================================
+
+def load_stats():
+    default_stats = {
+        "launches": 0,
+        "total_play_time": 0,
+        "last_launch": None,
+        "launch_history": []
+    }
+
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                stats = json.load(f)
+                return stats
+        except:
+            return default_stats
+    return default_stats
+
+
+def save_stats(stats):
+    try:
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        return False
+
+
+def update_stats():
+    stats = load_stats()
+    stats["launches"] += 1
+    stats["last_launch"] = datetime.now().isoformat()
+    stats["launch_history"].append({
+        "time": datetime.now().isoformat(),
+        "version": LauncherApp.instance.version_combo.get() if hasattr(LauncherApp.instance,
+                                                                       'version_combo') else "unknown"
+    })
+    if len(stats["launch_history"]) > 100:
+        stats["launch_history"] = stats["launch_history"][-100:]
+    save_stats(stats)
+
+    if LauncherApp.instance:
+        LauncherApp.instance.update_info_display()
+        LauncherApp.instance.update_subtitle()
+
+
+def update_play_time(seconds):
+    stats = load_stats()
+    stats["total_play_time"] = stats.get("total_play_time", 0) + seconds
+    save_stats(stats)
+
+    if LauncherApp.instance:
+        LauncherApp.instance.stats = stats
+        LauncherApp.instance.update_info_display()
+
+
+# ===================================================================
+# 4. РАБОТА С ПАПКОЙ ИГРЫ
+# ===================================================================
+
 def create_launcher_profiles():
     launcher_profiles = {
         "profiles": {},
@@ -73,30 +336,28 @@ def create_launcher_profiles():
             "keepLauncherOpen": False
         },
         "selectedProfile": "Latest Release",
-        "clientToken": "ionux-launcher-token",
+        "clientToken": "67-launcher-token",
         "authenticationDatabase": {}
     }
 
     os.makedirs(os.path.dirname(LAUNCHER_PROFILES_FILE), exist_ok=True)
     with open(LAUNCHER_PROFILES_FILE, 'w', encoding='utf-8') as f:
         json.dump(launcher_profiles, f, indent=2)
-    log_message("✅ Создан launcher_profiles.json")
 
 
 def cleanup_forge_temp():
-    """Удаляет временные папки Forge, которые могли остаться после ошибки"""
     temp_dir = tempfile.gettempdir()
     for item in os.listdir(temp_dir):
-        if item.startswith("minecraft-launcher-lib-forge"):
+        if item.startswith("minecraft-launcher-lib-forge") or item.startswith("minecraft-launcher-lib-fabric"):
             temp_path = os.path.join(temp_dir, item)
             try:
                 shutil.rmtree(temp_path, ignore_errors=True)
-                log_message(f"🧹 Очищена временная папка: {temp_path}")
             except Exception:
                 pass
 
 
 def ensure_game_folder_structure():
+    global MINECRAFT_DIR
     os.makedirs(MINECRAFT_DIR, exist_ok=True)
     for folder in REQUIRED_FOLDERS:
         folder_path = os.path.join(MINECRAFT_DIR, folder)
@@ -124,11 +385,9 @@ def ensure_game_folder_structure():
                 elif filename.endswith('.dat'):
                     f.write("")
 
-    log_message(f"✅ Структура папки игры создана: {MINECRAFT_DIR}")
-
 
 # ===================================================================
-# 2. РАБОТА С АККАУНТАМИ
+# 5. РАБОТА С АККАУНТАМИ
 # ===================================================================
 
 def load_accounts():
@@ -150,7 +409,6 @@ def load_accounts():
                         acc['created'] = "давно"
                 return accounts
         except Exception as e:
-            print(f"Ошибка загрузки аккаунтов: {e}")
             return []
     return []
 
@@ -162,7 +420,6 @@ def save_accounts(accounts):
             json.dump(accounts, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
-        print(f"Ошибка сохранения аккаунтов: {e}")
         return False
 
 
@@ -197,7 +454,7 @@ def delete_account(username):
 
 
 # ===================================================================
-# 3. РАБОТА С ПРОФИЛЯМИ И ВЕРСИЯМИ
+# 6. РАБОТА С ПРОФИЛЯМИ И ВЕРСИЯМИ
 # ===================================================================
 
 def load_profiles():
@@ -227,7 +484,6 @@ def save_profiles(profiles):
             json.dump(profiles, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
-        print(f"Ошибка сохранения профилей: {e}")
         return False
 
 
@@ -250,7 +506,6 @@ def create_profile(version_id, version_name=None, java_args="-Xmx2G -Xms512M"):
     }
 
     if save_profiles(profiles):
-        log_message(f"✅ Профиль создан: {version_id}")
         return True
     return False
 
@@ -263,9 +518,20 @@ def delete_profile(version_id):
     if version_id in profiles:
         del profiles[version_id]
         save_profiles(profiles)
-        log_message(f"🗑️ Профиль удалён: {version_id}")
         return True
     return False
+
+
+def get_available_versions(include_snapshots=False):
+    try:
+        versions = mll.utils.get_available_versions(MINECRAFT_DIR)
+
+        if not include_snapshots:
+            versions = [v for v in versions if "snapshot" not in v.get("type", "").lower()]
+
+        return versions
+    except Exception as e:
+        return []
 
 
 def scan_versions():
@@ -296,6 +562,8 @@ def scan_versions():
                     version_type = "forge"
                 elif "optifine" in folder_lower or "of" in folder_lower:
                     version_type = "optifine"
+                elif "snapshot" in folder_lower:
+                    version_type = "snapshot"
 
                 versions.append({
                     "id": folder,
@@ -309,22 +577,8 @@ def scan_versions():
 
 
 # ===================================================================
-# 4. УСТАНОВКА JAVA
+# 7. УСТАНОВКА JAVA
 # ===================================================================
-
-def download_with_progress(url, dest_path, callback=None):
-    try:
-        def report_progress(count, block_size, total_size):
-            if total_size > 0 and callback:
-                percent = int(count * block_size * 100 / total_size)
-                callback(percent)
-
-        urllib.request.urlretrieve(url, dest_path, report_progress)
-        return True
-    except Exception as e:
-        log_message(f"❌ Ошибка скачивания: {e}")
-        return False
-
 
 def get_java_version(java_path="java"):
     try:
@@ -345,91 +599,55 @@ def get_java_version(java_path="java"):
 
 
 def get_java_for_version(minecraft_version):
-    major = 0
+    settings = load_launcher_settings()
+
+    needs_java17 = any(x in minecraft_version for x in ["1.20", "1.21", "1.19", "1.18", "1.17"])
+    target_version = 17 if needs_java17 else 8
+
+    manual_java = settings.get("java_path", "")
+    if manual_java and os.path.exists(manual_java):
+        ver = get_java_version(manual_java)
+        if ver == target_version:
+            return manual_java
+
     try:
-        major = int(minecraft_version.split('.')[0])
+        result = subprocess.run(["java", "-version"], capture_output=True, text=True)
+        if result.returncode == 0:
+            output = (result.stderr + result.stdout).lower()
+            if target_version == 17 and ("17." in output or '"17' in output):
+                return "java"
+            elif target_version == 8 and ("1.8" in output or '"8.' in output):
+                return "java"
     except:
         pass
 
-    if major <= 16:
-        try:
-            result = subprocess.run(["java", "-version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                output = (result.stderr + result.stdout).lower()
-                if "1.8" in output or '"8.' in output:
-                    log_message("✅ Найдена Java 8 для старых версий")
-                    return "java"
-        except:
-            pass
+    if target_version == 17:
+        common_paths = [
+            "C:\\Program Files\\Java\\jdk-17.0.13\\bin\\java.exe",
+            "C:\\Program Files\\Java\\jdk-17.0.12\\bin\\java.exe",
+            "C:\\Program Files\\Java\\jdk-17\\bin\\java.exe",
+            "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.13.11-hotspot\\bin\\java.exe",
+            "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.12.7-hotspot\\bin\\java.exe"
+        ]
+        for path in common_paths:
+            if os.path.exists(path):
+                ver = get_java_version(path)
+                if ver == 17:
+                    return path
 
-        local_java_dir = os.path.join(MINECRAFT_DIR, "java")
-        java8_exe = os.path.join(local_java_dir, "bin", "java.exe")
-        if os.path.exists(java8_exe):
-            ver = get_java_version(java8_exe)
-            if ver == 8:
-                log_message("✅ Найдена локальная Java 8")
-                return java8_exe
+    local_java_dir = os.path.join(MINECRAFT_DIR, f"java{target_version}")
+    java_exe = os.path.join(local_java_dir, "bin", "java.exe")
 
-        log_message("⚠️ Java 8 не найдена! Скачивание...")
-        java8_url = "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u392-b08/OpenJDK8U-jdk_x64_windows_hotspot_8u392b08.zip"
-        temp_dir = os.path.join(tempfile.gettempdir(), "ionux_java8")
-        os.makedirs(temp_dir, exist_ok=True)
-        zip_path = os.path.join(temp_dir, "java8.zip")
-        local_java_dir = os.path.join(MINECRAFT_DIR, "java")
-
-        if download_with_progress(java8_url, zip_path):
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(local_java_dir)
-                os.remove(zip_path)
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                log_message("✅ Java 8 установлена!")
-                return os.path.join(local_java_dir, "bin", "java.exe")
-            except Exception as e:
-                log_message(f"❌ Ошибка установки Java 8: {e}")
-
-    else:
-        try:
-            result = subprocess.run(["java", "-version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                output = (result.stderr + result.stdout).lower()
-                if "17." in output or '"17' in output:
-                    log_message("✅ Найдена Java 17 для новых версий")
-                    return "java"
-        except:
-            pass
-
-        local_java_dir = os.path.join(MINECRAFT_DIR, "java")
-        java17_exe = os.path.join(local_java_dir, "bin", "java.exe")
-        if os.path.exists(java17_exe):
-            ver = get_java_version(java17_exe)
-            if ver == 17:
-                log_message("✅ Найдена локальная Java 17")
-                return java17_exe
-
-        log_message("⚠️ Java 17 не найдена! Скачивание...")
-        java17_url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.9%2B9/OpenJDK17U-jdk_x64_windows_hotspot_17.0.9_9.zip"
-        temp_dir = os.path.join(tempfile.gettempdir(), "ionux_java17")
-        os.makedirs(temp_dir, exist_ok=True)
-        zip_path = os.path.join(temp_dir, "java17.zip")
-        local_java_dir = os.path.join(MINECRAFT_DIR, "java")
-
-        if download_with_progress(java17_url, zip_path):
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(local_java_dir)
-                os.remove(zip_path)
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                log_message("✅ Java 17 установлена!")
-                return os.path.join(local_java_dir, "bin", "java.exe")
-            except Exception as e:
-                log_message(f"❌ Ошибка установки Java 17: {e}")
+    if os.path.exists(java_exe):
+        ver = get_java_version(java_exe)
+        if ver == target_version:
+            return java_exe
 
     return "java"
 
 
 # ===================================================================
-# 5. РАБОТА С МОДАМИ
+# 8. РАБОТА С МОДАМИ
 # ===================================================================
 
 def get_mods_folder():
@@ -446,11 +664,10 @@ def search_mods(query, game_version, mod_loader, limit=20):
     }
     try:
         response = requests.get("https://api.modrinth.com/v2/search", params=params,
-                                headers={"User-Agent": "IonuxLauncher/1.0"})
+                                headers={"User-Agent": "67Launcher/1.5"})
         response.raise_for_status()
         return response.json().get("hits", [])
     except Exception as e:
-        log_message(f"❌ Ошибка поиска: {e}")
         return []
 
 
@@ -458,7 +675,7 @@ def install_mod(project_id, game_version, mod_loader):
     try:
         params = {"game_versions": f'["{game_version}"]', "loaders": f'["{mod_loader}"]'}
         response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}/version",
-                                params=params, headers={"User-Agent": "IonuxLauncher/1.0"})
+                                params=params, headers={"User-Agent": "67Launcher/1.5"})
         response.raise_for_status()
         versions = response.json()
         if not versions:
@@ -494,7 +711,17 @@ def delete_mod(mod_name):
 
 
 # ===================================================================
-# 6. КОЛБЭК ДЛЯ MLL
+# 9. РАБОТА СО СКИНАМИ
+# ===================================================================
+
+def get_skins_folder():
+    skins_path = os.path.join(MINECRAFT_DIR, "skins")
+    os.makedirs(skins_path, exist_ok=True)
+    return skins_path
+
+
+# ===================================================================
+# 10. КОЛБЭК ДЛЯ MLL
 # ===================================================================
 
 def mll_set_status(text):
@@ -516,7 +743,7 @@ mll_callback = {
 
 
 # ===================================================================
-# 7. КЛАСС ДЛЯ АНИМИРОВАННОГО ПРОГРЕСС-БАРА
+# 11. КЛАСС ДЛЯ АНИМИРОВАННОГО ПРОГРЕСС-БАРА
 # ===================================================================
 
 class AnimatedProgressBar(ctk.CTkProgressBar):
@@ -528,8 +755,11 @@ class AnimatedProgressBar(ctk.CTkProgressBar):
         self.animation_speed = 50
         self.step = 2
         self.set(0)
+        self._after_id = None
 
     def start_animation(self):
+        if self.animating:
+            return
         self.animating = True
         self.current_value = 0
         self.target_value = 100
@@ -537,45 +767,172 @@ class AnimatedProgressBar(ctk.CTkProgressBar):
 
     def stop_animation(self):
         self.animating = False
-        self.set(1.0)
+        try:
+            self.set(1.0)
+        except:
+            pass
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            except:
+                pass
 
     def set_progress(self, value):
         self.target_value = min(100, max(0, value))
         if not self.animating:
             self.current_value = self.target_value
-            self.set(self.current_value / 100)
+            try:
+                self.set(self.current_value / 100)
+            except:
+                pass
 
     def _animate(self):
         if not self.animating:
             return
+
+        try:
+            if not self.winfo_exists():
+                self.animating = False
+                return
+        except:
+            self.animating = False
+            return
+
         if self.current_value >= 95:
             self.step = -2
         elif self.current_value <= 5:
             self.step = 2
         self.current_value += self.step
-        self.set(self.current_value / 100)
-        self.after(self.animation_speed, self._animate)
+
+        try:
+            self.set(self.current_value / 100)
+        except:
+            self.animating = False
+            return
+
+        try:
+            self._after_id = self.after(self.animation_speed, self._animate)
+        except:
+            self.animating = False
+            self._after_id = None
 
 
 # ===================================================================
-# 8. ОСНОВНОЙ КЛАСС ПРИЛОЖЕНИЯ
+# 12. КЛАСС ДЛЯ АНИМИРОВАННОГО СПИННЕРА
+# ===================================================================
+
+class LoadingSpinner(ctk.CTkLabel):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, text="", font=ctk.CTkFont(size=30), **kwargs)
+        self.running = False
+        self.frames = ["⏳", "⌛", "⏳", "⌛"]
+        self.idx = 0
+        self._after_id = None
+
+    def start(self):
+        """Запускает анимацию спиннера"""
+        if self.running:
+            return
+        self.running = True
+        self.idx = 0
+        self._animate()
+
+    def _animate(self):
+        """Анимирует спиннер"""
+        if not self.running:
+            return
+        try:
+            if not self.winfo_exists():
+                self.running = False
+                return
+        except:
+            self.running = False
+            return
+
+        self.configure(text=self.frames[self.idx % len(self.frames)])
+        self.idx += 1
+        try:
+            self._after_id = self.after(200, self._animate)
+        except:
+            self.running = False
+            self._after_id = None
+
+    def stop(self):
+        """Останавливает анимацию спиннера"""
+        self.running = False
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            except:
+                pass
+        self.configure(text="✅")
+
+
+# ===================================================================
+# 13. ОСНОВНОЙ КЛАСС ПРИЛОЖЕНИЯ
 # ===================================================================
 
 class LauncherApp(ctk.CTk):
+    instance = None
+
     def __init__(self):
+        global MINECRAFT_DIR, GAME_DIR, ACCOUNTS_FILE, PROFILES_FILE, LAUNCHER_PROFILES_FILE
+
         super().__init__()
-        self.title("67 Launcher - Minecraft Launcher")
-        self.geometry("1100x850")
-        self.minsize(1000, 750)
+        LauncherApp.instance = self
+
+        print(f"📁 ПУТЬ К НАСТРОЙКАМ: {SETTINGS_FILE}")
+        print(f"📁 ПАПКА ИГРЫ: {MINECRAFT_DIR}")
+
+        self.settings = load_launcher_settings()
+        self.stats = load_stats()
+
+        # УВЕЛИЧИВАЕМ СЧЕТЧИК ЗАПУСКОВ ПРИ КАЖДОМ ЗАПУСКЕ
+        # УВЕЛИЧИВАЕМ СЧЕТЧИК ЗАПУСКОВ ПРИ КАЖДОМ ЗАПУСКЕ
+        launch_count = self.settings.get("launch_count", 0) + 1
+
+        # ЕСЛИ ДОСТИГЛИ 5 - ОБНУЛЯЕМ И ПОКАЗЫВАЕМ ОКНО ПОДДЕРЖКИ
+        if launch_count >= 5:
+            launch_count = 0
+            self.settings["support_shown_5"] = False  # СБРАСЫВАЕМ ФЛАГ
+            save_launcher_settings(self.settings)
+            # ПОКАЗЫВАЕМ ОКНО ПОДДЕРЖКИ
+            self.after(100, self.show_support_dialog)
+
+        self.settings["launch_count"] = launch_count
+        save_launcher_settings(self.settings)
+
+        self.apply_theme()
+
+        GAME_DIR = self.settings.get("game_dir", DEFAULT_GAME_DIR)
+        MINECRAFT_DIR = GAME_DIR
+
+        ACCOUNTS_FILE = os.path.join(MINECRAFT_DIR, "accounts.json")
+        PROFILES_FILE = os.path.join(MINECRAFT_DIR, "profile.json")
+        LAUNCHER_PROFILES_FILE = os.path.join(MINECRAFT_DIR, "launcher_profiles.json")
+
+        self.title("67Launcher - МЯУ")
+        self.geometry("1200x950")
+        self.minsize(1000, 800)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
         set_log_callback(self.log)
+
         self.search_results = []
         self.selected_mod_index = -1
         self.is_launching = False
         self.installed_versions = []
         self.selected_installer_path = None
         self.install_cancelled = False
+        self._closing = False
+        self.minecraft_process = None
+        self.launch_success = False
+        self.timer_running = False
+        self.timer_seconds = 0
+        self.available_versions = []
+        self._last_j_press = 0
 
         ensure_game_folder_structure()
 
@@ -584,337 +941,1162 @@ class LauncherApp(ctk.CTk):
         self.refresh_accounts_listbox()
         self.refresh_mods_list()
         self.scan_and_update_versions()
+        self.load_available_versions()
+        self.refresh_resourcepacks()
+        self.refresh_skins()
+
+        self.restore_last_selection()
 
         self.log(f"📁 Папка игры: {MINECRAFT_DIR}")
+        self.log(f"📊 Запусков игры: {self.stats.get('launches', 0)}")
+        self.log(f"📊 Запуск лаунчера #{launch_count if launch_count > 0 else 'обнулен'}")
 
-    def create_widgets(self):
-        self.main_frame = ctk.CTkFrame(self)
-        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.start_idle_timer()
 
-        banner_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        banner_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+    # =================================================================
+    # ФОРМАТИРОВАНИЕ
+    # =================================================================
 
-        title_label = ctk.CTkLabel(
-            banner_frame,
-            text="⚡ 67 Launcher RELEASE!",
-            font=ctk.CTkFont(size=32, weight="bold"),
+    def format_time(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+
+        if hours > 0:
+            return f"{hours}ч {minutes}м {secs}с"
+        elif minutes > 0:
+            return f"{minutes}м {secs}с"
+        else:
+            return f"{secs}с"
+
+    def format_date(self, date_str):
+        if not date_str:
+            return "Никогда"
+        try:
+            dt = datetime.fromisoformat(date_str)
+            return dt.strftime("%d.%m.%Y %H:%M")
+        except:
+            return date_str
+
+    def format_size(self, size):
+        """Форматирует размер файла"""
+        for unit in ['Б', 'КБ', 'МБ', 'ГБ']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} ТБ"
+
+    def get_folder_size(self, folder_path):
+        """Вычисляет размер папки рекурсивно"""
+        total = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp):
+                        total += os.path.getsize(fp)
+        except:
+            pass
+        return total
+
+    # =================================================================
+    # МЕТОДЫ ДЛЯ ТАЙМЕРОВ И СТАТИСТИКИ
+    # =================================================================
+
+    def start_idle_timer(self):
+        """Запускает таймер бездействия для обновления статистики"""
+        self.after(1000, self.update_stats_display)
+
+    def update_stats_display(self):
+        """Обновляет отображение статистики"""
+        stats = load_stats()
+        self.stats = stats
+
+        launches = stats.get("launches", 0)
+        play_time = stats.get("total_play_time", 0)
+        last_launch = stats.get("last_launch", "Никогда")
+
+        if last_launch and last_launch != "Никогда":
+            try:
+                dt = datetime.fromisoformat(last_launch)
+                last_launch = dt.strftime("%d.%m.%Y %H:%M:%S")
+            except:
+                pass
+
+        history = stats.get("launch_history", [])
+        history_text = ""
+        if history:
+            history_text = "\n".join([
+                f"  • {h.get('time', '')[:16]} - {h.get('version', 'unknown')}"
+                for h in history[-10:]
+            ])
+
+        stats_text = f"""
+📊 СТАТИСТИКА:
+
+🚀 Всего запусков игры: {launches}
+⏱ Общее время игры: {self.format_time(play_time)}
+🕐 Последний запуск: {last_launch}
+
+📋 Последние запуски:
+{history_text if history_text else "  Нет записей"}
+
+📊 Запусков лаунчера: {self.settings.get('launch_count', 0)}
+"""
+
+        self.stats_text.delete("1.0", "end")
+        self.stats_text.insert("1.0", stats_text)
+
+    # =================================================================
+    # МЕТОДЫ ДЛЯ СКАЧИВАНИЯ С ПРОГРЕССОМ
+    # =================================================================
+
+    def show_download_panel(self, show=True):
+        """Показывает или скрывает панель скачивания"""
+        try:
+            if hasattr(self, 'download_panel'):
+                if show:
+                    self.download_panel.grid()
+                else:
+                    self.download_panel.grid_remove()
+        except:
+            pass
+
+    def download_with_progress(self, url, filepath, description="Скачивание"):
+        """Скачивает файл с отображением прогресса"""
+        try:
+            # Показываем панель
+            self.after(0, lambda: self.show_download_panel(True))
+
+            self.log(f"📥 {description}...")
+
+            # Показываем спиннер
+            if hasattr(self, 'download_spinner'):
+                self.download_spinner.start()
+
+            # Обновляем статус
+            if hasattr(self, 'download_status_label'):
+                self.download_status_label.configure(text=f"⏳ {description}...", text_color="#f9e2af")
+
+            # Активируем прогресс-бар
+            if hasattr(self, 'download_progressbar'):
+                self.download_progressbar.start_animation()
+
+            response = requests.get(url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            block_size = 8192
+
+            # Создаем папку если её нет
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=block_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            percent = int((downloaded / total_size) * 100)
+                            # Обновляем прогресс-бар
+                            if hasattr(self, 'download_progressbar'):
+                                self.download_progressbar.set_progress(percent)
+                            # Логируем каждые 10%
+                            if percent % 10 == 0:
+                                self.log(f"📊 {description}: {percent}%")
+
+            # Завершаем
+            if hasattr(self, 'download_progressbar'):
+                self.download_progressbar.stop_animation()
+                self.download_progressbar.set(1.0)
+                self.download_progressbar.configure(progress_color="#a6e3a1")
+
+            if hasattr(self, 'download_spinner'):
+                self.download_spinner.stop()
+
+            if hasattr(self, 'download_status_label'):
+                self.download_status_label.configure(text=f"✅ {description} завершено!", text_color="#a6e3a1")
+
+            self.log(f"✅ {description} завершено!")
+
+            # Скрываем панель через 2 секунды
+            self.after(2000, lambda: self.show_download_panel(False))
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка скачивания: {e}")
+            if hasattr(self, 'download_spinner'):
+                self.download_spinner.stop()
+            if hasattr(self, 'download_status_label'):
+                self.download_status_label.configure(text=f"❌ Ошибка: {e}", text_color="#f38ba8")
+            if hasattr(self, 'download_progressbar'):
+                self.download_progressbar.stop_animation()
+                self.download_progressbar.set(0.3)
+                self.download_progressbar.configure(progress_color="#f38ba8")
+
+            # Скрываем панель через 3 секунды
+            self.after(3000, lambda: self.show_download_panel(False))
+            return False
+
+    # =================================================================
+    # МЕТОДЫ ДЛЯ ПЕРЕКЛЮЧЕНИЯ ТЕМЫ
+    # =================================================================
+
+    def toggle_theme(self):
+        """Переключает тему между темной и светлой"""
+        current = ctk.get_appearance_mode()
+        new_theme = "Light" if current == "Dark" else "Dark"
+        ctk.set_appearance_mode(new_theme)
+        self.settings["theme"] = new_theme.lower()
+        save_launcher_settings(self.settings)
+
+        # Обновляем текст кнопок
+        theme_text = "🌙 Тёмная" if new_theme == "Dark" else "☀️ Светлая"
+        if hasattr(self, 'theme_btn'):
+            self.theme_btn.configure(text=theme_text)
+        if hasattr(self, 'theme_btn_settings'):
+            self.theme_btn_settings.configure(text=theme_text)
+
+        self.log(f"🌓 Переключено на {new_theme} тему")
+
+    def apply_theme(self):
+        """Применяет сохраненную тему"""
+        theme = self.settings.get("theme", "dark")
+        ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
+        self.configure(fg_color="#1e1e2e" if theme == "dark" else "#f0f0f0")
+
+    # =================================================================
+    # МЕТОДЫ ДЛЯ ОКНА ПОДДЕРЖКИ
+    # =================================================================
+
+    def show_support_dialog(self):
+        """Показывает диалог поддержки автора (при 5-м запуске)"""
+        # Проверяем, не показывали ли уже окно
+        if self.settings.get("support_shown_5", False):
+            return
+
+        self.settings["support_shown_5"] = True
+        save_launcher_settings(self.settings)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("PLEASE")
+        dialog.geometry("500x480")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self)
+
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        # Основной фрейм с отступами
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Иконка
+        icon_label = ctk.CTkLabel(
+            main_frame,
+            text="🌟",
+            font=ctk.CTkFont(size=70)
+        )
+        icon_label.pack(pady=(10, 5))
+
+        # Заголовок
+        header = ctk.CTkLabel(
+            main_frame,
+            text="FOR MEEE",
+            font=ctk.CTkFont(size=22, weight="bold"),
             text_color="#89b4fa"
         )
-        title_label.pack()
+        header.pack(pady=(0, 5))
 
-        subtitle_label = ctk.CTkLabel(
-            banner_frame,
-            text=f"Папка: {MINECRAFT_DIR}",
-            font=ctk.CTkFont(size=12)
+        sub_header = ctk.CTkLabel(
+            main_frame,
+            text="lolipop",
+            font=ctk.CTkFont(size=15),
+            text_color="#f9e2af"
         )
-        subtitle_label.pack()
+        sub_header.pack(pady=(0, 15))
 
-        self.tab_view = ctk.CTkTabview(self.main_frame)
-        self.tab_view.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        # Разделитель
+        ctk.CTkFrame(main_frame, height=2, fg_color="#89b4fa").pack(fill="x", pady=(0, 15))
 
-        self.tab_view.add("🎮 Игра")
-        self.tab_view.add("📦 Моды")
-        self.tab_view.add("👤 Аккаунты")
-        self.tab_view.add("⚡ Установка")
-        self.tab_view.add("🔧 Версии")
-        self.tab_view.add("📁 Файлы")
-        self.tab_view.add("⚙️ Настройки")
+        # Текст
+        msg = """Если тебе нравится 67Launcher задонать пжж и рассмотри возможность 
+небольшого доната.
 
-        self.create_game_tab()
-        self.create_mods_tab()
-        self.create_accounts_tab()
-        self.create_install_tab()
-        self.create_versions_tab()
-        self.create_files_tab()
-        self.create_settings_tab()
+💝 Даже 50 рублей помогут продолжить разработку!(наверное)
 
-        console_frame = ctk.CTkFrame(self.main_frame)
-        console_frame.grid(row=2, column=0, sticky="nsew")
-        console_frame.grid_columnconfigure(0, weight=1)
-        console_frame.grid_rowconfigure(1, weight=1)
+❤️ Спасибо, что пользуешься 67Launcher!"""
 
-        console_header = ctk.CTkFrame(console_frame, fg_color="transparent")
-        console_header.grid(row=0, column=0, sticky="ew", pady=(5, 5))
-
-        ctk.CTkLabel(console_header, text="📋 Консоль", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-
-        clear_btn = ctk.CTkButton(
-            console_header,
-            text="Очистить",
-            command=self.clear_console,
-            width=100,
-            height=30,
-            fg_color="#f38ba8",
-            hover_color="#e64553"
+        text_label = ctk.CTkLabel(
+            main_frame,
+            text=msg,
+            font=ctk.CTkFont(size=14),
+            justify="center",
+            wraplength=420
         )
-        clear_btn.pack(side="right")
+        text_label.pack(pady=(0, 20))
 
-        self.console_text = ctk.CTkTextbox(console_frame, font=ctk.CTkFont(family="Consolas", size=11))
-        self.console_text.grid(row=1, column=0, sticky="nsew", pady=(0, 5))
+        # Разделитель
+        ctk.CTkFrame(main_frame, height=2, fg_color="#89b4fa").pack(fill="x", pady=(0, 15))
 
-        self.main_frame.grid_rowconfigure(2, weight=1)
+        # Кнопки
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(pady=(10, 5))
 
-    def create_game_tab(self):
-        tab = self.tab_view.tab("🎮 Игра")
-        tab.grid_columnconfigure(0, weight=2)
-        tab.grid_columnconfigure(1, weight=1)
-        tab.grid_rowconfigure(0, weight=1)
-
-        left_frame = ctk.CTkFrame(tab)
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(left_frame, text="Аккаунт", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0,
-                                                                                                sticky="w",
-                                                                                                pady=(10, 5), padx=10)
-
-        self.account_combo = ctk.CTkComboBox(
-            left_frame,
-            values=["Загрузка..."],
-            state="readonly",
-            width=300
-        )
-        self.account_combo.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 15))
-
-        ctk.CTkLabel(left_frame, text="Версия Minecraft", font=ctk.CTkFont(size=14, weight="bold")).grid(row=2,
-                                                                                                         column=0,
-                                                                                                         sticky="w",
-                                                                                                         padx=10,
-                                                                                                         pady=(0, 5))
-
-        self.version_combo = ctk.CTkComboBox(
-            left_frame,
-            values=["Загрузка..."],
-            state="readonly",
-            width=350
-        )
-        self.version_combo.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 15))
-
-        ctk.CTkLabel(left_frame, text="Выделение памяти", font=ctk.CTkFont(size=14, weight="bold")).grid(row=4,
-                                                                                                         column=0,
-                                                                                                         sticky="w",
-                                                                                                         padx=10,
-                                                                                                         pady=(0, 5))
-
-        ram_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        ram_frame.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 20))
-
-        self.ram_var = ctk.StringVar(value="2G")
-        rams = ["1G", "2G", "4G", "6G", "8G"]
-
-        for i, ram in enumerate(rams):
-            rb = ctk.CTkRadioButton(
-                ram_frame,
-                text=ram,
-                variable=self.ram_var,
-                value=ram
+        def open_donate():
+            webbrowser.open("https://www.donationalerts.com/r/ionux")
+            dialog.destroy()
+            messagebox.showinfo(
+                "Спасибо! 🙏",
+                "Спасибо за поддержку! ❤️\n\nКаждый донат помогает делать лаунчер лучше!(надеюсь)"
             )
-            rb.grid(row=0, column=i, padx=(0, 10))
 
-        self.launch_btn = ctk.CTkButton(
-            left_frame,
-            text="🚀 ЗАПУСТИТЬ ИГРУ",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            height=55,
+        def open_github():
+            webbrowser.open("https://github.com/KotiPlayYT/")
+
+        def close_dialog():
+            dialog.destroy()
+
+        donate_btn = ctk.CTkButton(
+            btn_frame,
+            text="💝 Поддержать",
+            command=open_donate,
+            width=170,
+            height=50,
+            fg_color="#ff6b6b",
+            hover_color="#ee5a24",
+            font=ctk.CTkFont(size=15, weight="bold")
+        )
+        donate_btn.grid(row=0, column=0, padx=10, pady=5)
+
+        github_btn = ctk.CTkButton(
+            btn_frame,
+            text="⭐ GitHub",
+            command=open_github,
+            width=150,
+            height=50,
+            fg_color="#333333",
+            hover_color="#555555",
+            font=ctk.CTkFont(size=15)
+        )
+        github_btn.grid(row=0, column=1, padx=10, pady=5)
+
+        close_btn = ctk.CTkButton(
+            main_frame,
+            text="Пропустить",
+            command=close_dialog,
+            width=120,
+            height=35,
+            fg_color="#f38ba8",
+            hover_color="#e64553",
+            font=ctk.CTkFont(size=13)
+        )
+        close_btn.pack(pady=(10, 5))
+
+    # =================================================================
+    # МЕТОДЫ ДЛЯ УСТАНОВКИ МОДА СКИНОВ
+    # =================================================================
+
+    def install_custom_skin_loader(self):
+        """Устанавливает мод CustomSkinLoader (Universal версия) в папку .minecraft"""
+        try:
+            mods_path = os.path.join(MINECRAFT_DIR, "mods")
+            os.makedirs(mods_path, exist_ok=True)
+
+            for file in os.listdir(mods_path):
+                if "CustomSkinLoader" in file or "SkinLoader" in file:
+                    self.log("✅ CustomSkinLoader уже установлен")
+                    messagebox.showinfo("Информация", "Мод CustomSkinLoader уже установлен!")
+                    return True
+
+            self.log("📥 Скачивание CustomSkinLoader Universal...")
+
+            mod_url = "https://github.com/xfl03/MCCustomSkinLoader/releases/download/v15.0.1/CustomSkinLoader_Universal-15.0.1.jar"
+            mod_file = os.path.join(mods_path, "CustomSkinLoader.jar")
+
+            # Используем метод с прогрессом
+            success = self.download_with_progress(mod_url, mod_file, "Скачивание CustomSkinLoader")
+
+            if not success:
+                return False
+
+            self.log("✅ CustomSkinLoader Universal установлен!")
+
+            config_path = os.path.join(MINECRAFT_DIR, "config", "CustomSkinLoader")
+            os.makedirs(config_path, exist_ok=True)
+
+            config_file = os.path.join(config_path, "skinloader.json")
+            config_data = {
+                "enable": True,
+                "loadlist": [
+                    {
+                        "name": "LocalSkin",
+                        "type": "LocalSkin",
+                        "skin": "LocalSkin/%s.png"
+                    },
+                    {
+                        "name": "Mojang",
+                        "type": "MojangAPI"
+                    }
+                ]
+            }
+
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, indent=2, ensure_ascii=False)
+            self.log("✅ Конфиг CustomSkinLoader создан")
+
+            skins_local_path = os.path.join(MINECRAFT_DIR, "CustomSkinLoader", "LocalSkin")
+            os.makedirs(skins_local_path, exist_ok=True)
+            self.log(f"📁 Папка для скинов: {skins_local_path}")
+
+            messagebox.showinfo(
+                "Успешно",
+                "Мод CustomSkinLoader Universal успешно установлен!\n\n"
+                "📁 Скины нужно помещать в папку:\n"
+                f"{skins_local_path}\n\n"
+                "💡 Скин должен называться: имя_пользователя.png\n"
+                "Например: Steve.png\n\n"
+                "⚠️ После установки скина перезапустите игру!"
+            )
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка установки CustomSkinLoader: {e}")
+            messagebox.showerror(
+                "Ошибка",
+                f"Не удалось установить CustomSkinLoader.\n\n"
+                f"Ошибка: {e}\n\n"
+                "Попробуйте скачать вручную:\n"
+                "https://github.com/xfl03/MCCustomSkinLoader/releases\n\n"
+                "1. Скачайте CustomSkinLoader_Universal-15.0.1.jar\n"
+                "2. Поместите в папку mods\n"
+                "3. Перезапустите игру"
+            )
+            return False
+
+    def install_skin_loader_for_fabric(self):
+        """Устанавливает CustomSkinLoader для Fabric (использует Universal версию)"""
+        self.log("🧵 Установка CustomSkinLoader для Fabric...")
+        return self.install_custom_skin_loader()
+
+    # =================================================================
+    # МЕТОД ДЛЯ УСТАНОВКИ СКИНА
+    # =================================================================
+
+    def create_skin_data(self, username, skin_path):
+        """Создает данные для скина в папке .minecraft"""
+        try:
+            skins_local_path = os.path.join(MINECRAFT_DIR, "CustomSkinLoader", "LocalSkin")
+            os.makedirs(skins_local_path, exist_ok=True)
+
+            skin_filename = f"{username}.png"
+            skin_dest = os.path.join(skins_local_path, skin_filename)
+            shutil.copy2(skin_path, skin_dest)
+            self.log(f"✅ Скин скопирован: .minecraft/CustomSkinLoader/LocalSkin/{skin_filename}")
+
+            self.log(f"🎨 Скин {skin_filename} успешно установлен для {username}!")
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка установки скина: {e}")
+            return False
+
+    def open_mods_folder(self):
+        """Открывает папку с модами в .minecraft"""
+        mods_path = os.path.join(MINECRAFT_DIR, "mods")
+        os.makedirs(mods_path, exist_ok=True)
+        os.startfile(mods_path)
+        self.log(f"📂 Открыта папка mods")
+        messagebox.showinfo(
+            "Установка мода вручную",
+            "1. Скачайте CustomSkinLoader с:\n"
+            "https://github.com/xfl03/MCCustomSkinLoader/releases\n\n"
+            "2. Скачайте CustomSkinLoader_Universal-15.0.1.jar\n"
+            "3. Скопируйте .jar файл в открывшуюся папку mods\n\n"
+            "📁 После установки скины кладите в:\n"
+            f"{os.path.join(MINECRAFT_DIR, 'CustomSkinLoader', 'LocalSkin')}\n"
+            "Имя файла: имя_пользователя.png"
+        )
+
+    # =================================================================
+    # МЕТОДЫ ВКЛАДКИ АККАУНТОВ
+    # =================================================================
+
+    def refresh_accounts(self):
+        accounts = load_accounts()
+        usernames = [acc['username'] for acc in accounts]
+        if not usernames:
+            usernames = ["Нет аккаунтов"]
+        self.account_combo.configure(values=usernames)
+        if usernames and usernames[0] != "Нет аккаунтов":
+            self.account_combo.set(usernames[0])
+
+    def refresh_accounts_listbox(self):
+        accounts = load_accounts()
+        self.accounts_listbox.delete("1.0", "end")
+        if not accounts:
+            self.accounts_listbox.insert("1.0", "Нет аккаунтов")
+            return
+
+        for acc in accounts:
+            created = acc.get('created', 'неизвестно')
+            self.accounts_listbox.insert("end", f"👤 {acc['username']}  (создан: {created})\n")
+
+    def add_account_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Добавление аккаунта")
+        dialog.geometry("350x180")
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Введите имя пользователя:", font=ctk.CTkFont(size=13)).pack(pady=(20, 5))
+
+        entry = ctk.CTkEntry(dialog, width=280, height=35)
+        entry.pack(pady=(5, 10))
+
+        def confirm():
+            username = entry.get().strip()
+            if not username:
+                messagebox.showwarning("Ошибка", "Имя не может быть пустым")
+                return
+            success, msg = add_account(username)
+            if success:
+                self.refresh_accounts()
+                self.refresh_accounts_listbox()
+                dialog.destroy()
+                messagebox.showinfo("Успешно", msg)
+            else:
+                messagebox.showerror("Ошибка", msg)
+
+        ctk.CTkButton(
+            dialog,
+            text="Добавить",
+            command=confirm,
             fg_color="#a6e3a1",
             hover_color="#7ecb8f",
-            text_color="#1e1e2e",
-            command=self.launch_game,
-            corner_radius=10
+            text_color="#1e1e2e"
+        ).pack(pady=10)
+
+    def delete_selected_account(self):
+        selection = self.accounts_listbox.get("1.0", "end").strip()
+        if not selection or selection == "Нет аккаунтов":
+            messagebox.showwarning("Ошибка", "Нет аккаунтов для удаления")
+            return
+
+        username = selection.split("👤")[1].split("(")[0].strip()
+        if messagebox.askyesno("Подтверждение", f"Удалить аккаунт '{username}'?"):
+            success, msg = delete_account(username)
+            if success:
+                self.refresh_accounts()
+                self.refresh_accounts_listbox()
+                messagebox.showinfo("Успешно", msg)
+            else:
+                messagebox.showerror("Ошибка", msg)
+
+    # =================================================================
+    # МЕТОДЫ ВКЛАДКИ МОДОВ
+    # =================================================================
+
+    def refresh_mods_list(self):
+        self.installed_listbox.delete(0, "end")
+        mods = list_mods()
+        if not mods:
+            self.installed_listbox.insert("end", "📭 Моды не установлены")
+            return
+
+        for mod in mods:
+            self.installed_listbox.insert("end", f"📦 {mod}")
+
+    def delete_selected_mod(self):
+        selection = self.installed_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Ошибка", "Выберите мод для удаления")
+            return
+
+        mod_name = self.installed_listbox.get(selection[0])
+        if "Моды не установлены" in mod_name:
+            return
+
+        mod_name = mod_name.replace("📦 ", "").strip()
+        if messagebox.askyesno("Подтверждение", f"Удалить мод '{mod_name}'?"):
+            if delete_mod(mod_name):
+                self.refresh_mods_list()
+                messagebox.showinfo("Успешно", "Мод удалён")
+            else:
+                messagebox.showerror("Ошибка", "Не удалось удалить мод")
+
+    # =================================================================
+    # МЕТОДЫ ВКЛАДКИ РЕСУРСПАКОВ
+    # =================================================================
+
+    def read_pack_meta(self, pack_path):
+        info = {"description": "Без описания", "pack_format": "неизвестно"}
+
+        try:
+            import zipfile
+            import json
+
+            meta_content = None
+
+            if pack_path.endswith('.zip'):
+                with zipfile.ZipFile(pack_path, 'r') as zip_ref:
+                    if 'pack.mcmeta' in zip_ref.namelist():
+                        meta_content = zip_ref.read('pack.mcmeta').decode('utf-8')
+            elif os.path.isdir(pack_path):
+                meta_path = os.path.join(pack_path, 'pack.mcmeta')
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r', encoding='utf-8') as f:
+                        meta_content = f.read()
+
+            if meta_content:
+                data = json.loads(meta_content)
+                pack_data = data.get('pack', {})
+
+                if 'description' in pack_data:
+                    info['description'] = pack_data['description']
+                if 'pack_format' in pack_data:
+                    info['pack_format'] = str(pack_data['pack_format'])
+
+        except Exception as e:
+            pass
+
+        return info
+
+    def list_resourcepacks(self):
+        packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
+        packs = []
+
+        if os.path.exists(packs_path):
+            for item in os.listdir(packs_path):
+                item_path = os.path.join(packs_path, item)
+
+                if os.path.isdir(item_path) or item.endswith('.zip'):
+                    pack_info = {
+                        "name": item,
+                        "path": item_path,
+                        "is_zip": item.endswith('.zip'),
+                        "size": self.format_size(
+                            os.path.getsize(item_path) if os.path.isfile(item_path) else self.get_folder_size(
+                                item_path)),
+                        "modified": datetime.fromtimestamp(os.path.getmtime(item_path)).strftime("%d.%m.%Y %H:%M"),
+                        "description": "Без описания",
+                        "pack_format": "неизвестно"
+                    }
+
+                    pack_info.update(self.read_pack_meta(item_path))
+                    packs.append(pack_info)
+
+        return sorted(packs, key=lambda x: x['name'].lower())
+
+    def refresh_resourcepacks(self):
+        packs = self.list_resourcepacks()
+
+        self.resourcepacks_listbox.delete(0, "end")
+
+        if not packs:
+            self.resourcepacks_listbox.insert("end", "📭 Ресурспаки не установлены")
+            self.resourcepacks_listbox.insert("end", "Нажмите 'Установить' для добавления")
+            return
+
+        for pack in packs:
+            info = f"📦 {pack['name']}"
+            if pack['description'] != "Без описания":
+                info += f" - {pack['description']}"
+            info += f" ({pack['size']})"
+            self.resourcepacks_listbox.insert("end", info)
+
+    def install_resourcepack(self):
+        file_path = filedialog.askopenfilename(
+            title="Выберите ресурспак (.zip или папка)",
+            filetypes=[
+                ("ZIP архивы", "*.zip"),
+                ("Все файлы", "*.*")
+            ]
         )
-        self.launch_btn.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 5))
 
-        self.launch_progressbar = AnimatedProgressBar(
-            left_frame,
-            height=15,
-            corner_radius=5,
-            progress_color="#f9e2af"
-        )
-        self.launch_progressbar.grid(row=7, column=0, sticky="ew", padx=10, pady=(0, 2))
-        self.launch_progressbar.set(0)
+        if not file_path:
+            return
 
-        self.launch_status_label = ctk.CTkLabel(
-            left_frame,
-            text="Готов к запуску",
-            font=ctk.CTkFont(size=11),
-            text_color="#a6e3a1"
-        )
-        self.launch_status_label.grid(row=8, column=0, sticky="w", padx=10, pady=(0, 5))
+        packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
+        os.makedirs(packs_path, exist_ok=True)
 
-        right_frame = ctk.CTkFrame(tab)
-        right_frame.grid(row=0, column=1, sticky="nsew")
-        right_frame.grid_columnconfigure(0, weight=1)
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(packs_path, filename)
 
-        ctk.CTkLabel(
-            right_frame,
-            text="ℹ️ Информация",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=15, pady=(15, 10))
+        try:
+            if file_path.endswith('.zip'):
+                shutil.copy2(file_path, dest_path)
+            else:
+                shutil.copytree(file_path, dest_path, dirs_exist_ok=True)
+
+            self.log(f"✅ Ресурспак установлен: {filename}")
+            messagebox.showinfo("Успешно", f"Ресурспак '{filename}' установлен!")
+            self.refresh_resourcepacks()
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка установки ресурспака: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось установить ресурспак:\n{e}")
+            return False
+
+    def delete_resourcepack(self, pack_name):
+        if not messagebox.askyesno("Подтверждение", f"Удалить ресурспак '{pack_name}'?"):
+            return False
+
+        packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
+        pack_path = os.path.join(packs_path, pack_name)
+
+        try:
+            if os.path.isdir(pack_path):
+                shutil.rmtree(pack_path)
+            elif os.path.isfile(pack_path):
+                os.remove(pack_path)
+
+            self.log(f"🗑️ Ресурспак удален: {pack_name}")
+            messagebox.showinfo("Успешно", f"Ресурспак '{pack_name}' удален!")
+            self.refresh_resourcepacks()
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка удаления ресурспака: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось удалить ресурспак:\n{e}")
+            return False
+
+    def show_resourcepack_info(self, pack_name):
+        packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
+        pack_path = os.path.join(packs_path, pack_name)
+
+        if not os.path.exists(pack_path):
+            return
+
+        info = self.read_pack_meta(pack_path)
 
         info_text = f"""
-📁 Папка с игрой:
-{os.path.abspath(MINECRAFT_DIR)}
+📦 Ресурспак: {pack_name}
 
-📁 Структура папки игры:
-   📁 assets/     - ресурсы игры
-   📁 config/     - конфиги модов
-   📁 libraries/  - библиотеки Java
-   📁 logs/       - логи игры
-   📁 mods/       - установленные моды
-   📁 resourcepacks/ - ресурспаки
-   📁 saves/      - сохранения (миры)
-   📁 versions/   - установленные версии
+📝 Описание: {info.get('description', 'Без описания')}
+📋 Формат: {info.get('pack_format', 'неизвестно')}
 
-📄 Важные файлы:
-   А для чего тебе это)
+📁 Путь: {pack_path}
+📏 Размер: {self.format_size(os.path.getsize(pack_path) if os.path.isfile(pack_path) else self.get_folder_size(pack_path))}
+🕐 Изменен: {datetime.fromtimestamp(os.path.getmtime(pack_path)).strftime("%d.%m.%Y %H:%M:%S")}
+
+📂 Тип: {"ZIP архив" if pack_name.endswith('.zip') else "Папка"}
         """
 
-        info_display = ctk.CTkTextbox(right_frame, font=ctk.CTkFont(family="Consolas", size=11))
-        info_display.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 15))
-        info_display.insert("1.0", info_text)
-        info_display.configure(state="disabled")
+        self.resourcepack_info.configure(state="normal")
+        self.resourcepack_info.delete("1.0", "end")
+        self.resourcepack_info.insert("1.0", info_text)
+        self.resourcepack_info.configure(state="disabled")
 
-        right_frame.grid_rowconfigure(1, weight=1)
+    def delete_selected_resourcepack(self):
+        selection = self.resourcepacks_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Ошибка", "Выберите ресурспак для удаления")
+            return
 
-    def create_mods_tab(self):
-        tab = self.tab_view.tab("📦 Моды")
-        tab.grid_columnconfigure(0, weight=2)
+        selected_text = self.resourcepacks_listbox.get(selection[0])
+        if "📭" in selected_text or "Нажмите" in selected_text:
+            return
+
+        name = selected_text.split("📦 ")[1].split(" -")[0].strip()
+        self.delete_resourcepack(name)
+
+    def on_resourcepack_double_click(self, event):
+        selection = self.resourcepacks_listbox.curselection()
+        if not selection:
+            return
+
+        selected_text = self.resourcepacks_listbox.get(selection[0])
+        if "📭" in selected_text or "Нажмите" in selected_text:
+            return
+
+        name = selected_text.split("📦 ")[1].split(" -")[0].strip()
+        self.show_resourcepack_info(name)
+
+    def open_resourcepacks_folder(self):
+        packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
+        if not os.path.exists(packs_path):
+            os.makedirs(packs_path, exist_ok=True)
+        os.startfile(packs_path)
+
+    # =================================================================
+    # МЕТОДЫ ВКЛАДКИ СКИНОВ
+    # =================================================================
+
+    def get_skins_list(self):
+        """Получает список установленных скинов"""
+        skins_path = get_skins_folder()
+        skins = []
+
+        if os.path.exists(skins_path):
+            for file in os.listdir(skins_path):
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    file_path = os.path.join(skins_path, file)
+                    skins.append({
+                        "name": file,
+                        "path": file_path,
+                        "size": self.format_size(os.path.getsize(file_path)),
+                        "modified": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%d.%m.%Y %H:%M")
+                    })
+
+        return sorted(skins, key=lambda x: x['name'].lower())
+
+    def refresh_skins(self):
+        """Обновляет список скинов в интерфейсе"""
+        skins = self.get_skins_list()
+
+        self.skins_listbox.delete(0, "end")
+
+        if not skins:
+            self.skins_listbox.insert("end", "📭 Скины не установлены")
+            self.skins_listbox.insert("end", "Нажмите 'Добавить скин' для импорта")
+            self.skin_combo.configure(values=["Нет скинов"])
+            return
+
+        skin_names = []
+        for skin in skins:
+            info = f"🎨 {skin['name']} ({skin['size']})"
+            self.skins_listbox.insert("end", info)
+            skin_names.append(skin['name'])
+
+        self.skin_combo.configure(values=skin_names)
+        if skin_names:
+            self.skin_combo.set(skin_names[0])
+
+    def import_skin(self):
+        """Импортирует скин из файла"""
+        file_path = filedialog.askopenfilename(
+            title="Выберите скин (PNG или JPG)",
+            filetypes=[
+                ("PNG изображения", "*.png"),
+                ("JPG изображения", "*.jpg"),
+                ("JPEG изображения", "*.jpeg"),
+                ("Все файлы", "*.*")
+            ]
+        )
+
+        if not file_path:
+            return False
+
+        skins_path = get_skins_folder()
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(skins_path, filename)
+
+        if os.path.exists(dest_path):
+            if not messagebox.askyesno(
+                    "Файл существует",
+                    f"Скин '{filename}' уже существует.\n\nЗаменить?"
+            ):
+                return False
+
+        try:
+            shutil.copy2(file_path, dest_path)
+            self.log(f"✅ Скин импортирован: {filename}")
+            messagebox.showinfo("Успешно", f"Скин '{filename}' импортирован!")
+            self.refresh_skins()
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка импорта скина: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось импортировать скин:\n{e}")
+            return False
+
+    def delete_skin(self, skin_name):
+        """Удаляет скин"""
+        if not messagebox.askyesno("Подтверждение", f"Удалить скин '{skin_name}'?"):
+            return False
+
+        skins_path = get_skins_folder()
+        skin_path = os.path.join(skins_path, skin_name)
+
+        try:
+            os.remove(skin_path)
+            self.log(f"🗑️ Скин удален: {skin_name}")
+            messagebox.showinfo("Успешно", f"Скин '{skin_name}' удален!")
+            self.refresh_skins()
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка удаления скина: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось удалить скин:\n{e}")
+            return False
+
+    def delete_selected_skin(self):
+        """Удаляет выбранный скин"""
+        selection = self.skins_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Ошибка", "Выберите скин для удаления")
+            return
+
+        selected_text = self.skins_listbox.get(selection[0])
+        if "📭" in selected_text or "Нажмите" in selected_text:
+            return
+
+        name = selected_text.split("🎨 ")[1].split(" (")[0].strip()
+        self.delete_skin(name)
+
+    def preview_skin(self):
+        """Показывает превью выбранного скина"""
+        skin_name = self.skin_combo.get()
+        if not skin_name or skin_name == "Нет скинов" or skin_name == "Загрузка...":
+            messagebox.showinfo("Информация", "Скин не выбран")
+            return
+
+        skins_path = get_skins_folder()
+        skin_path = os.path.join(skins_path, skin_name)
+
+        if not os.path.exists(skin_path):
+            messagebox.showerror("Ошибка", f"Скин '{skin_name}' не найден")
+            return
+
+        try:
+            from PIL import Image, ImageTk
+
+            image = Image.open(skin_path)
+
+            preview_window = ctk.CTkToplevel(self)
+            preview_window.title(f"Превью скина: {skin_name}")
+            preview_window.geometry("400x500")
+            preview_window.resizable(False, False)
+            preview_window.grab_set()
+
+            max_size = (300, 400)
+            image.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            temp_path = os.path.join(tempfile.gettempdir(), "skin_preview.png")
+            image.save(temp_path, "PNG")
+
+            img = Image.open(temp_path)
+            photo = ImageTk.PhotoImage(img)
+
+            label = ctk.CTkLabel(preview_window, text="", image=photo)
+            label.image = photo
+            label.pack(pady=20, padx=20)
+
+            info_text = f"""
+📝 Название: {skin_name}
+📏 Размер: {self.format_size(os.path.getsize(skin_path))}
+🕐 Изменен: {datetime.fromtimestamp(os.path.getmtime(skin_path)).strftime("%d.%m.%Y %H:%M")}
+            """
+            info_label = ctk.CTkLabel(
+                preview_window,
+                text=info_text,
+                font=ctk.CTkFont(size=12),
+                justify="left"
+            )
+            info_label.pack(pady=10)
+
+            close_btn = ctk.CTkButton(
+                preview_window,
+                text="Закрыть",
+                command=preview_window.destroy,
+                width=100,
+                height=35
+            )
+            close_btn.pack(pady=10)
+
+            def on_close():
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                preview_window.destroy()
+
+            preview_window.protocol("WM_DELETE_WINDOW", on_close)
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть скин:\n{e}")
+
+    def open_skins_folder(self):
+        """Открывает папку со скинами"""
+        skins_path = get_skins_folder()
+        os.startfile(skins_path)
+        self.log(f"📂 Открыта папка скинов")
+
+    def on_skin_double_click(self, event):
+        """Обработка двойного клика по скину - показывает превью"""
+        selection = self.skins_listbox.curselection()
+        if not selection:
+            return
+
+        selected_text = self.skins_listbox.get(selection[0])
+        if "📭" in selected_text or "Нажмите" in selected_text:
+            return
+
+        name = selected_text.split("🎨 ")[1].split(" (")[0].strip()
+        self.show_skin_info(name)
+
+    def show_skin_info(self, skin_name):
+        """Показывает подробную информацию о скине"""
+        skins_path = get_skins_folder()
+        skin_path = os.path.join(skins_path, skin_name)
+
+        if not os.path.exists(skin_path):
+            return
+
+        info_text = f"""
+🎨 Скин: {skin_name}
+
+📁 Путь: {skin_path}
+📏 Размер: {self.format_size(os.path.getsize(skin_path))}
+🕐 Изменен: {datetime.fromtimestamp(os.path.getmtime(skin_path)).strftime("%d.%m.%Y %H:%M:%S")}
+
+📂 Тип: {skin_name.split('.')[-1].upper()}
+💡 Для использования выберите этот скин на вкладке "Игра"
+        """
+
+        self.skin_info.configure(state="normal")
+        self.skin_info.delete("1.0", "end")
+        self.skin_info.insert("1.0", info_text)
+        self.skin_info.configure(state="disabled")
+
+    def create_skins_tab(self):
+        """Создает вкладку управления скинами с кнопками установки мода"""
+        tab = self.tab_view.tab("🎨 Скины")
+        tab.grid_columnconfigure(0, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         tab.grid_rowconfigure(1, weight=1)
 
         header_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 5))
+        header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=20, pady=(15, 10))
 
         ctk.CTkLabel(
             header_frame,
-            text="🔍 Поиск и установка модов",
+            text="🎨 Управление скинами",
             font=ctk.CTkFont(size=18, weight="bold")
         ).pack(side="left")
 
         left_frame = ctk.CTkFrame(tab)
         left_frame.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=(0, 10))
         left_frame.grid_columnconfigure(0, weight=1)
-        left_frame.grid_rowconfigure(7, weight=1)
+        left_frame.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(left_frame, text="🎮 Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(5, 2)
-        )
-        self.mod_version_entry = ctk.CTkEntry(
+        ctk.CTkLabel(
             left_frame,
-            placeholder_text="1.20.4",
-            height=32
-        )
-        self.mod_version_entry.insert(0, "1.20.1")
-        self.mod_version_entry.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+            text="📋 Установленные скины",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 5))
 
-        ctk.CTkLabel(left_frame, text="🔧 Загрузчик:", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=2, column=0, sticky="w", padx=10, pady=(0, 2)
-        )
-
-        loader_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        loader_frame.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
-
-        self.mod_loader_var = ctk.StringVar(value="fabric")
-        loaders = [
-            ("🧵 Fabric", "fabric"),
-            ("🔥 Forge", "forge"),
-            ("🧶 Quilt", "quilt")
-        ]
-
-        for i, (text, value) in enumerate(loaders):
-            rb = ctk.CTkRadioButton(
-                loader_frame,
-                text=text,
-                variable=self.mod_loader_var,
-                value=value
-            )
-            rb.grid(row=0, column=i, padx=(0, 15))
-
-        ctk.CTkLabel(left_frame, text="🔍 Название мода:", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=4, column=0, sticky="w", padx=10, pady=(0, 2)
-        )
-
-        search_row = ctk.CTkFrame(left_frame, fg_color="transparent")
-        search_row.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
-        search_row.grid_columnconfigure(0, weight=1)
-
-        self.mod_search_entry = ctk.CTkEntry(
-            search_row,
-            placeholder_text="Введите название мода...",
-            height=32
-        )
-        self.mod_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.mod_search_entry.bind("<Return>", lambda e: self.search_mods())
-
-        search_btn = ctk.CTkButton(
-            search_row,
-            text="🔍 Искать",
-            command=self.search_mods,
-            width=100,
-            height=32,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
-        )
-        search_btn.grid(row=0, column=1)
-
-        ctk.CTkLabel(left_frame, text="📋 Результаты поиска (кликните для выбора):",
-                     font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=6, column=0, sticky="w", padx=10, pady=(5, 2)
-        )
-
-        self.results_listbox = tk.Listbox(
+        self.skins_listbox = tk.Listbox(
             left_frame,
             bg="#1a1a2e",
             fg="#cdd6f4",
             selectbackground="#89b4fa",
             selectforeground="#1e1e2e",
             font=("Consolas", 11),
-            height=6,
+            height=12,
             relief="flat"
         )
-        self.results_listbox.grid(row=7, column=0, sticky="nsew", padx=10, pady=(0, 8))
-        self.results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
+        self.skins_listbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.skins_listbox.bind("<Double-Button-1>", self.on_skin_double_click)
 
-        self.install_mod_btn = ctk.CTkButton(
-            left_frame,
-            text="📥 УСТАНОВИТЬ ВЫБРАННЫЙ МОД",
-            command=self.install_selected_mod,
-            height=45,
+        btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+        btn_frame.grid_columnconfigure(3, weight=1)
+
+        import_btn = ctk.CTkButton(
+            btn_frame,
+            text="📥 Добавить",
+            command=self.import_skin,
             fg_color="#a6e3a1",
             hover_color="#7ecb8f",
             text_color="#1e1e2e",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            corner_radius=10,
-            state="disabled"
+            height=35
         )
-        self.install_mod_btn.grid(row=8, column=0, sticky="ew", padx=10, pady=(0, 5))
+        import_btn.grid(row=0, column=0, padx=2)
 
-        self.mod_progressbar = AnimatedProgressBar(
-            left_frame,
-            height=12,
-            corner_radius=5,
-            progress_color="#f9e2af"
+        preview_btn = ctk.CTkButton(
+            btn_frame,
+            text="👁️ Превью",
+            command=self.preview_skin,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec",
+            height=35
         )
-        self.mod_progressbar.grid(row=9, column=0, sticky="ew", padx=10, pady=(0, 2))
-        self.mod_progressbar.set(0)
+        preview_btn.grid(row=0, column=1, padx=2)
 
-        self.mod_status_label = ctk.CTkLabel(
-            left_frame,
-            text="Выберите мод из списка",
-            font=ctk.CTkFont(size=11),
+        delete_btn = ctk.CTkButton(
+            btn_frame,
+            text="🗑️ Удалить",
+            command=self.delete_selected_skin,
+            fg_color="#f38ba8",
+            hover_color="#e64553",
+            height=35
+        )
+        delete_btn.grid(row=0, column=2, padx=2)
+
+        refresh_btn = ctk.CTkButton(
+            btn_frame,
+            text="🔄 Обновить",
+            command=self.refresh_skins,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e",
+            height=35
+        )
+        refresh_btn.grid(row=0, column=3, padx=2)
+
+        mod_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        mod_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(10, 0))
+        mod_frame.grid_columnconfigure(0, weight=1)
+        mod_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            mod_frame,
+            text="📦 Установка мода для скинов:",
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#89b4fa"
-        )
-        self.mod_status_label.grid(row=10, column=0, sticky="w", padx=10, pady=(0, 2))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
 
-        self.selected_mod_label = ctk.CTkLabel(
-            left_frame,
-            text="❌ Мод не выбран",
-            font=ctk.CTkFont(size=12),
-            text_color="#f38ba8"
+        forge_btn = ctk.CTkButton(
+            mod_frame,
+            text="🔥 Forge",
+            command=self.install_custom_skin_loader,
+            fg_color="#e67e22",
+            hover_color="#d35400",
+            text_color="white",
+            height=35,
+            font=ctk.CTkFont(size=12, weight="bold")
         )
-        self.selected_mod_label.grid(row=11, column=0, sticky="w", padx=10, pady=(2, 5))
+        forge_btn.grid(row=1, column=0, padx=2, sticky="ew")
+
+        fabric_btn = ctk.CTkButton(
+            mod_frame,
+            text="🧵 Fabric",
+            command=self.install_skin_loader_for_fabric,
+            fg_color="#2ecc71",
+            hover_color="#27ae60",
+            text_color="white",
+            height=35,
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        fabric_btn.grid(row=1, column=1, padx=2, sticky="ew")
+
+        open_mods_btn = ctk.CTkButton(
+            mod_frame,
+            text="📂 Открыть папку mods",
+            command=self.open_mods_folder,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec",
+            height=35,
+            font=ctk.CTkFont(size=12)
+        )
+        open_mods_btn.grid(row=2, column=0, columnspan=2, padx=2, pady=(5, 0), sticky="ew")
+
+        info_label = ctk.CTkLabel(
+            left_frame,
+            text="💡 CustomSkinLoader - мод для отображения скинов в офлайн режиме\nДля Fabric и Forge",
+            font=ctk.CTkFont(size=11),
+            text_color="#89b4fa",
+            justify="left"
+        )
+        info_label.grid(row=4, column=0, sticky="w", padx=10, pady=(10, 5))
 
         right_frame = ctk.CTkFrame(tab)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=(0, 10))
@@ -923,625 +2105,700 @@ class LauncherApp(ctk.CTk):
 
         ctk.CTkLabel(
             right_frame,
-            text="📦 Установленные моды",
+            text="ℹ️ Информация о скине",
             font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 5))
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 5))
 
-        self.installed_listbox = tk.Listbox(
+        self.skin_info = ctk.CTkTextbox(
             right_frame,
-            bg="#1a1a2e",
-            fg="#cdd6f4",
-            font=("Consolas", 11),
-            height=6,
-            relief="flat"
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=200
         )
-        self.installed_listbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.skin_info.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.skin_info.insert("1.0", "Выберите скин для просмотра информации\n\nДвойной клик для просмотра")
+        self.skin_info.configure(state="disabled")
 
-        btn_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        refresh_btn = ctk.CTkButton(
-            btn_frame,
-            text="🔄 Обновить",
-            command=self.refresh_mods_list,
-            width=100,
-            height=32
-        )
-        refresh_btn.grid(row=0, column=0, padx=(0, 10))
-
-        delete_mod_btn = ctk.CTkButton(
-            btn_frame,
-            text="🗑️ Удалить мод",
-            command=self.delete_selected_mod,
-            width=100,
-            height=32,
-            fg_color="#f38ba8",
-            hover_color="#e64553"
-        )
-        delete_mod_btn.grid(row=0, column=1)
-
-    def create_accounts_tab(self):
-        tab = self.tab_view.tab("👤 Аккаунты")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            tab,
-            text="Управление аккаунтами",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(15, 10))
-
-        self.accounts_listbox = ctk.CTkTextbox(tab, font=ctk.CTkFont(family="Consolas", size=12))
-        self.accounts_listbox.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 10))
-
-        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 15))
-
-        add_btn = ctk.CTkButton(
-            btn_frame,
-            text="➕ Добавить аккаунт",
-            command=self.add_account_dialog,
-            fg_color="#a6e3a1",
-            hover_color="#7ecb8f",
-            text_color="#1e1e2e"
-        )
-        add_btn.grid(row=0, column=0, padx=(0, 10))
-
-        delete_btn = ctk.CTkButton(
-            btn_frame,
-            text="🗑️ Удалить аккаунт",
-            command=self.delete_selected_account,
-            fg_color="#f38ba8",
-            hover_color="#e64553"
-        )
-        delete_btn.grid(row=0, column=1)
-
-    def create_install_tab(self):
-        tab = self.tab_view.tab("⚡ Установка")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(0, weight=1)
-
-        main_frame = ctk.CTkFrame(tab)
-        main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
-        main_frame.grid_columnconfigure(0, weight=1)
-        main_frame.grid_rowconfigure(6, weight=1)
-
-        ctk.CTkLabel(
-            main_frame,
-            text="⚡ Установка клиентов",
-            font=ctk.CTkFont(size=18, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=15, pady=(0, 10))
-
-        ctk.CTkLabel(
-            main_frame,
-            text="Установка Vanilla, Fabric, Forge или OptiFine\n"
-                 "Выберите тип и нажмите кнопку установки",
-            font=ctk.CTkFont(size=13),
-            justify="left"
-        ).grid(row=1, column=0, sticky="w", padx=15, pady=(0, 15))
-
-        type_frame = ctk.CTkFrame(main_frame)
-        type_frame.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 10))
-
-        ctk.CTkLabel(type_frame, text="Тип клиента:", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0,
-                                                                                                     padx=10,
-                                                                                                     sticky="w")
-
-        self.install_type_var = ctk.StringVar(value="vanilla")
-        types = [
-            ("📦 Vanilla", "vanilla"),
-            ("🧵 Fabric", "fabric"),
-            ("🔥 Forge", "forge"),
-            ("⚡ OptiFine", "optifine")
-        ]
-
-        for i, (text, value) in enumerate(types):
-            rb = ctk.CTkRadioButton(
-                type_frame,
-                text=text,
-                variable=self.install_type_var,
-                value=value
-            )
-            rb.grid(row=0, column=i + 1, padx=10)
-
-        version_frame = ctk.CTkFrame(main_frame)
-        version_frame.grid(row=3, column=0, sticky="ew", padx=15, pady=(0, 10))
-        version_frame.grid_columnconfigure(0, weight=1)
-        version_frame.grid_columnconfigure(1, weight=0)
-
-        ctk.CTkLabel(version_frame, text="Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(5, 2)
-        )
-
-        self.install_version_entry = ctk.CTkEntry(
-            version_frame,
-            placeholder_text="1.20.4",
-            height=35,
-            width=200
-        )
-        self.install_version_entry.insert(0, "1.20.1")
-        self.install_version_entry.grid(row=0, column=0, sticky="w", padx=(10, 10), pady=(0, 5))
-
-        popular_btn = ctk.CTkButton(
-            version_frame,
-            text="Популярные",
-            command=self.show_install_popular_versions,
-            width=120,
-            height=35,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
-        )
-        popular_btn.grid(row=0, column=1)
-
-        self.install_btn = ctk.CTkButton(
-            main_frame,
-            text="📥 УСТАНОВИТЬ",
-            command=self.install_selected_client,
-            height=40,
-            fg_color="#a6e3a1",
-            hover_color="#7ecb8f",
+        open_folder_btn = ctk.CTkButton(
+            right_frame,
+            text="📂 Открыть папку со скинами",
+            command=self.open_skins_folder,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
             text_color="#1e1e2e",
-            font=ctk.CTkFont(size=14, weight="bold")
+            height=35
         )
-        self.install_btn.grid(row=4, column=0, sticky="ew", padx=15, pady=(0, 10))
+        open_folder_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
 
-        self.install_progressbar = AnimatedProgressBar(
-            main_frame,
-            height=15,
-            corner_radius=5,
-            progress_color="#f9e2af"
-        )
-        self.install_progressbar.grid(row=5, column=0, sticky="ew", padx=15, pady=(0, 2))
-        self.install_progressbar.set(0)
-
-        self.install_status_label = ctk.CTkLabel(
-            main_frame,
-            text="Выберите тип и версию, затем нажмите 'Установить'",
-            font=ctk.CTkFont(size=13),
-            text_color="#89b4fa"
-        )
-        self.install_status_label.grid(row=6, column=0, sticky="w", padx=15, pady=(5, 0))
-
-        info_frame = ctk.CTkFrame(main_frame)
-        info_frame.grid(row=7, column=0, sticky="nsew", padx=15, pady=(15, 0))
-        info_frame.grid_columnconfigure(0, weight=1)
-        info_frame.grid_rowconfigure(0, weight=1)
-
-        info_text = """
-📌 Fabric/Forge устанавливаются автоматически через интернет
-   (может занять несколько минут)
-
-📌 Для Vanilla:
-   Просто выберите версию и нажмите "УСТАНОВИТЬ"
-
-📌 Для OptiFine:
-   1. Скачайте установщик с официального сайта (.jar)
-   2. Нажмите "Выбрать файл" и укажите его
-   3. Нажмите "УСТАНОВИТЬ"
-
-⚠️ Для Forge 1.12.2 и ниже требуется Java 8!
-   Лаунчер автоматически установит её при необходимости
-
-💡 После установки нажмите "Обновить список" на вкладке "Версии"
-        """
-
-        info_display = ctk.CTkTextbox(info_frame, font=ctk.CTkFont(family="Consolas", size=11))
-        info_display.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        info_display.insert("1.0", info_text)
-        info_display.configure(state="disabled")
-
-        file_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        file_frame.grid(row=8, column=0, sticky="ew", padx=15, pady=(0, 10))
-
-        self.install_file_label = ctk.CTkLabel(
-            file_frame,
-            text="❌ Файл не выбран (только для OptiFine)",
-            font=ctk.CTkFont(size=12),
-            text_color="#f38ba8"
-        )
-        self.install_file_label.grid(row=0, column=0, sticky="w", padx=10, pady=(5, 5))
-
-        select_btn = ctk.CTkButton(
-            file_frame,
-            text="📂 Выбрать файл установщика",
-            command=self.select_installer_file,
-            width=250,
-            height=30,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
-        )
-        select_btn.grid(row=1, column=0, padx=10, pady=(0, 5))
-
-        main_frame.grid_rowconfigure(7, weight=1)
-
-    def create_versions_tab(self):
-        tab = self.tab_view.tab("🔧 Версии")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            tab,
-            text="🔧 Установленные версии",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(15, 10))
-
-        self.versions_listbox = tk.Listbox(
-            tab,
-            bg="#1a1a2e",
-            fg="#cdd6f4",
-            selectbackground="#89b4fa",
-            selectforeground="#1e1e2e",
-            font=("Consolas", 11),
-            height=10,
-            relief="flat"
-        )
-        self.versions_listbox.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 10))
-
-        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 15))
-
-        refresh_btn = ctk.CTkButton(
-            btn_frame,
-            text="🔄 Обновить список",
-            command=self.scan_and_update_versions,
-            width=150,
-            height=35,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec",
-            font=ctk.CTkFont(size=13, weight="bold")
-        )
-        refresh_btn.grid(row=0, column=0, padx=(0, 10))
-
-        delete_btn = ctk.CTkButton(
-            btn_frame,
-            text="🗑️ Удалить версию",
-            command=self.delete_selected_version,
-            width=150,
-            height=35,
-            fg_color="#f38ba8",
-            hover_color="#e64553"
-        )
-        delete_btn.grid(row=0, column=1)
-
-        info_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        info_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 10))
-
-        self.version_info_label = ctk.CTkLabel(
-            info_frame,
-            text="💡 Нажмите 'Обновить список' для поиска новых версий\n"
-                 "📁 Версии хранятся в: versions/",
-            font=ctk.CTkFont(size=12),
+        info_label = ctk.CTkLabel(
+            right_frame,
+            text="💡 Двойной клик для просмотра информации\nПоддерживаются .png, .jpg, .jpeg",
+            font=ctk.CTkFont(size=11),
             text_color="#89b4fa",
             justify="left"
         )
-        self.version_info_label.pack(anchor="w")
+        info_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 5))
 
-    def create_files_tab(self):
-        tab = self.tab_view.tab("📁 Файлы")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
+    # =================================================================
+    # ТАЙМЕР ИГРЫ
+    # =================================================================
 
-        ctk.CTkLabel(
-            tab,
-            text="📁 Структура папки игры",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(15, 10))
+    def update_timer_display(self):
+        if self.timer_running:
+            self.timer_label.configure(text=f"⏱ Время игры: {self.format_time(self.timer_seconds)}")
+            self.timer_seconds += 1
+            self.after(1000, self.update_timer_display)
 
-        main_frame = ctk.CTkFrame(tab)
-        main_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 10))
-        main_frame.grid_columnconfigure(0, weight=1)
-        main_frame.grid_rowconfigure(0, weight=1)
+    def start_game_timer(self):
+        if not self.timer_running:
+            self.timer_running = True
+            self.timer_seconds = 0
+            self.log("⏱ Таймер запущен")
+            self.update_timer_display()
+            self.start_hygiene_reminder()
 
-        files_frame = ctk.CTkFrame(main_frame)
-        files_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        files_frame.grid_columnconfigure(0, weight=1)
-        files_frame.grid_rowconfigure(1, weight=1)
+    def stop_game_timer(self):
+        if self.timer_running:
+            self.timer_running = False
+            if self.timer_seconds > 0:
+                update_play_time(self.timer_seconds)
+                self.stats = load_stats()
+                self.log(f"⏱ Время игры сохранено: {self.format_time(self.timer_seconds)}")
+                self.update_info_display()
+                self.update_subtitle()
+            else:
+                self.log("⏱ Таймер остановлен (0 секунд)")
+            self.timer_label.configure(text="⏱ Время игры: 0с")
 
-        info_text = f"""
-📁 ПАПКА ИГРЫ: {MINECRAFT_DIR}
+    # =================================================================
+    # НАПОМИНАНИЯ
+    # =================================================================
 
-📁 ПАПКИ:
+    def get_funny_hygiene_message(self):
+        messages = [
+            "ТЕБЕ НОРМАС?",
+            "ПОВЕРБАНК",
+            "... ждет своего часа! Не заставляй его ждать!",
+            "Беги быстрее!",
+            "💧",
+            "🧽 Губка БОБ",
+            "🫧 Пена СКИЛЛ",
+            "ТИРАНЫ",
+            "ОЙ ДА КОНЧНО)",
+            "ВЫРУБАЙ!",
+            "Я СБРОШУ 250К ТОН ДРОТИЛА",
+            "Время!",
+            "🫧",
+            "ТЫ ЧЕГО",
+            "...",
+            "?",
+            ":Р",
+            ":З",
+            "ЫЫЫ",
+            "Не забудь про ждет! Не разочаровывай её!"
+        ]
+        return random.choice(messages)
 
-📁 assets/          Все игровые ресурсы: текстуры, звуки, шрифты, модели
-📁 config/          Конфиги модов (Forge / Fabric / Quilt)
-📁 libraries/       Библиотеки Java (LWJGL, логирование и пр.)
-📁 logs/            Логи игры (latest.log — последний)
-📁 mods/            Папка для установленных модов
-📁 resourcepacks/   Ресурспаки (.zip или папки)
-📁 runtime/         Встроенный Java Runtime
-📁 saves/           Твои сохранения (миры)
-📁 versions/        Установленные версии Minecraft
+    def start_hygiene_reminder(self):
+        if not self.settings.get("hygiene_reminders", True):
+            self.log("Напоминания отключены в настройках")
+            return
 
-📄 ФАЙЛЫ:
+        def reminder_thread():
+            INTERVAL = 1500  # 25 минут
 
-???
-        """
+            while True:
+                if self._closing or not self.timer_running:
+                    break
 
-        info_display = ctk.CTkTextbox(files_frame, font=ctk.CTkFont(family="Consolas", size=11))
-        info_display.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        info_display.insert("1.0", info_text)
-        info_display.configure(state="disabled")
+                time.sleep(INTERVAL)
 
-        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        btn_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-        btn_frame.grid_columnconfigure(0, weight=1)
+                if self._closing or not self.timer_running:
+                    break
 
-        row1 = ctk.CTkFrame(btn_frame, fg_color="transparent")
-        row1.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        row1.grid_columnconfigure(0, weight=1)
+                if self.settings.get("hygiene_reminders", True):
+                    message = self.get_funny_hygiene_message()
+                    self.after(0, lambda msg=message: self.show_hygiene_notification(msg))
 
-        btn_mods = ctk.CTkButton(
-            row1,
-            text="📦 Моды",
-            command=lambda: self.open_subfolder("mods"),
-            width=100,
-            height=30,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
+        threading.Thread(target=reminder_thread, daemon=True).start()
+        self.log("⏰ Напоминания каждые 25 минут запущены!")
+
+    def manual_hygiene_reminder(self):
+        if not self.settings.get("hygiene_reminders", True):
+            if messagebox.askyesno(
+                    "Напоминания отключены",
+                    "Напоминания отключены в настройках.\n\nВключить сейчас?"
+            ):
+                self.settings["hygiene_reminders"] = True
+                self.hygiene_reminders_var.set(True)
+                save_launcher_settings(self.settings)
+                self.log("Напоминания включены")
+                self.start_hygiene_reminder()
+            return
+
+        message = self.get_funny_hygiene_message()
+        self.show_hygiene_notification(message)
+
+    def show_hygiene_notification(self, message):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("ам ам")
+        dialog.geometry("450x350")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        icon_label = ctk.CTkLabel(
+            dialog,
+            text="🧼",
+            font=ctk.CTkFont(size=70)
         )
-        btn_mods.grid(row=0, column=0, padx=5)
+        icon_label.pack(pady=(20, 10))
 
-        btn_saves = ctk.CTkButton(
-            row1,
-            text="💾 Сохранения",
-            command=lambda: self.open_subfolder("saves"),
-            width=100,
-            height=30,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
+        header = ctk.CTkLabel(
+            dialog,
+            text="Время покажет",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="#89b4fa"
         )
-        btn_saves.grid(row=0, column=1, padx=5)
+        header.pack(pady=(0, 10))
 
-        btn_resourcepacks = ctk.CTkButton(
-            row1,
-            text="🎨 Ресурспаки",
-            command=lambda: self.open_subfolder("resourcepacks"),
-            width=100,
-            height=30,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
+        time_label = ctk.CTkLabel(
+            dialog,
+            text=f"🕐 Ты играешь уже: {self.format_time(self.timer_seconds)}",
+            font=ctk.CTkFont(size=13),
+            text_color="#f9e2af"
         )
-        btn_resourcepacks.grid(row=0, column=2, padx=5)
+        time_label.pack(pady=(0, 10))
 
-        btn_config = ctk.CTkButton(
-            row1,
-            text="⚙️ Конфиги",
-            command=lambda: self.open_subfolder("config"),
-            width=100,
-            height=30,
-            fg_color="#89b4fa",
-            hover_color="#74c7ec"
+        msg_label = ctk.CTkLabel(
+            dialog,
+            text=message,
+            font=ctk.CTkFont(size=14),
+            wraplength=380,
+            justify="center"
         )
-        btn_config.grid(row=0, column=3, padx=5)
+        msg_label.pack(pady=(10, 20), padx=20)
 
-        row2 = ctk.CTkFrame(btn_frame, fg_color="transparent")
-        row2.grid(row=1, column=0, sticky="ew")
-        row2.grid_columnconfigure(0, weight=1)
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=(0, 20))
 
-        btn_logs = ctk.CTkButton(
-            row2,
-            text="📋 Логи",
-            command=lambda: self.open_subfolder("logs"),
-            width=100,
-            height=30,
-            fg_color="#f9e2af",
-            hover_color="#f5d742",
-            text_color="#1e1e2e"
-        )
-        btn_logs.grid(row=0, column=0, padx=5)
+        def go_shower():
+            self.log("🚿 Пользователь пошел мыться! Отличное решение!")
+            messagebox.showinfo(
+                "🌟 Молодец!",
+                "\n\nА когда вернешься - игра не не будет тебя ждать"
+            )
+            dialog.destroy()
 
-        btn_options = ctk.CTkButton(
-            row2,
-            text="⚙️ Настройки игры",
-            command=lambda: self.open_file("options.txt"),
-            width=100,
-            height=30,
-            fg_color="#f9e2af",
-            hover_color="#f5d742",
-            text_color="#1e1e2e"
-        )
-        btn_options.grid(row=0, column=1, padx=5)
+        def later():
+            self.log("😅 Пользователь отложил...")
+            if messagebox.askyesno(
+                    "Напомнить позже?",
+                    "Хочешь, чтобы я напомнил тебе через 15 минут?"
+            ):
+                self.log("⏰ Установлено напоминание через 15 минут")
+                threading.Thread(target=lambda: self.delayed_reminder(900), daemon=True).start()
+            dialog.destroy()
 
-        btn_servers = ctk.CTkButton(
-            row2,
-            text="🌐 Серверы",
-            command=lambda: self.open_file("servers.dat"),
-            width=100,
-            height=30,
-            fg_color="#f9e2af",
-            hover_color="#f5d742",
-            text_color="#1e1e2e"
-        )
-        btn_servers.grid(row=0, column=2, padx=5)
+        def never_remind():
+            self.log("🚫 Пользователь отключил напоминания ")
+            self.settings["hygiene_reminders"] = False
+            self.hygiene_reminders_var.set(False)
+            save_launcher_settings(self.settings)
+            dialog.destroy()
+            messagebox.showinfo(
+                "🧼 Напоминания отключены",
+                "Напоминания е отключены.\n\nТы всегда можешь включить их в настройках или нажать кнопку '🧼 Напомнить ' в любое время."
+            )
 
-        btn_versions = ctk.CTkButton(
-            row2,
-            text="📂 Версии",
-            command=lambda: self.open_subfolder("versions"),
-            width=100,
-            height=30,
-            fg_color="#f9e2af",
-            hover_color="#f5d742",
-            text_color="#1e1e2e"
-        )
-        btn_versions.grid(row=0, column=3, padx=5)
-
-        open_root_btn = ctk.CTkButton(
+        shower_btn = ctk.CTkButton(
             btn_frame,
-            text="📂 Открыть папку игры",
-            command=self.open_game_folder,
-            height=35,
+            text="да конечно",
+            command=go_shower,
             fg_color="#a6e3a1",
             hover_color="#7ecb8f",
             text_color="#1e1e2e",
-            font=ctk.CTkFont(size=13, weight="bold")
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=130,
+            height=45
         )
-        open_root_btn.grid(row=2, column=0, sticky="ew", padx=5, pady=(10, 0))
+        shower_btn.grid(row=0, column=0, padx=5)
 
-    def open_subfolder(self, folder_name):
-        path = os.path.join(MINECRAFT_DIR, folder_name)
-        if os.path.exists(path):
-            os.startfile(path)
-            self.log(f"📂 Открыта папка: {folder_name}")
-        else:
+        later_btn = ctk.CTkButton(
+            btn_frame,
+            text="⏰ Позже",
+            command=later,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e",
+            width=100,
+            height=45
+        )
+        later_btn.grid(row=0, column=1, padx=5)
+
+        never_btn = ctk.CTkButton(
+            btn_frame,
+            text="🔕 Не напоминать",
+            command=never_remind,
+            fg_color="#f38ba8",
+            hover_color="#e64553",
+            width=130,
+            height=45
+        )
+        never_btn.grid(row=0, column=2, padx=5)
+
+        try:
+            import winsound
+            winsound.Beep(1000, 500)
+            winsound.Beep(1200, 300)
+        except:
+            pass
+
+        self.show_system_notification("дядя", message)
+
+    def delayed_reminder(self, delay_seconds):
+        time.sleep(delay_seconds)
+        if not self._closing and self.settings.get("hygiene_reminders", True):
+            self.after(0, lambda: self.show_hygiene_notification("Я же говорил! Время не ждет!"))
+
+    def show_system_notification(self, title, message):
+        if sys.platform == "win32":
             try:
-                os.makedirs(path, exist_ok=True)
-                os.startfile(path)
-                self.log(f"📂 Создана и открыта папка: {folder_name}")
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{e}")
-                self.log(f"❌ Ошибка открытия папки {folder_name}: {e}")
+                from win10toast import ToastNotifier
+                toaster = ToastNotifier()
+                toaster.show_toast(title, message, duration=10, threaded=True)
+            except:
+                pass
 
-    def open_file(self, filename):
-        path = os.path.join(MINECRAFT_DIR, filename)
-        if os.path.exists(path):
+    # =================================================================
+    # ЗАПУСК ИГРЫ
+    # =================================================================
+
+    def launch_game(self):
+        if self.is_launching:
+            return
+
+        username = self.account_combo.get()
+        if username == "Нет аккаунтов" or not username:
+            messagebox.showwarning("Ошибка", "Сначала создайте аккаунт")
+            return
+
+        version = self.version_combo.get()
+        if version == "Нет версий" or not version:
+            messagebox.showwarning("Ошибка", "Сначала установите версию Minecraft")
+            return
+
+        ram = self.ram_var.get()
+
+        skin_name = self.skin_combo.get()
+        skin_path = None
+        if skin_name and skin_name != "Нет скинов" and skin_name != "Загрузка...":
+            skin_path = os.path.join(get_skins_folder(), skin_name)
+            if not os.path.exists(skin_path):
+                skin_path = None
+
+        self.is_launching = True
+        self.launch_btn.configure(state="disabled", text="⏳ ЗАПУСК...")
+        self.launch_progressbar.start_animation()
+        self.launch_status_label.configure(text="⏳ Запуск Minecraft...", text_color="#f9e2af")
+        self.log(f"🚀 Запуск: {version} от {username} с памятью {ram}")
+        if skin_path:
+            self.log(f"🎨 Используется скин: {skin_name}")
+        self.update_idletasks()
+
+        def do_launch():
+            error_message = None
+            success = False
+
             try:
-                os.startfile(path)
-                self.log(f"📄 Открыт файл: {filename}")
+                java_path = get_java_for_version(version)
+                self.log(f"☕ Java: {java_path}")
+
+                java_ver = get_java_version(java_path)
+                self.log(f"☕ Java версия: {java_ver}")
+
+                version_path = os.path.join(MINECRAFT_DIR, "versions", version)
+                if not os.path.exists(version_path):
+                    error_message = f"Версия {version} не найдена"
+                    self.after(0, lambda: self.launch_finish(False, error_message))
+                    return
+
+                jar_path = os.path.join(version_path, f"{version}.jar")
+                if not os.path.exists(jar_path):
+                    error_message = f"JAR файл не найден: {jar_path}"
+                    self.log(f"❌ {error_message}")
+                    self.after(0, lambda: self.launch_finish(False, error_message))
+                    return
+
+                if skin_path and os.path.exists(skin_path):
+                    self.create_skin_data(username, skin_path)
+                    self.log(f"🎨 Скин {skin_name} установлен для {username}")
+
+                self.log("⏳ Запуск через minecraft_launcher_lib...")
+
+                # ========== ИСПРАВЛЕННЫЙ КОД ЗАПУСКА ==========
+                # Получаем команду с options
+                command = mll.command.get_minecraft_command(
+                    version=version,
+                    minecraft_directory=MINECRAFT_DIR,
+                    options=mll.utils.generate_test_options()
+                )
+
+                # Очищаем старые аргументы
+                cleaned_command = []
+                i = 0
+                while i < len(command):
+                    arg = command[i]
+                    if arg in ["--username", "--uuid", "--accessToken", "--userType"]:
+                        i += 2
+                        continue
+                    cleaned_command.append(arg)
+                    i += 1
+
+                command = cleaned_command
+
+                # Добавляем правильные аргументы
+                command.extend(["--username", username])
+                command.extend(["--uuid", "00000000-0000-0000-0000-000000000000"])
+                command.extend(["--accessToken", "0"])
+                command.extend(["--userType", "mojang"])
+
+                if java_path != "java":
+                    command.insert(0, java_path)
+
+                self.log(f"📋 Команда: {' '.join(command[:8])}...")
+
+                if sys.platform == "win32":
+                    self.minecraft_process = subprocess.Popen(
+                        command,
+                        cwd=MINECRAFT_DIR,
+                        creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+                    )
+                else:
+                    self.minecraft_process = subprocess.Popen(
+                        command,
+                        cwd=MINECRAFT_DIR,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1
+                    )
+
+                def read_output(pipe, name):
+                    try:
+                        for line in iter(pipe.readline, ''):
+                            if line:
+                                line = line.strip()
+                                if line:
+                                    self.log(f"[{name}] {line}")
+                    except:
+                        pass
+
+                threading.Thread(target=read_output, args=(self.minecraft_process.stdout, "Minecraft"),
+                                 daemon=True).start()
+                threading.Thread(target=read_output, args=(self.minecraft_process.stderr, "ERROR"), daemon=True).start()
+
+                self.log("✅ Процесс запущен!")
+                success = True
+                error_message = "Игра запущена!"
+
+                update_stats()
+                self.stats = load_stats()
+                self.start_game_timer()
+
+                def monitor_process():
+                    if self.minecraft_process:
+                        self.minecraft_process.wait()
+                        self.after(0, self.stop_game_timer)
+                        self.log("🔄 Игра закрыта, таймер остановлен")
+
+                threading.Thread(target=monitor_process, daemon=True).start()
+
             except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
-                self.log(f"❌ Ошибка открытия файла {filename}: {e}")
+                error_message = str(e)
+                self.log(f"❌ Ошибка запуска: {error_message}")
+                self.stop_game_timer()
+
+            if success:
+                self.after(0, lambda: self.launch_finish(True, error_message))
+            else:
+                self.after(0, lambda: self.launch_finish(False, error_message))
+
+        threading.Thread(target=do_launch, daemon=True).start()
+
+    def launch_finish(self, success, message):
+        self.is_launching = False
+        self.launch_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ИГРУ")
+        self.launch_progressbar.stop_animation()
+
+        if success:
+            self.launch_status_label.configure(text="✅ Игра запущена!", text_color="#a6e3a1")
+            self.launch_progressbar.set(1.0)
+            self.launch_progressbar.configure(progress_color="#a6e3a1")
+            self.log("✅ Игра успешно запущена")
+            self.save_current_selection()
+            self.stats = load_stats()
+            self.update_info_display()
+            self.update_subtitle()
         else:
-            messagebox.showinfo("Информация",
-                                f"Файл {filename} не найден\n\nВозможно, он будет создан после запуска игры.")
-            self.log(f"ℹ️ Файл не найден: {filename}")
+            self.launch_status_label.configure(text="❌ Ошибка запуска", text_color="#f38ba8")
+            self.launch_progressbar.set(0.3)
+            self.launch_progressbar.configure(progress_color="#f38ba8")
+            self.log(f"❌ Ошибка запуска: {message}")
+            self.stop_game_timer()
 
-    def create_settings_tab(self):
-        tab = self.tab_view.tab("⚙️ Настройки")
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(0, weight=1)
-
-        settings_frame = ctk.CTkFrame(tab)
-        settings_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
-        settings_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            settings_frame,
-            text="📁 Путь к файлам игры",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=15, pady=(15, 5))
-
-        path_entry = ctk.CTkEntry(
-            settings_frame,
-            font=ctk.CTkFont(family="Consolas", size=11),
-            state="readonly"
-        )
-        path_entry.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 15))
-        path_entry.insert(0, os.path.abspath(MINECRAFT_DIR))
-
-        ctk.CTkLabel(
-            settings_frame,
-            text="ℹ️ О программе",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=2, column=0, sticky="w", padx=15, pady=(0, 5))
-
-        about_text = f"""
-IONUX Launcher - Minecraft Launcher
-
-Версия: 1.0 (CustomTkinter)
-Разработчик: IONUX
-
-Особенности:
-• Автоматическая установка Java
-• Установка модов через Modrinth
-• Установка Vanilla/Fabric/Forge/OptiFine
-• Автоматическое сканирование установленных версий
-• Автоматическое создание профилей (profile.json)
-• Управление версиями
-• Доступ к структуре папки игры
-• Несколько офлайн-аккаунтов
-• Настройка выделения памяти
-• Современный дизайн
-
-📁 Папка игры:
-{os.path.abspath(MINECRAFT_DIR)}
-        """
-
-        about_display = ctk.CTkTextbox(settings_frame, font=ctk.CTkFont(family="Consolas", size=11))
-        about_display.grid(row=3, column=0, sticky="nsew", padx=15, pady=(0, 15))
-        about_display.insert("1.0", about_text)
-        about_display.configure(state="disabled")
-
-        open_btn = ctk.CTkButton(
-            settings_frame,
-            text="📂 Открыть папку с игрой",
-            command=self.open_game_folder,
-            width=200
-        )
-        open_btn.grid(row=4, column=0, pady=(0, 15))
-
-        settings_frame.grid_rowconfigure(3, weight=1)
-
-    def show_install_popular_versions(self):
-        versions = ["1.21", "1.20.4", "1.20.1", "1.19.2", "1.18.2", "1.17.1", "1.16.5", "1.15.2", "1.12.2", "1.8.9"]
-
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Популярные версии")
-        dialog.geometry("250x350")
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text="Выберите версию:", font=ctk.CTkFont(size=13)).pack(pady=(15, 10))
-
-        listbox = tk.Listbox(
-            dialog,
-            bg="#1a1a2e",
-            fg="#cdd6f4",
-            selectbackground="#89b4fa",
-            font=("Consolas", 12)
-        )
-        listbox.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-
-        for v in versions:
-            listbox.insert("end", v)
-
-        def select():
-            selection = listbox.curselection()
-            if selection:
-                self.install_version_entry.delete(0, "end")
-                self.install_version_entry.insert(0, versions[selection[0]])
-                dialog.destroy()
-
-        ctk.CTkButton(
-            dialog,
-            text="Выбрать",
-            command=select
-        ).pack(pady=(0, 15))
-
-    def select_installer_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Выберите установщик клиента",
-            filetypes=[
-                ("JAR файлы", "*.jar"),
-                ("Все файлы", "*.*")
-            ]
-        )
-
-        if file_path:
-            if file_path.lower().endswith('.exe'):
-                messagebox.showwarning(
-                    "Предупреждение",
-                    "Вы выбрали .exe файл!\n\n"
-                    "Для установки OptiFine используйте .jar версию установщика.\n"
-                    "Скачайте установщик (.jar) с официального сайта."
-                )
-                self.selected_installer_path = None
-                self.install_file_label.configure(
-                    text="❌ Неверный формат! Используйте .jar файл",
-                    text_color="#f38ba8"
-                )
-                return
-
-            self.selected_installer_path = file_path
-            filename = os.path.basename(file_path)
-            self.install_file_label.configure(
-                text=f"✅ Выбран: {filename}",
-                text_color="#a6e3a1"
+            java_ver = '17' if '1.20' in self.version_combo.get() else '8'
+            messagebox.showerror(
+                "Ошибка запуска",
+                f"Не удалось запустить игру.\n\nОшибка: {message}\n\nУбедитесь, что установлена Java {java_ver}."
             )
-            self.log(f"📂 Выбран файл: {file_path}")
 
     # =================================================================
-    # УСТАНОВКА КЛИЕНТОВ - ИСПРАВЛЕННАЯ
+    # УСТАНОВКА КЛИЕНТОВ
     # =================================================================
+
+    def install_vanilla(self, version):
+        try:
+            is_snapshot = "snapshot" in version.lower() or "pre" in version.lower() or "rc" in version.lower()
+
+            if is_snapshot:
+                self.log(f"⚠️ Устанавливается снапшот: {version}")
+                self.install_status_label.configure(text="⚠️ Устанавливается снапшот!")
+                self.update_idletasks()
+
+            self.log(f"📦 Установка Vanilla {version}...")
+            self.install_status_label.configure(text="Установка Vanilla...")
+            self.update_idletasks()
+
+            mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
+            self.log(f"✅ Vanilla {version} установлен!")
+
+            version_name = f"Vanilla {version}"
+            if is_snapshot:
+                version_name = f"🔬 Snapshot {version}"
+
+            create_profile(version, version_name)
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка: {e}")
+            return False
+
+    def install_fabric(self, version):
+        try:
+            self.log(f"📦 Установка Fabric {version}...")
+            self.install_status_label.configure(text="Загрузка Fabric...")
+            self.update_idletasks()
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.log(f"🔄 Попытка {attempt + 1} из {max_retries}")
+                    mll.fabric.install_fabric(version, MINECRAFT_DIR, callback=mll_callback)
+                    break
+                except Exception as e:
+                    self.log(f"⚠️ Ошибка попытки {attempt + 1}: {e}")
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(2)
+
+            self.log(f"✅ Fabric {version} установлен!")
+            self.install_status_label.configure(text="✅ Fabric установлен!")
+            self.update_idletasks()
+
+            installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
+            fabric_versions = [v for v in installed if "fabric" in v["id"].lower()]
+            if fabric_versions:
+                fabric_id = fabric_versions[-1]["id"]
+                create_profile(fabric_id, f"Fabric {version}")
+                self.log(f"✅ Профиль создан для: {fabric_id}")
+            else:
+                fabric_id = f"fabric-loader-0.14.22-{version}"
+                create_profile(fabric_id, f"Fabric {version}")
+
+            self.scan_and_update_versions()
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка установки Fabric: {e}")
+            return False
+
+    def install_forge(self, version):
+        try:
+            self.log(f"📦 Установка Forge {version}...")
+
+            self.log(f"📦 Шаг 1/2: Установка оригинальной версии {version}...")
+            self.install_status_label.configure(text="Установка Vanilla...")
+            self.update_idletasks()
+
+            mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
+
+            self.log(f"📦 Шаг 2/2: Установка Forge...")
+            self.install_status_label.configure(text="Установка Forge...")
+            self.update_idletasks()
+
+            forge_installed = False
+
+            if hasattr(mll.forge, 'install_forge'):
+                try:
+                    self.log("🔧 Способ 1: mll.forge.install_forge")
+                    mll.forge.install_forge(version, MINECRAFT_DIR, mll_callback)
+                    forge_installed = True
+                except Exception as e:
+                    self.log(f"⚠️ Способ 1 не сработал: {e}")
+
+            if not forge_installed and hasattr(mll.install, 'install_forge'):
+                try:
+                    self.log("🔧 Способ 2: mll.install.install_forge")
+                    mll.install.install_forge(version, MINECRAFT_DIR, mll_callback)
+                    forge_installed = True
+                except Exception as e:
+                    self.log(f"⚠️ Способ 2 не сработал: {e}")
+
+            if not forge_installed and hasattr(mll.forge, 'install'):
+                try:
+                    self.log("🔧 Способ 3: mll.forge.install")
+                    mll.forge.install(version, MINECRAFT_DIR, mll_callback)
+                    forge_installed = True
+                except Exception as e:
+                    self.log(f"⚠️ Способ 3 не сработал: {e}")
+
+            if not forge_installed:
+                self.log("🔧 Способ 4: Ручная установка через официальный установщик")
+                forge_installed = self.install_forge_manual(version)
+
+            if not forge_installed:
+                raise Exception("Не удалось установить Forge ни одним способом")
+
+            self.log(f"✅ Forge {version} установлен!")
+            self.install_status_label.configure(text="✅ Forge установлен!")
+            self.update_idletasks()
+
+            installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
+            forge_versions = [v for v in installed if "forge" in v["id"].lower()]
+            if forge_versions:
+                forge_id = forge_versions[-1]["id"]
+                create_profile(forge_id, f"Forge {version}")
+                self.log(f"✅ Профиль создан для: {forge_id}")
+            else:
+                forge_id = f"forge-{version}"
+                create_profile(forge_id, f"Forge {version}")
+
+            self.scan_and_update_versions()
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка установки Forge: {e}")
+            return False
+
+    def install_forge_manual(self, version):
+        try:
+            import urllib.request
+
+            self.log("📥 Скачивание установщика Forge...")
+
+            forge_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{version}/forge-{version}-installer.jar"
+            installer_path = os.path.join(tempfile.gettempdir(), f"forge-{version}-installer.jar")
+
+            def report_progress(count, block_size, total_size):
+                if total_size > 0:
+                    percent = int(count * block_size * 100 / total_size)
+                    if percent % 10 == 0:
+                        self.log(f"📊 Скачивание Forge: {percent}%")
+
+            urllib.request.urlretrieve(forge_url, installer_path, report_progress)
+
+            self.log("🔧 Запуск установщика Forge...")
+
+            java_path = get_java_for_version(version)
+            cmd = [
+                java_path,
+                "-jar",
+                installer_path,
+                "--installClient",
+                MINECRAFT_DIR
+            ]
+
+            process = subprocess.Popen(
+                cmd,
+                cwd=MINECRAFT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    self.log(f"📌 {output.strip()}")
+
+            if process.returncode != 0:
+                stderr = process.stderr.read()
+                self.log(f"❌ Ошибка установки Forge: {stderr}")
+                return False
+
+            try:
+                os.remove(installer_path)
+            except:
+                pass
+
+            self.log("✅ Forge установлен через официальный установщик")
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка ручной установки Forge: {e}")
+            return False
+
+    def install_optifine(self, version):
+        try:
+            if not hasattr(self, 'selected_installer_path') or not self.selected_installer_path:
+                self.log("❌ Файл не выбран")
+                return False
+
+            self.log(f"📦 Установка OptiFine {version} из файла...")
+            self.install_status_label.configure(text="Установка OptiFine...")
+            self.update_idletasks()
+
+            self.log(f"📦 Шаг 1/2: Установка оригинальной версии {version}...")
+            self.install_status_label.configure(text="Установка Vanilla...")
+            self.update_idletasks()
+
+            mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
+
+            self.log(f"📦 Шаг 2/2: Установка OptiFine...")
+            self.install_status_label.configure(text="Установка OptiFine...")
+            self.update_idletasks()
+
+            mll.optifine.install_optifine(self.selected_installer_path, MINECRAFT_DIR, mll_callback)
+
+            self.log(f"✅ OptiFine {version} установлен!")
+            self.install_status_label.configure(text="✅ OptiFine установлен!")
+            self.update_idletasks()
+
+            installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
+            optifine_versions = [v for v in installed if "optifine" in v["id"].lower() or "of" in v["id"].lower()]
+            if optifine_versions:
+                optifine_id = optifine_versions[-1]["id"]
+                create_profile(optifine_id, f"OptiFine {version}")
+                self.log(f"✅ Профиль создан для: {optifine_id}")
+            else:
+                optifine_id = f"OptiFine_{version}"
+                create_profile(optifine_id, f"OptiFine {version}")
+
+            self.scan_and_update_versions()
+            self.selected_installer_path = None
+            self.install_file_label.configure(text="❌ Файл не выбран (только для OptiFine)", text_color="#f38ba8")
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Ошибка установки OptiFine: {e}")
+            return False
 
     def install_selected_client(self):
         install_type = self.install_type_var.get()
@@ -1551,7 +2808,6 @@ IONUX Launcher - Minecraft Launcher
             messagebox.showwarning("Ошибка", "Введите версию Minecraft")
             return
 
-        # Для OptiFine нужен файл установщика
         if install_type == "optifine":
             if not hasattr(self, 'selected_installer_path') or not self.selected_installer_path:
                 messagebox.showwarning("Ошибка", "Сначала выберите файл установщика OptiFine")
@@ -1560,20 +2816,19 @@ IONUX Launcher - Minecraft Launcher
             if self.selected_installer_path.lower().endswith('.exe'):
                 messagebox.showwarning(
                     "Ошибка",
-                    "Для установки OptiFine используйте .jar версию установщика!\n"
-                    "Скачайте установщик (.jar) с официального сайта."
+                    "Для установки OptiFine используйте .jar версию установщика!\nСкачайте установщик (.jar) с официального сайта."
                 )
                 return
 
         self.log(f"📦 Установка {install_type} {version}")
         self.install_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
         self.install_progressbar.start_animation()
-        self.install_status_label.configure(text="Установка...", text_color="#f9e2af")
+        self.install_status_label.configure(text="Подготовка...", text_color="#f9e2af")
+        self.update_idletasks()
 
         def do_install():
             success = False
 
-            # Очищаем временные папки перед установкой
             cleanup_forge_temp()
 
             if install_type == "vanilla":
@@ -1608,699 +2863,1343 @@ IONUX Launcher - Minecraft Launcher
                 )
                 messagebox.showerror("Ошибка", f"Не удалось установить {install_type} {version}")
 
-            # Очищаем временные папки после установки
             cleanup_forge_temp()
 
         threading.Thread(target=do_install, daemon=True).start()
 
-    def install_vanilla(self, version):
+    # =================================================================
+    # КОНСОЛЬ И ЛОГИ
+    # =================================================================
+
+    def log(self, message):
         try:
-            log_message(f"📦 Установка Vanilla {version}...")
-            mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
-            log_message(f"✅ Vanilla {version} установлен!")
-            create_profile(version, f"Vanilla {version}")
-            return True
-        except Exception as e:
-            log_message(f"❌ Ошибка: {e}")
-            return False
+            if hasattr(self, 'console_text') and self.console_text:
+                timestamp = time.strftime("%H:%M:%S")
+                self.console_text.insert("end", f"[{timestamp}] {message}\n")
+                self.console_text.see("end")
+        except:
+            print(f"LOG: {message}")
 
-    def install_fabric(self, version):
-        try:
-            log_message(f"📦 Установка Fabric {version}...")
+    def clear_console(self):
+        self.console_text.delete("1.0", "end")
+        self.console_text.insert("1.0", "[00:00:00] Консоль очищена\n")
 
-            # Устанавливаем Fabric напрямую через MLL (как в рабочей версии)
-            mll.fabric.install_fabric(version, MINECRAFT_DIR, callback=mll_callback)
+    # =================================================================
+    # МЕТОДЫ ДЛЯ ИНТЕРФЕЙСА
+    # =================================================================
 
-            log_message(f"✅ Fabric {version} установлен!")
+    def create_widgets(self):
+        """Создает все виджеты интерфейса"""
+        # Основной контейнер
+        self.main_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_container.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.main_container.grid_columnconfigure(0, weight=1)
+        self.main_container.grid_rowconfigure(1, weight=1)
 
-            # Находим установленную версию Fabric
-            installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
-            fabric_versions = [v for v in installed if "fabric" in v["id"].lower()]
-            if fabric_versions:
-                fabric_id = fabric_versions[-1]["id"]
-                create_profile(fabric_id, f"Fabric {version}")
-                log_message(f"✅ Профиль создан для: {fabric_id}")
-            else:
-                # Если не нашли, создаём профиль с предполагаемым именем
-                fabric_id = f"fabric-loader-0.14.22-{version}"
-                create_profile(fabric_id, f"Fabric {version}")
+        # Верхняя панель с заголовком и кнопкой темы
+        top_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        top_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top_frame.grid_columnconfigure(0, weight=1)
 
-            self.scan_and_update_versions()
-            return True
+        title_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
 
-        except Exception as e:
-            log_message(f"❌ Ошибка установки Fabric: {e}")
-            return False
+        ctk.CTkLabel(
+            title_frame,
+            text="⚡ 67Launcher",
+            font=ctk.CTkFont(size=28, weight="bold"),
+            text_color="#89b4fa"
+        ).pack(side="left")
 
-    def install_forge(self, version):
-        try:
-            log_message(f"📦 Установка Forge {version}...")
+        # Отображаем счетчик запусков (обнулен если 0)
+        launch_display = self.settings.get('launch_count', 0)
+        if launch_display == 0:
+            launch_text = "обнулен"
+        else:
+            launch_text = str(launch_display)
 
-            # Шаг 1: Устанавливаем оригинальную версию Minecraft
-            log_message(f"📦 Шаг 1/2: Установка оригинальной версии {version}...")
-            mll.install.install_minecraft_version(version, MINECRAFT_DIR, callback=mll_callback)
-            log_message(f"✅ Оригинальная версия установлена!")
+        self.subtitle_label = ctk.CTkLabel(
+            title_frame,
+            text=f"📁 {MINECRAFT_DIR} | Запуск #{launch_text}",
+            font=ctk.CTkFont(size=11),
+            text_color="#a6a6a6"
+        )
+        self.subtitle_label.pack(side="left", padx=(10, 0))
 
-            # Шаг 2: Находим версию Forge
-            log_message(f"🔍 Поиск Forge для версии {version}...")
-            forge_version = mll.forge.find_forge_version(version)
-            if forge_version is None:
-                log_message(f"❌ Forge не поддерживает версию {version}")
-                return False
+        # Кнопка переключения темы
+        self.theme_btn = ctk.CTkButton(
+            top_frame,
+            text="🌙 Тёмная" if ctk.get_appearance_mode() == "Dark" else "☀️ Светлая",
+            command=self.toggle_theme,
+            width=120,
+            height=30,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec",
+            font=ctk.CTkFont(size=12)
+        )
+        self.theme_btn.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-            log_message(f"✅ Найдена Forge версия: {forge_version}")
+        # Вкладки
+        self.tab_view = ctk.CTkTabview(self.main_container)
+        self.tab_view.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
 
-            # Шаг 3: Устанавливаем Forge поверх оригинальной версии
-            log_message(f"📦 Шаг 2/2: Установка Forge {forge_version}...")
-            mll.forge.install_forge_version(forge_version, MINECRAFT_DIR, callback=mll_callback)
+        self.tab_view.add("🎮 Игра")
+        self.tab_view.add("📦 Установка")
+        self.tab_view.add("👤 Аккаунты")
+        self.tab_view.add("📦 Моды")
+        self.tab_view.add("🎨 Скины")
+        self.tab_view.add("📦 Ресурспаки")
+        self.tab_view.add("⚙️ Настройки")
+        self.tab_view.add("📊 Статистика")
 
-            # Получаем ID версии Forge для запуска
-            installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
-            forge_versions = [v for v in installed if "forge" in v["id"].lower()]
-            if forge_versions:
-                forge_id = forge_versions[-1]["id"]
-                create_profile(forge_id, f"Forge {version}")
-                log_message(f"✅ Профиль создан для: {forge_id}")
+        self.create_game_tab()
+        self.create_install_tab()
+        self.create_accounts_tab()
+        self.create_mods_tab()
+        self.create_skins_tab()
+        self.create_resourcepacks_tab()
+        self.create_settings_tab()
+        self.create_stats_tab()
 
-            log_message(f"✅ Forge {version} установлен!")
-            self.scan_and_update_versions()
-            return True
+        # Панель скачивания
+        self.create_download_panel()
 
-        except Exception as e:
-            log_message(f"❌ Ошибка установки Forge: {e}")
-            return False
+        # Консоль
+        self.create_console()
 
-    def install_optifine(self, version):
-        try:
-            installer_path = self.selected_installer_path
+    def create_mods_tab(self):
+        """Создает вкладку модов с поиском на Modrinth"""
+        tab = self.tab_view.tab("📦 Моды")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
 
-            if not installer_path.lower().endswith('.jar'):
-                messagebox.showerror("Ошибка", "Для установки OptiFine используйте .jar версию установщика!")
-                return False
+        # ЛЕВАЯ ПАНЕЛЬ - ПОИСК И УСТАНОВКА МОДОВ
+        left_frame = ctk.CTkFrame(tab)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(4, weight=1)
 
-            java_path = get_java_for_version(version)
+        ctk.CTkLabel(
+            left_frame,
+            text="🔍 Поиск модов на Modrinth",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
 
-            log_message(f"📦 Установка OptiFine {version}...")
-            log_message(f"☕ Используется Java: {java_path}")
+        # Версия Minecraft
+        ctk.CTkLabel(left_frame, text="🎮 Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=1, column=0, sticky="w", padx=10, pady=(5, 2)
+        )
+        self.mod_version_entry = ctk.CTkEntry(
+            left_frame,
+            placeholder_text="1.20.4",
+            height=32,
+            width=200
+        )
+        self.mod_version_entry.insert(0, "1.20.1")
+        self.mod_version_entry.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
 
-            # Устанавливаем Vanilla если нет
-            versions_dir = os.path.join(MINECRAFT_DIR, "versions", version)
-            if not os.path.exists(versions_dir):
-                log_message(f"📦 Установка Vanilla {version}...")
-                mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
-                log_message(f"✅ Vanilla {version} установлен!")
+        # Загрузчик
+        ctk.CTkLabel(left_frame, text="🔧 Загрузчик:", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=3, column=0, sticky="w", padx=10, pady=(0, 2)
+        )
 
-            cmd = [java_path, "-jar", installer_path]
-            log_message(f"⚙️ Запуск: {' '.join(cmd)}")
+        loader_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        loader_frame.grid(row=4, column=0, sticky="w", padx=10, pady=(0, 8))
 
-            process = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
-                timeout=300
+        self.mod_loader_var = ctk.StringVar(value="fabric")
+        loaders = [
+            ("🧵 Fabric", "fabric"),
+            ("🔥 Forge", "forge"),
+            ("🧶 Quilt", "quilt")
+        ]
+
+        for i, (text, value) in enumerate(loaders):
+            rb = ctk.CTkRadioButton(
+                loader_frame,
+                text=text,
+                variable=self.mod_loader_var,
+                value=value
             )
+            rb.grid(row=0, column=i, padx=(0, 15))
 
-            if process.returncode != 0:
-                log_message(f"⚠️ Ошибка: {process.stderr}")
-                return False
+        # Поиск
+        ctk.CTkLabel(left_frame, text="🔍 Название мода:", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=5, column=0, sticky="w", padx=10, pady=(0, 2)
+        )
 
-            log_message(f"✅ OptiFine {version} установлен!")
-            self.scan_and_update_versions()
-            return True
+        search_row = ctk.CTkFrame(left_frame, fg_color="transparent")
+        search_row.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
+        search_row.grid_columnconfigure(0, weight=1)
 
-        except subprocess.TimeoutExpired:
-            log_message("❌ Таймаут установки OptiFine")
-            return False
-        except Exception as e:
-            log_message(f"❌ Ошибка: {e}")
-            return False
+        self.mod_search_entry = ctk.CTkEntry(
+            search_row,
+            placeholder_text="Введите название мода...",
+            height=32
+        )
+        self.mod_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.mod_search_entry.bind("<Return>", lambda e: self.search_mods())
 
-    def scan_and_update_versions(self):
-        self.versions_listbox.delete(0, tk.END)
-        versions = scan_versions()
-        self.installed_versions = versions
+        search_btn = ctk.CTkButton(
+            search_row,
+            text="🔍 Искать",
+            command=self.search_mods,
+            width=100,
+            height=32,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec"
+        )
+        search_btn.grid(row=0, column=1)
 
-        profiles = load_profiles()
+        # Результаты поиска
+        ctk.CTkLabel(left_frame, text="📋 Результаты поиска:", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=7, column=0, sticky="w", padx=10, pady=(5, 2)
+        )
 
-        version_names = [v["id"] for v in versions]
-        self.version_combo.configure(values=version_names)
-        if version_names:
-            self.version_combo.set(version_names[0])
-        else:
-            self.version_combo.set("Нет версий")
+        self.results_listbox = tk.Listbox(
+            left_frame,
+            bg="#1a1a2e",
+            fg="#cdd6f4",
+            selectbackground="#89b4fa",
+            selectforeground="#1e1e2e",
+            font=("Consolas", 11),
+            height=10,
+            relief="flat"
+        )
+        self.results_listbox.grid(row=8, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self.results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
+        self.results_listbox.bind("<Double-Button-1>", self.on_mod_double_click)
 
-        if not versions:
-            self.versions_listbox.insert(0, "⚠️ Нет установленных версий")
-            self.versions_listbox.insert(1, "💡 Нажмите 'Обновить список' для поиска")
-            self.versions_listbox.insert(2, "📁 Или добавьте версии в папку versions/")
-        else:
-            for v in versions:
-                type_icon = {
-                    "vanilla": "📦",
-                    "fabric": "🧵",
-                    "forge": "🔥",
-                    "optifine": "⚡"
-                }.get(v["type"], "❓")
+        # Кнопка установки мода
+        self.install_mod_btn = ctk.CTkButton(
+            left_frame,
+            text="📥 УСТАНОВИТЬ ВЫБРАННЫЙ МОД",
+            command=self.install_selected_mod,
+            height=45,
+            fg_color="#a6e3a1",
+            hover_color="#7ecb8f",
+            text_color="#1e1e2e",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            corner_radius=10,
+            state="disabled"
+        )
+        self.install_mod_btn.grid(row=9, column=0, sticky="ew", padx=10, pady=(0, 5))
 
-                profile_mark = "✅" if v["id"] in profiles else "❌"
+        self.mod_progressbar = AnimatedProgressBar(
+            left_frame,
+            height=12,
+            corner_radius=5,
+            progress_color="#f9e2af"
+        )
+        self.mod_progressbar.grid(row=10, column=0, sticky="ew", padx=10, pady=(0, 2))
+        self.mod_progressbar.set(0)
 
-                files_status = ""
-                if v["jar"] and v["json"]:
-                    files_status = "✅"
-                elif v["json"] and not v["jar"]:
-                    files_status = "📄 (только .json)"
-                elif v["jar"]:
-                    files_status = "⚠️ (нет .json)"
-                else:
-                    files_status = "❌ (нет файлов)"
+        self.mod_status_label = ctk.CTkLabel(
+            left_frame,
+            text="Введите запрос и нажмите 'Искать'",
+            font=ctk.CTkFont(size=11),
+            text_color="#89b4fa"
+        )
+        self.mod_status_label.grid(row=11, column=0, sticky="w", padx=10, pady=(2, 2))
 
-                self.versions_listbox.insert(tk.END, f"{type_icon} {v['id']} {profile_mark} {files_status}")
+        self.selected_mod_label = ctk.CTkLabel(
+            left_frame,
+            text="❌ Мод не выбран",
+            font=ctk.CTkFont(size=12),
+            text_color="#f38ba8"
+        )
+        self.selected_mod_label.grid(row=12, column=0, sticky="w", padx=10, pady=(2, 5))
 
-        self.log(f"📋 Найдено версий: {len(versions)}")
+        # ПРАВАЯ ПАНЕЛЬ - УСТАНОВЛЕННЫЕ МОДЫ
+        right_frame = ctk.CTkFrame(tab)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(1, weight=1)
 
-    def delete_selected_version(self):
-        selection = self.versions_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Ошибка", "Выберите версию для удаления")
-            return
+        ctk.CTkLabel(
+            right_frame,
+            text="📦 Установленные моды",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
 
-        if selection[0] >= len(self.installed_versions):
-            return
+        self.installed_listbox = tk.Listbox(
+            right_frame,
+            bg="#1a1a2e",
+            fg="#cdd6f4",
+            font=("Consolas", 11),
+            height=15,
+            relief="flat"
+        )
+        self.installed_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
 
-        version = self.installed_versions[selection[0]]
-        version_id = version["id"]
+        btn_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
 
-        if not messagebox.askyesno("Подтверждение", f"Удалить версию {version_id}?"):
-            return
+        refresh_btn = ctk.CTkButton(
+            btn_frame,
+            text="🔄 Обновить список",
+            command=self.refresh_mods_list,
+            height=35,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec"
+        )
+        refresh_btn.grid(row=0, column=0, padx=5)
 
-        try:
-            shutil.rmtree(version["path"])
-            delete_profile(version_id)
-            self.log(f"🗑️ Версия удалена: {version_id}")
-            self.scan_and_update_versions()
-            messagebox.showinfo("Успешно", f"Версия {version_id} удалена")
-        except Exception as e:
-            self.log(f"❌ Ошибка удаления: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось удалить версию: {e}")
-
-    def on_mod_select(self, event):
-        selection = self.results_listbox.curselection()
-        if selection:
-            index = selection[0]
-            if index < len(self.search_results):
-                self.selected_mod_index = index
-                mod = self.search_results[index]
-                self.selected_mod_label.configure(
-                    text=f"✅ Выбран: {mod.get('title', '?')}",
-                    text_color="#a6e3a1"
-                )
-                self.install_mod_btn.configure(state="normal")
-                self.mod_status_label.configure(text="Готов к установке", text_color="#a6e3a1")
-            else:
-                self.selected_mod_label.configure(text="❌ Мод не выбран", text_color="#f38ba8")
-                self.install_mod_btn.configure(state="disabled")
-                self.mod_status_label.configure(text="Выберите мод из списка", text_color="#89b4fa")
-        else:
-            self.selected_mod_label.configure(text="❌ Мод не выбран", text_color="#f38ba8")
-            self.install_mod_btn.configure(state="disabled")
+        delete_mod_btn = ctk.CTkButton(
+            btn_frame,
+            text="🗑️ Удалить мод",
+            command=self.delete_selected_mod,
+            height=35,
+            fg_color="#f38ba8",
+            hover_color="#e64553"
+        )
+        delete_mod_btn.grid(row=0, column=1, padx=5)
 
     def search_mods(self):
+        """Выполняет поиск модов на Modrinth"""
         query = self.mod_search_entry.get().strip()
         if not query:
             messagebox.showwarning("Ошибка", "Введите название мода")
             return
 
-        game_ver = self.mod_version_entry.get().strip()
-        mod_loader = self.mod_loader_var.get()
+        version = self.mod_version_entry.get().strip()
+        if not version:
+            version = "1.20.1"
 
-        self.log(f"🔍 Поиск модов: '{query}' для {game_ver} ({mod_loader})")
+        loader = self.mod_loader_var.get()
 
-        self.results_listbox.delete(0, tk.END)
-        self.search_results = []
-        self.selected_mod_index = -1
-        self.selected_mod_label.configure(text="⏳ Поиск...", text_color="#f9e2af")
-        self.install_mod_btn.configure(state="disabled")
+        self.results_listbox.delete(0, "end")
+        self.results_listbox.insert("end", f"⏳ Поиск {query}...")
+        self.mod_status_label.configure(text="⏳ Поиск...", text_color="#f9e2af")
+        self.update_idletasks()
 
         def do_search():
-            try:
-                results = search_mods(query, game_ver, mod_loader)
-                self.search_results = results
-                self.after(0, lambda: self.update_search_results(results))
-            except Exception as e:
-                self.log(f"❌ Ошибка поиска: {e}")
-                self.after(0, lambda: self.results_listbox.insert(0, f"❌ Ошибка: {e}"))
+            results = search_mods(query, version, loader)
+            self.after(0, lambda: self.display_search_results(results))
 
         threading.Thread(target=do_search, daemon=True).start()
 
-    def update_search_results(self, results):
-        self.results_listbox.delete(0, tk.END)
+    def display_search_results(self, results):
+        """Отображает результаты поиска"""
+        self.results_listbox.delete(0, "end")
+        self.search_results = results
 
         if not results:
-            self.results_listbox.insert(0, "❌ Моды не найдены")
-            self.selected_mod_label.configure(text="❌ Моды не найдены", text_color="#f38ba8")
-            self.mod_status_label.configure(text="Моды не найдены", text_color="#f38ba8")
-            self.log("❌ Моды не найдены")
+            self.results_listbox.insert("end", "❌ Ничего не найдено")
+            self.mod_status_label.configure(text="❌ Моды не найдены", text_color="#f38ba8")
             return
 
-        for i, mod in enumerate(results[:20]):
-            title = mod.get('title', '?')
+        for i, mod in enumerate(results):
+            title = mod.get('title', 'Без названия')
+            author = mod.get('author', 'неизвестен')
             downloads = mod.get('downloads', 0)
-            self.results_listbox.insert(tk.END, f"{i + 1:2}. {title[:30]:<30} ⬇ {downloads:,}")
+            self.results_listbox.insert("end", f"{i + 1}. {title} (👤 {author}) ⬇️{downloads}")
 
-        self.selected_mod_label.configure(text=f"✅ Найдено {len(results)} модов", text_color="#a6e3a1")
-        self.mod_status_label.configure(text="Выберите мод из списка", text_color="#89b4fa")
-        self.log(f"✅ Найдено {len(results)} модов")
+        self.mod_status_label.configure(text=f"✅ Найдено {len(results)} модов", text_color="#a6e3a1")
+
+    def on_mod_select(self, event):
+        """Обработка выбора мода из списка"""
+        selection = self.results_listbox.curselection()
+        if not selection:
+            return
+
+        idx = selection[0]
+        if idx >= len(self.search_results):
+            return
+
+        self.selected_mod_index = idx
+        mod = self.search_results[idx]
+        title = mod.get('title', 'Без названия')
+        self.selected_mod_label.configure(text=f"✅ Выбран: {title}", text_color="#a6e3a1")
+        self.install_mod_btn.configure(state="normal")
+        self.mod_status_label.configure(text=f"📦 Выбран мод: {title}")
+
+    def on_mod_double_click(self, event):
+        """Обработка двойного клика по моду - показывает информацию"""
+        selection = self.results_listbox.curselection()
+        if not selection:
+            return
+
+        idx = selection[0]
+        if idx >= len(self.search_results):
+            return
+
+        mod = self.search_results[idx]
+        name = mod.get('title', 'Без названия')
+        author = mod.get('author', 'Неизвестен')
+        description = mod.get('description', 'Нет описания')
+        downloads = mod.get('downloads', 0)
+        follows = mod.get('follows', 0)
+        versions = mod.get('versions', [])
+
+        info_text = f"""
+📦 Мод: {name}
+👤 Автор: {author}
+📝 Описание: {description}
+⬇️ Скачиваний: {downloads}
+⭐ Подписок: {follows}
+📋 Версии: {', '.join(versions[:5]) if versions else 'Неизвестно'}
+
+💡 Двойной клик для установки
+        """
+
+        messagebox.showinfo(f"Информация о моде", info_text)
 
     def install_selected_mod(self):
+        """Устанавливает выбранный мод с предупреждением о VPN"""
         if self.selected_mod_index < 0 or self.selected_mod_index >= len(self.search_results):
             messagebox.showwarning("Ошибка", "Сначала выберите мод из списка")
             return
 
         mod = self.search_results[self.selected_mod_index]
         project_id = mod.get('project_id')
-        game_ver = self.mod_version_entry.get().strip()
-        mod_loader = self.mod_loader_var.get()
+        if not project_id:
+            messagebox.showerror("Ошибка", "ID мода не найден")
+            return
 
-        mod_title = mod.get('title', '?')
+        version = self.mod_version_entry.get().strip()
+        if not version:
+            version = "1.20.1"
 
-        self.log(f"📦 Установка мода: {mod_title}")
+        loader = self.mod_loader_var.get()
+
+        # Предупреждение о VPN
+        if not messagebox.askyesno(
+                "⚠️ ВНИМАНИЕ!",
+                "Для установки модов с Modrinth рекомендуется использовать VPN!\n\n"
+                "🌐 Без VPN могут быть проблемы с подключением.\n"
+                "🔒 VPN обеспечит стабильное соединение.\n\n"
+                "❓ Продолжить установку?"
+        ):
+            self.log("❌ Установка отменена")
+            return
+
         self.install_mod_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
         self.mod_progressbar.start_animation()
-        self.mod_status_label.configure(text="Установка...", text_color="#f9e2af")
-        self.mod_progressbar.configure(progress_color="#f9e2af")
+        self.mod_status_label.configure(text="⏳ Установка мода...", text_color="#f9e2af")
+        self.update_idletasks()
 
         def do_install():
-            try:
-                success, result = install_mod(project_id, game_ver, mod_loader)
-
-                self.after(0, lambda: self.install_mod_btn.configure(state="normal", text="📥 УСТАНОВИТЬ ВЫБРАННЫЙ МОД"))
-                self.after(0, lambda: self.mod_progressbar.stop_animation())
-
-                if success:
-                    self.log(f"✅ Мод установлен: {result}")
-                    self.mod_progressbar.set(1.0)
-                    self.mod_progressbar.configure(progress_color="#a6e3a1")
-                    self.mod_status_label.configure(text="✅ Установлено!", text_color="#a6e3a1")
-                    messagebox.showinfo("Успешно", f"Мод '{mod_title}' успешно установлен!")
-                    self.refresh_mods_list()
-                else:
-                    self.log(f"❌ Ошибка: {result}")
-                    self.mod_progressbar.set(0.3)
-                    self.mod_progressbar.configure(progress_color="#f38ba8")
-                    self.mod_status_label.configure(text=f"❌ Ошибка", text_color="#f38ba8")
-                    messagebox.showerror("Ошибка", f"Не удалось установить мод: {result}")
-            except Exception as e:
-                self.log(f"❌ Ошибка: {e}")
-                self.mod_progressbar.set(0.3)
-                self.mod_progressbar.configure(progress_color="#f38ba8")
-                self.mod_status_label.configure(text=f"❌ Ошибка", text_color="#f38ba8")
-                messagebox.showerror("Ошибка", f"Не удалось установить мод: {e}")
-
-            self.after(2000, lambda: self.reset_mod_progress())
+            success, result = install_mod(project_id, version, loader)
+            self.after(0, lambda: self.install_mod_finish(success, result))
 
         threading.Thread(target=do_install, daemon=True).start()
 
-    def reset_mod_progress(self):
-        self.mod_progressbar.set(0)
-        self.mod_progressbar.configure(progress_color="#f9e2af")
-        self.mod_status_label.configure(text="Готов к установке", text_color="#a6e3a1")
+    def install_mod_finish(self, success, result):
+        """Завершение установки мода"""
+        self.install_mod_btn.configure(state="normal", text="📥 УСТАНОВИТЬ ВЫБРАННЫЙ МОД")
+        self.mod_progressbar.stop_animation()
 
-    def refresh_mods_list(self):
-        self.installed_listbox.delete(0, tk.END)
-        mods = list_mods()
-
-        if not mods:
-            self.installed_listbox.insert(0, "⚠️ Нет установленных модов")
-        else:
-            for mod in mods:
-                try:
-                    size = os.path.getsize(os.path.join(get_mods_folder(), mod)) / (1024 * 1024)
-                    self.installed_listbox.insert(tk.END, f"📦 {mod} ({size:.1f} MB)")
-                except:
-                    self.installed_listbox.insert(tk.END, f"📦 {mod}")
-
-        self.log(f"📋 Установлено модов: {len(mods)}")
-
-    def delete_selected_mod(self):
-        selection = self.installed_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Ошибка", "Выберите мод для удаления")
-            return
-
-        mod_text = self.installed_listbox.get(selection[0])
-        mod_name = mod_text.split("(")[0].replace("📦", "").strip()
-
-        if mod_name and delete_mod(mod_name):
-            self.log(f"🗑️ Мод удалён: {mod_name}")
+        if success:
+            self.mod_status_label.configure(text=f"✅ Мод установлен: {result}", text_color="#a6e3a1")
+            self.mod_progressbar.set(1.0)
+            self.mod_progressbar.configure(progress_color="#a6e3a1")
             self.refresh_mods_list()
-            messagebox.showinfo("Успешно", f"Мод '{mod_name}' удалён!")
-
-    def refresh_accounts(self):
-        accounts = load_accounts()
-        values = [acc['username'] for acc in accounts]
-        self.account_combo.configure(values=values)
-        if values:
-            self.account_combo.set(values[0])
+            messagebox.showinfo(
+                "Успешно",
+                f"✅ Мод '{result}' установлен!\n\n"
+                "💡 Если возникли проблемы с подключением, используйте VPN."
+            )
         else:
-            self.account_combo.set("Нет аккаунтов")
+            self.mod_status_label.configure(text=f"❌ Ошибка: {result}", text_color="#f38ba8")
+            self.mod_progressbar.set(0.3)
+            self.mod_progressbar.configure(progress_color="#f38ba8")
+            messagebox.showerror(
+                "Ошибка",
+                f"❌ Не удалось установить мод:\n{result}\n\n"
+                "💡 Рекомендации:\n"
+                "1. 🔒 Включите VPN\n"
+                "2. 🌐 Проверьте интернет-соединение\n"
+                "3. ⏰ Попробуйте позже"
+            )
 
-    def refresh_accounts_listbox(self):
-        self.accounts_listbox.configure(state="normal")
-        self.accounts_listbox.delete("1.0", "end")
-        accounts = load_accounts()
-        if not accounts:
-            self.accounts_listbox.insert("end", "⚠️ Нет добавленных аккаунтов\n")
-            self.accounts_listbox.insert("end", "💡 Нажмите 'Добавить аккаунт' для создания")
-        else:
-            for acc in accounts:
-                created = acc.get('created', 'давно')
-                self.accounts_listbox.insert("end", f"👤 {acc['username']}  |  {created}\n")
-        self.accounts_listbox.configure(state="disabled")
+    def create_console(self):
+        """Создает консоль для логов внизу окна"""
+        console_frame = ctk.CTkFrame(self.main_container)
+        console_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        console_frame.grid_columnconfigure(0, weight=1)
 
-    def add_account_dialog(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Новый аккаунт")
-        dialog.geometry("350x220")
-        dialog.resizable(False, False)
-        dialog.grab_set()
-
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 350) // 2
-        y = self.winfo_y() + (self.winfo_height() - 220) // 2
-        dialog.geometry(f"+{x}+{y}")
+        header_frame = ctk.CTkFrame(console_frame, fg_color="transparent")
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(5, 0))
+        header_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            dialog,
-            text="➕ Создание нового аккаунта",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).pack(pady=(20, 10))
+            header_frame,
+            text="📋 Консоль",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=5)
 
-        ctk.CTkLabel(dialog, text="Введите никнейм:", font=ctk.CTkFont(size=13)).pack(pady=(0, 5))
+        ctk.CTkButton(
+            header_frame,
+            text="🗑️ Очистить",
+            command=self.clear_console,
+            fg_color="#f38ba8",
+            hover_color="#e64553",
+            height=25,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        ).grid(row=0, column=1, padx=5)
 
-        entry = ctk.CTkEntry(
-            dialog,
-            width=250,
-            height=35,
-            placeholder_text="Игровой никнейм"
+        self.console_text = ctk.CTkTextbox(
+            console_frame,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=200
         )
-        entry.pack(pady=10)
-        entry.focus()
+        self.console_text.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        self.console_text.insert("1.0", "[00:00:00] Лаунчер запущен\n")
 
-        def save():
-            username = entry.get().strip()
-            if not username:
-                messagebox.showwarning("Ошибка", "Введите никнейм!")
-                return
-            success, message = add_account(username)
-            if success:
-                self.refresh_accounts()
-                self.refresh_accounts_listbox()
-                dialog.destroy()
-                self.log(f"✅ Аккаунт '{username}' добавлен")
-                messagebox.showinfo("Успешно", f"Аккаунт '{username}' создан!")
-            else:
-                messagebox.showwarning("Ошибка", message)
+    def create_download_panel(self):
+        """Создает панель для отображения скачивания"""
+        self.download_panel = ctk.CTkFrame(self.main_container, fg_color="transparent", height=40)
+        self.download_panel.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        self.download_panel.grid_columnconfigure(1, weight=1)
+        self.download_panel.grid_remove()
 
-        def on_enter(event):
-            save()
+        # Спиннер загрузки
+        self.download_spinner = LoadingSpinner(self.download_panel)
+        self.download_spinner.grid(row=0, column=0, padx=(0, 10))
+        self.download_spinner.stop()
 
-        entry.bind("<Return>", on_enter)
+        # Статус
+        self.download_status_label = ctk.CTkLabel(
+            self.download_panel,
+            text="Готов к работе",
+            font=ctk.CTkFont(size=12),
+            text_color="#89b4fa"
+        )
+        self.download_status_label.grid(row=0, column=1, sticky="w")
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_frame.pack(pady=15)
+        # Прогресс-бар скачивания
+        self.download_progressbar = AnimatedProgressBar(
+            self.download_panel,
+            height=10,
+            corner_radius=5,
+            progress_color="#89b4fa",
+            width=300
+        )
+        self.download_progressbar.grid(row=0, column=2, padx=(10, 0))
+        self.download_progressbar.set(0)
 
-        create_btn = ctk.CTkButton(
+    def create_game_tab(self):
+        """Создает вкладку игры"""
+        tab = self.tab_view.tab("🎮 Игра")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        main_frame = ctk.CTkFrame(tab)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        main_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            main_frame,
+            text="🎮 Запуск игры",
+            font=ctk.CTkFont(size=24, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 20))
+
+        ctk.CTkLabel(main_frame, text="👤 Аккаунт:", font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="w")
+        self.account_combo = ctk.CTkComboBox(main_frame, values=["Нет аккаунтов"], width=300, height=35)
+        self.account_combo.grid(row=2, column=0, sticky="w", pady=(0, 15))
+
+        ctk.CTkLabel(main_frame, text="📦 Версия:", font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="w")
+        self.version_combo = ctk.CTkComboBox(main_frame, values=["Нет версий"], width=300, height=35)
+        self.version_combo.grid(row=4, column=0, sticky="w", pady=(0, 15))
+
+        ctk.CTkLabel(main_frame, text="🎨 Скин:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
+        self.skin_combo = ctk.CTkComboBox(main_frame, values=["Нет скинов"], width=300, height=35)
+        self.skin_combo.grid(row=6, column=0, sticky="w", pady=(0, 15))
+
+        ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=7, column=0, sticky="w")
+        self.ram_var = ctk.StringVar(value="2G")
+        ram_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        ram_frame.grid(row=8, column=0, sticky="w", pady=(0, 20))
+
+        for ram in ["1G", "2G", "3G", "4G", "6G", "8G"]:
+            ctk.CTkRadioButton(
+                ram_frame,
+                text=ram,
+                variable=self.ram_var,
+                value=ram
+            ).pack(side="left", padx=5)
+
+        self.launch_status_label = ctk.CTkLabel(main_frame, text="✅ Готов к запуску", font=ctk.CTkFont(size=13))
+        self.launch_status_label.grid(row=9, column=0, sticky="w", pady=(0, 10))
+
+        self.launch_progressbar = AnimatedProgressBar(main_frame, width=300, height=15)
+        self.launch_progressbar.grid(row=10, column=0, sticky="ew", pady=(0, 15))
+
+        self.launch_btn = ctk.CTkButton(
+            main_frame,
+            text="🚀 ЗАПУСТИТЬ ИГРУ",
+            command=self.launch_game,
+            height=50,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color="#89b4fa",
+            hover_color="#74c7ec"
+        )
+        self.launch_btn.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+
+        self.timer_label = ctk.CTkLabel(main_frame, text="⏱ Время игры: 0с", font=ctk.CTkFont(size=13))
+        self.timer_label.grid(row=12, column=0, sticky="w")
+
+    def create_install_tab(self):
+        """Создает вкладку установки"""
+        tab = self.tab_view.tab("📦 Установка")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        main_frame = ctk.CTkFrame(tab)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        main_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            main_frame,
+            text="📦 Установка клиентов",
+            font=ctk.CTkFont(size=24, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 20))
+
+        ctk.CTkLabel(main_frame, text="Тип установки:", font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="w")
+        self.install_type_var = ctk.StringVar(value="vanilla")
+        type_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        type_frame.grid(row=2, column=0, sticky="w", pady=(0, 10))
+
+        types = [
+            ("🌐 Vanilla", "vanilla"),
+            ("🧵 Fabric", "fabric"),
+            ("🔥 Forge", "forge"),
+            ("✨ OptiFine", "optifine")
+        ]
+
+        for text, value in types:
+            ctk.CTkRadioButton(
+                type_frame,
+                text=text,
+                variable=self.install_type_var,
+                value=value
+            ).pack(side="left", padx=10)
+
+        ctk.CTkLabel(main_frame, text="Версия Minecraft:", font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="w")
+        self.install_version_entry = ctk.CTkEntry(main_frame, placeholder_text="Например: 1.20.4", width=300, height=35)
+        self.install_version_entry.grid(row=4, column=0, sticky="w", pady=(0, 10))
+
+        self.install_file_label = ctk.CTkLabel(
+            main_frame,
+            text="❌ Файл не выбран (только для OptiFine)",
+            text_color="#f38ba8"
+        )
+        self.install_file_label.grid(row=5, column=0, sticky="w", pady=(0, 5))
+
+        ctk.CTkButton(
+            main_frame,
+            text="📂 Выбрать файл OptiFine",
+            command=self.select_optifine_file,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e"
+        ).grid(row=6, column=0, sticky="w", pady=(0, 15))
+
+        self.install_status_label = ctk.CTkLabel(main_frame, text="✅ Готов к установке", font=ctk.CTkFont(size=13))
+        self.install_status_label.grid(row=7, column=0, sticky="w", pady=(0, 10))
+
+        self.install_progressbar = AnimatedProgressBar(main_frame, width=300, height=15)
+        self.install_progressbar.grid(row=8, column=0, sticky="ew", pady=(0, 15))
+
+        self.install_btn = ctk.CTkButton(
+            main_frame,
+            text="📥 УСТАНОВИТЬ",
+            command=self.install_selected_client,
+            height=50,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color="#a6e3a1",
+            hover_color="#7ecb8f",
+            text_color="#1e1e2e"
+        )
+        self.install_btn.grid(row=9, column=0, sticky="ew")
+
+    def create_accounts_tab(self):
+        """Создает вкладку аккаунтов"""
+        tab = self.tab_view.tab("👤 Аккаунты")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left_frame = ctk.CTkFrame(tab)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            left_frame,
+            text="👤 Управление аккаунтами",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
+
+        self.accounts_listbox = tk.Text(
+            left_frame,
+            bg="#1a1a2e",
+            fg="#cdd6f4",
+            font=("Consolas", 11),
+            height=15,
+            relief="flat"
+        )
+        self.accounts_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+
+        btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(
             btn_frame,
-            text="✅ Создать",
-            command=save,
+            text="➕ Добавить",
+            command=self.add_account_dialog,
+            fg_color="#a6e3a1",
+            hover_color="#7ecb8f",
+            text_color="#1e1e2e"
+        ).grid(row=0, column=0, padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="🗑️ Удалить",
+            command=self.delete_selected_account,
+            fg_color="#f38ba8",
+            hover_color="#e64553"
+        ).grid(row=0, column=1, padx=5)
+
+        right_frame = ctk.CTkFrame(tab)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            right_frame,
+            text="ℹ️ Информация",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
+
+        info_text = """📌 Инструкция:
+
+1. Нажмите "Добавить"
+2. Введите имя пользователя3. Аккаунт будет создан
+
+💡 Аккаунты сохраняются в папке игры
+💡 Можно создать несколько аккаунтов"""
+
+        info_label = ctk.CTkLabel(
+            right_frame,
+            text=info_text,
+            font=ctk.CTkFont(size=13),
+            justify="left"
+        )
+        info_label.grid(row=1, column=0, sticky="n")
+
+    def create_skins_tab(self):
+        """Создает вкладку управления скинами с кнопками установки мода"""
+        tab = self.tab_view.tab("🎨 Скины")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        header_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=20, pady=(15, 10))
+
+        ctk.CTkLabel(
+            header_frame,
+            text="🎨 Управление скинами",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(side="left")
+
+        left_frame = ctk.CTkFrame(tab)
+        left_frame.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=(0, 10))
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            left_frame,
+            text="📋 Установленные скины",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 5))
+
+        self.skins_listbox = tk.Listbox(
+            left_frame,
+            bg="#1a1a2e",
+            fg="#cdd6f4",
+            selectbackground="#89b4fa",
+            selectforeground="#1e1e2e",
+            font=("Consolas", 11),
+            height=12,
+            relief="flat"
+        )
+        self.skins_listbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.skins_listbox.bind("<Double-Button-1>", self.on_skin_double_click)
+
+        btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+        btn_frame.grid_columnconfigure(3, weight=1)
+
+        import_btn = ctk.CTkButton(
+            btn_frame,
+            text="📥 Добавить",
+            command=self.import_skin,
             fg_color="#a6e3a1",
             hover_color="#7ecb8f",
             text_color="#1e1e2e",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            height=35,
-            width=120
+            height=35
         )
-        create_btn.grid(row=0, column=0, padx=5)
+        import_btn.grid(row=0, column=0, padx=2)
 
-        cancel_btn = ctk.CTkButton(
+        preview_btn = ctk.CTkButton(
             btn_frame,
-            text="❌ Отмена",
-            command=dialog.destroy,
-            fg_color="#f38ba8",
-            hover_color="#e64553",
-            font=ctk.CTkFont(size=13),
-            height=35,
-            width=120
+            text="👁️ Превью",
+            command=self.preview_skin,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec",
+            height=35
         )
-        cancel_btn.grid(row=0, column=1, padx=5)
-
-    def delete_selected_account(self):
-        accounts = load_accounts()
-        if not accounts:
-            messagebox.showwarning("Ошибка", "Нет аккаунтов для удаления")
-            return
-
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Удаление аккаунта")
-        dialog.geometry("350x200")
-        dialog.resizable(False, False)
-        dialog.grab_set()
-
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 350) // 2
-        y = self.winfo_y() + (self.winfo_height() - 200) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        ctk.CTkLabel(
-            dialog,
-            text="🗑️ Выберите аккаунт для удаления:",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(pady=(20, 15))
-
-        values = [acc['username'] for acc in accounts]
-        combo = ctk.CTkComboBox(
-            dialog,
-            values=values,
-            width=250,
-            state="readonly"
-        )
-        combo.pack(pady=10)
-        if values:
-            combo.set(values[0])
-
-        def delete():
-            username = combo.get()
-            if username:
-                success, result = delete_account(username)
-                if success:
-                    self.refresh_accounts()
-                    self.refresh_accounts_listbox()
-                    dialog.destroy()
-                    self.log(f"🗑️ Аккаунт '{username}' удалён")
-                    messagebox.showinfo("Успешно", f"Аккаунт '{username}' удалён!")
-                else:
-                    messagebox.showerror("Ошибка", result)
-
-        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_frame.pack(pady=15)
+        preview_btn.grid(row=0, column=1, padx=2)
 
         delete_btn = ctk.CTkButton(
             btn_frame,
             text="🗑️ Удалить",
-            command=delete,
+            command=self.delete_selected_skin,
             fg_color="#f38ba8",
             hover_color="#e64553",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            height=35,
-            width=120
+            height=35
         )
-        delete_btn.grid(row=0, column=0, padx=5)
+        delete_btn.grid(row=0, column=2, padx=2)
 
-        cancel_btn = ctk.CTkButton(
+        refresh_btn = ctk.CTkButton(
             btn_frame,
-            text="❌ Отмена",
-            command=dialog.destroy,
+            text="🔄 Обновить",
+            command=self.refresh_skins,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e",
+            height=35
+        )
+        refresh_btn.grid(row=0, column=3, padx=2)
+
+        mod_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        mod_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(10, 0))
+        mod_frame.grid_columnconfigure(0, weight=1)
+        mod_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            mod_frame,
+            text="📦 Установка мода для скинов:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#89b4fa"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
+
+        forge_btn = ctk.CTkButton(
+            mod_frame,
+            text="🔥 Forge",
+            command=self.install_custom_skin_loader,
+            fg_color="#e67e22",
+            hover_color="#d35400",
+            text_color="white",
+            height=35,
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        forge_btn.grid(row=1, column=0, padx=2, sticky="ew")
+
+        fabric_btn = ctk.CTkButton(
+            mod_frame,
+            text="🧵 Fabric",
+            command=self.install_skin_loader_for_fabric,
+            fg_color="#2ecc71",
+            hover_color="#27ae60",
+            text_color="white",
+            height=35,
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        fabric_btn.grid(row=1, column=1, padx=2, sticky="ew")
+
+        open_mods_btn = ctk.CTkButton(
+            mod_frame,
+            text="📂 Открыть папку mods",
+            command=self.open_mods_folder,
             fg_color="#89b4fa",
             hover_color="#74c7ec",
-            font=ctk.CTkFont(size=13),
             height=35,
-            width=120
+            font=ctk.CTkFont(size=12)
         )
-        cancel_btn.grid(row=0, column=1, padx=5)
+        open_mods_btn.grid(row=2, column=0, columnspan=2, padx=2, pady=(5, 0), sticky="ew")
 
-    def open_game_folder(self):
-        if os.path.exists(MINECRAFT_DIR):
-            os.startfile(MINECRAFT_DIR)
+        info_label = ctk.CTkLabel(
+            left_frame,
+            text="💡 CustomSkinLoader - мод для отображения скинов в офлайн режиме\nДля Fabric и Forge",
+            font=ctk.CTkFont(size=11),
+            text_color="#89b4fa",
+            justify="left"
+        )
+        info_label.grid(row=4, column=0, sticky="w", padx=10, pady=(10, 5))
+
+        right_frame = ctk.CTkFrame(tab)
+        right_frame.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=(0, 10))
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            right_frame,
+            text="ℹ️ Информация о скине",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 5))
+
+        self.skin_info = ctk.CTkTextbox(
+            right_frame,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=200
+        )
+        self.skin_info.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.skin_info.insert("1.0", "Выберите скин для просмотра информации\n\nДвойной клик для просмотра")
+        self.skin_info.configure(state="disabled")
+
+        open_folder_btn = ctk.CTkButton(
+            right_frame,
+            text="📂 Открыть папку со скинами",
+            command=self.open_skins_folder,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e",
+            height=35
+        )
+        open_folder_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        info_label = ctk.CTkLabel(
+            right_frame,
+            text="💡 Двойной клик для просмотра информации\nПоддерживаются .png, .jpg, .jpeg",
+            font=ctk.CTkFont(size=11),
+            text_color="#89b4fa",
+            justify="left"
+        )
+        info_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 5))
+
+    def create_resourcepacks_tab(self):
+        """Создает вкладку ресурспаков"""
+        tab = self.tab_view.tab("📦 Ресурспаки")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left_frame = ctk.CTkFrame(tab)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            left_frame,
+            text="📦 Ресурспаки",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
+
+        self.resourcepacks_listbox = tk.Listbox(
+            left_frame,
+            bg="#1a1a2e",
+            fg="#cdd6f4",
+            selectbackground="#89b4fa",
+            selectforeground="#1e1e2e",
+            font=("Consolas", 11),
+            height=15,
+            relief="flat"
+        )
+        self.resourcepacks_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        self.resourcepacks_listbox.bind("<Double-Button-1>", self.on_resourcepack_double_click)
+
+        btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="📥 Установить",
+            command=self.install_resourcepack,
+            fg_color="#a6e3a1",
+            hover_color="#7ecb8f",
+            text_color="#1e1e2e"
+        ).grid(row=0, column=0, padx=2)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="🗑️ Удалить",
+            command=self.delete_selected_resourcepack,
+            fg_color="#f38ba8",
+            hover_color="#e64553"
+        ).grid(row=0, column=1, padx=2)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="📂 Открыть папку",
+            command=self.open_resourcepacks_folder,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec"
+        ).grid(row=0, column=2, padx=2)
+
+        right_frame = ctk.CTkFrame(tab)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            right_frame,
+            text="ℹ️ Информация",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 10))
+
+        self.resourcepack_info = ctk.CTkTextbox(
+            right_frame,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=200
+        )
+        self.resourcepack_info.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        self.resourcepack_info.insert("1.0", "Выберите ресурспак для просмотра информации")
+        self.resourcepack_info.configure(state="disabled")
+
+    def create_settings_tab(self):
+        """Создает вкладку настроек с ссылками"""
+        tab = self.tab_view.tab("⚙️ Настройки")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        main_frame = ctk.CTkFrame(tab)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        main_frame.grid_columnconfigure(0, weight=1)
+
+        # Заголовок
+        ctk.CTkLabel(
+            main_frame,
+            text="⚙️ Настройки лаунчера",
+            font=ctk.CTkFont(size=24, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 20))
+
+        # ============================================================
+        # ТЕМА
+        # ============================================================
+        ctk.CTkLabel(
+            main_frame,
+            text="🌓 Тема оформления",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=1, column=0, sticky="w", pady=(0, 5))
+
+        theme_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        theme_frame.grid(row=2, column=0, sticky="w", pady=(0, 15))
+
+        self.theme_btn_settings = ctk.CTkButton(
+            theme_frame,
+            text="🌙 Тёмная" if ctk.get_appearance_mode() == "Dark" else "☀️ Светлая",
+            command=self.toggle_theme,
+            width=150,
+            height=35,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec"
+        )
+        self.theme_btn_settings.pack(side="left")
+
+        # ============================================================
+        # НАПОМИНАНИЯ
+        # ============================================================
+        ctk.CTkLabel(
+            main_frame,
+            text="🧼 Напоминания",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=3, column=0, sticky="w", pady=(5, 5))
+
+        self.hygiene_reminders_var = ctk.BooleanVar(value=self.settings.get("hygiene_reminders", True))
+        ctk.CTkCheckBox(
+            main_frame,
+            text="Включить напоминания о перерыве (каждые 25 минут)",
+            variable=self.hygiene_reminders_var,
+            command=self.toggle_hygiene_reminders
+        ).grid(row=4, column=0, sticky="w", pady=(0, 5))
+
+        ctk.CTkButton(
+            main_frame,
+            text="🧼 Напомнить сейчас",
+            command=self.manual_hygiene_reminder,
+            fg_color="#f9e2af",
+            hover_color="#f5d742",
+            text_color="#1e1e2e",
+            width=200,
+            height=35
+        ).grid(row=5, column=0, sticky="w", pady=(0, 15))
+
+        # ============================================================
+        # СТАТИСТИКА
+        # ============================================================
+        ctk.CTkLabel(
+            main_frame,
+            text="📊 Статистика",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=6, column=0, sticky="w", pady=(5, 5))
+
+        ctk.CTkButton(
+            main_frame,
+            text="🔄 Сбросить статистику",
+            command=self.reset_stats,
+            fg_color="#f38ba8",
+            hover_color="#e64553",
+            width=200,
+            height=35
+        ).grid(row=7, column=0, sticky="w", pady=(0, 15))
+
+        # ============================================================
+        # ССЫЛКИ (GitHub и DonationAlerts)
+        # ============================================================
+        ctk.CTkLabel(
+            main_frame,
+            text="🔗 Полезные ссылки",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=8, column=0, sticky="w", pady=(5, 10))
+
+        # Контейнер для кнопок ссылок
+        links_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        links_frame.grid(row=9, column=0, sticky="w", pady=(0, 15))
+
+        # GitHub
+        github_btn = ctk.CTkButton(
+            links_frame,
+            text="⭐ GitHub",
+            command=lambda: webbrowser.open("https://github.com/KotiPlayYT/67launcher/"),
+            width=180,
+            height=40,
+            fg_color="#333333",
+            hover_color="#555555",
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        github_btn.grid(row=0, column=0, padx=(0, 15), pady=5)
+
+        # DonationAlerts
+        donate_btn = ctk.CTkButton(
+            links_frame,
+            text="💝 Поддержать (DonationAlerts)",
+            command=lambda: webbrowser.open("https://www.donationalerts.com/r/ionux"),
+            width=180,
+            height=40,
+            fg_color="#ff6b6b",
+            hover_color="#ee5a24",
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        donate_btn.grid(row=0, column=1, pady=5)
+
+        # Описание
+        info_text = """
+💡 GitHub - исходный код лаунчера
+💝 DonationAlerts - поддержка разработчика
+        """
+        info_label = ctk.CTkLabel(
+            main_frame,
+            text=info_text,
+            font=ctk.CTkFont(size=12),
+            text_color="#89b4fa",
+            justify="left"
+        )
+        info_label.grid(row=10, column=0, sticky="w", pady=(0, 10))
+
+        # Разделитель
+        ctk.CTkLabel(
+            main_frame,
+            text="",
+            height=20
+        ).grid(row=11, column=0)
+
+    def create_stats_tab(self):
+        """Создает вкладку статистики"""
+        tab = self.tab_view.tab("📊 Статистика")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        main_frame = ctk.CTkFrame(tab)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            main_frame,
+            text="📊 Статистика",
+            font=ctk.CTkFont(size=24, weight="bold")
+        ).grid(row=0, column=0, pady=(0, 20))
+
+        self.stats_text = ctk.CTkTextbox(
+            main_frame,
+            font=ctk.CTkFont(family="Consolas", size=13),
+            height=300
+        )
+        self.stats_text.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+
+        ctk.CTkButton(
+            main_frame,
+            text="🔄 Обновить",
+            command=self.update_stats_display,
+            fg_color="#89b4fa",
+            hover_color="#74c7ec",
+            width=200
+        ).grid(row=2, column=0)
+
+        self.update_stats_display()
+
+    # =================================================================
+    # ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ
+    # =================================================================
+
+    def toggle_hygiene_reminders(self):
+        """Включает/выключает напоминания"""
+        self.settings["hygiene_reminders"] = self.hygiene_reminders_var.get()
+        save_launcher_settings(self.settings)
+        if self.hygiene_reminders_var.get():
+            self.log("🧼 Напоминания включены")
+            self.start_hygiene_reminder()
         else:
+            self.log("🧼 Напоминания отключены")
+
+    def reset_stats(self):
+        """Сбрасывает статистику"""
+        if messagebox.askyesno("Подтверждение", "Сбросить всю статистику?"):
+            stats = {"launches": 0, "total_play_time": 0, "last_launch": None, "launch_history": []}
+            save_stats(stats)
+            self.stats = stats
+            self.update_stats_display()
+            self.log("📊 Статистика сброшена")
+
+    def update_info_display(self):
+        """Обновляет информацию на главном экране"""
+        stats = load_stats()
+        self.stats = stats
+        self.update_stats_display()
+
+    def update_subtitle(self):
+        """Обновляет подзаголовок окна"""
+        launches = self.stats.get("launches", 0)
+        play_time = self.stats.get("total_play_time", 0)
+        self.title(f"67Launcher - МЯУ | Запусков: {launches} | Время: {self.format_time(play_time)}")
+
+    def restore_last_selection(self):
+        """Восстанавливает последний выбранный аккаунт и версию"""
+        last_account = self.settings.get("last_account", "")
+        last_version = self.settings.get("last_version", "")
+        last_skin = self.settings.get("last_skin", "")
+
+        if last_account:
             try:
-                os.makedirs(MINECRAFT_DIR, exist_ok=True)
-                os.startfile(MINECRAFT_DIR)
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{e}")
+                self.account_combo.set(last_account)
+            except:
+                pass
 
-    def log(self, message):
-        if hasattr(self, 'console_text'):
-            self.console_text.configure(state="normal")
-            timestamp = time.strftime("%H:%M:%S")
-            self.console_text.insert("end", f"[{timestamp}] {message}\n")
-            self.console_text.see("end")
-            self.console_text.configure(state="disabled")
-            self.update_idletasks()
-
-    def clear_console(self):
-        if hasattr(self, 'console_text'):
-            self.console_text.configure(state="normal")
-            self.console_text.delete("1.0", "end")
-            self.console_text.configure(state="disabled")
-
-    # ================================================================
-    # ЗАПУСК ИГРЫ
-    # ================================================================
-
-    def launch_game(self):
-        if self.is_launching:
-            return
-
-        account_name = self.account_combo.get()
-        if not account_name or account_name == "Нет аккаунтов":
-            messagebox.showwarning("Ошибка", "Выберите аккаунт")
-            return
-
-        accounts = load_accounts()
-        account = None
-        for acc in accounts:
-            if acc['username'] == account_name:
-                account = acc
-                break
-
-        if not account:
-            messagebox.showwarning("Ошибка", "Аккаунт не найден")
-            return
-
-        version = self.version_combo.get()
-        if not version or version == "Нет версий":
-            messagebox.showwarning("Ошибка", "Выберите версию Minecraft")
-            return
-
-        ram = self.ram_var.get()
-
-        self.is_launching = True
-        self.launch_btn.configure(state="disabled", text="⏳ ЗАГРУЗКА...")
-
-        self.launch_progressbar.start_animation()
-        self.launch_status_label.configure(text="Подготовка...", text_color="#f9e2af")
-        self.launch_progressbar.configure(progress_color="#f9e2af")
-
-        self.log("=" * 50)
-        self.log(f"🚀 Запуск Minecraft {version} с аккаунтом: {account['username']}")
-        self.log(f"💾 Память: {ram}")
-        self.log(f"📁 Папка игры: {MINECRAFT_DIR}")
-        self.log("=" * 50)
-
-        def do_launch():
+        if last_version:
             try:
-                java_path = get_java_for_version(version)
-                log_message(f"☕ Используется Java: {java_path}")
+                self.version_combo.set(last_version)
+            except:
+                pass
 
-                # Проверяем установку через scan_versions
-                versions = scan_versions()
-                is_installed = False
-                for v in versions:
-                    if v["id"] == version:
-                        is_installed = True
-                        break
+        if last_skin:
+            try:
+                self.skin_combo.set(last_skin)
+            except:
+                pass
 
-                if not is_installed:
-                    log_message(f"📦 Установка Minecraft {version}...")
-                    try:
-                        mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
-                        log_message("✅ Версия установлена!")
-                        create_profile(version, f"Vanilla {version}")
-                    except Exception as e:
-                        log_message(f"⚠️ Ошибка установки: {e}")
-                else:
-                    log_message(f"✅ Версия {version} уже установлена")
+    def save_current_selection(self):
+        """Сохраняет текущий выбор"""
+        self.settings["last_account"] = self.account_combo.get()
+        self.settings["last_version"] = self.version_combo.get()
+        self.settings["last_skin"] = self.skin_combo.get()
+        save_launcher_settings(self.settings)
 
-                # Создаём профиль если нет
-                profiles = load_profiles()
-                if not isinstance(profiles, dict):
-                    profiles = {}
+    def load_available_versions(self):
+        """Загружает доступные версии из интернета"""
+        try:
+            self.log("🔄 Загрузка списка версий...")
+            versions = mll.utils.get_available_versions(MINECRAFT_DIR)
+            self.available_versions = [v["id"] for v in versions if "snapshot" not in v.get("type", "").lower()]
+            self.log(f"✅ Загружено {len(self.available_versions)} версий")
+        except Exception as e:
+            self.log(f"❌ Ошибка загрузки версий: {e}")
+            self.available_versions = []
 
-                if version not in profiles:
-                    create_profile(version, f"Profile {version}")
+    def scan_and_update_versions(self):
+        """Сканирует установленные версии и обновляет список"""
+        installed = []
+        versions_dir = os.path.join(MINECRAFT_DIR, "versions")
+        if os.path.exists(versions_dir):
+            for folder in os.listdir(versions_dir):
+                if os.path.isdir(os.path.join(versions_dir, folder)):
+                    installed.append(folder)
 
-                log_message(f"🚀 Запуск Minecraft {version}...")
-                log_message("⏳ Ожидание закрытия игры...")
+        self.installed_versions = installed
+        self.update_version_combo()
 
-                # Используем MLL для запуска
-                options = {
-                    "username": account["username"],
-                    "jvmArguments": [f"-Xmx{ram}", "-Xms512M"]
-                }
-                if java_path and java_path != "java":
-                    options["executablePath"] = java_path
+    def update_version_combo(self):
+        """Обновляет комбобокс с версиями"""
+        versions = self.installed_versions
+        if not versions:
+            versions = ["Нет версий"]
 
-                # Получаем команду через MLL
-                command = mll.command.get_minecraft_command(version, MINECRAFT_DIR, options)
-                log_message(f"⚙️ Команда запуска: {' '.join(command)}")
+        self.version_combo.configure(values=versions)
+        if versions and versions[0] != "Нет версий":
+            last_version = self.settings.get("last_version", "")
+            if last_version in versions:
+                self.version_combo.set(last_version)
+            else:
+                self.version_combo.set(versions[0])
 
-                # Запускаем игру
-                if platform.system() == "Windows":
-                    process = subprocess.Popen(
-                        command,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True
-                    )
+    def select_optifine_file(self):
+        """Выбирает файл установщика OptiFine"""
+        file_path = filedialog.askopenfilename(
+            title="Выберите установщик OptiFine (.jar)",
+            filetypes=[("JAR файлы", "*.jar"), ("Все файлы", "*.*")]
+        )
 
-                    # Читаем вывод
-                    while True:
-                        output = process.stdout.readline()
-                        if output == '' and process.poll() is not None:
-                            break
-                        if output:
-                            log_message(f"📤 {output.strip()}")
+        if file_path:
+            if file_path.lower().endswith('.exe'):
+                messagebox.showwarning(
+                    "Ошибка",
+                    "Для установки OptiFine используйте .jar версию установщика!\n\n"
+                    "Скачайте установщик (.jar) с официального сайта OptiFine."
+                )
+                return
 
-                    process.wait()
-                else:
-                    subprocess.run(command)
+            self.selected_installer_path = file_path
+            self.install_file_label.configure(
+                text=f"✅ Файл выбран: {os.path.basename(file_path)}",
+                text_color="#a6e3a1"
+            )
+            self.log(f"📂 Выбран файл OptiFine: {file_path}")
 
-                log_message("✅ Игра завершена!")
-                self.reset_launch_state()
+    def open_mods_folder_gui(self):
+        """Открывает папку с модами"""
+        mods_path = os.path.join(MINECRAFT_DIR, "mods")
+        os.makedirs(mods_path, exist_ok=True)
+        os.startfile(mods_path)
+        self.log(f"📂 Открыта папка mods")
 
-            except Exception as e:
-                log_message(f"❌ Ошибка: {e}")
-                import traceback
-                log_message(traceback.format_exc())
-                self.launch_status_label.configure(text="Ошибка запуска", text_color="#f38ba8")
-                self.launch_progressbar.configure(progress_color="#f38ba8")
-                self.launch_progressbar.stop_animation()
-                self.launch_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ИГРУ")
-                self.is_launching = False
-                messagebox.showerror("Ошибка", f"Произошла ошибка:\n{str(e)}")
+    def on_closing(self):
+        """Обработка закрытия окна"""
+        if self.timer_running:
+            self.stop_game_timer()
 
-        threading.Thread(target=do_launch, daemon=True).start()
+        self._closing = True
+        self.save_current_selection()
 
-    def reset_launch_state(self):
-        self.launch_progressbar.stop_animation()
-        self.launch_progressbar.set(1.0)
-        self.launch_progressbar.configure(progress_color="#a6e3a1")
-        self.launch_status_label.configure(text="✅ Игра завершена", text_color="#a6e3a1")
-        self.launch_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ИГРУ")
-        self.is_launching = False
-
-        self.after(3000, lambda: self.launch_progressbar.set(0))
-        self.after(3000, lambda: self.launch_status_label.configure(text="Готов к запуску", text_color="#a6e3a1"))
-        self.after(3000, lambda: self.launch_progressbar.configure(progress_color="#f9e2af"))
+        try:
+            self.destroy()
+        except:
+            pass
 
 
 # ===================================================================
-# 9. ЗАПУСК
+# спасибо
 # ===================================================================
 
 if __name__ == "__main__":
-    ensure_game_folder_structure()
-    app = LauncherApp()
-    app.mainloop()
+    try:
+        app = LauncherApp()
+        app.mainloop()
+    except Exception as e:
+        print(f"❌ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        input("\nНажмите Enter для выхода...")
