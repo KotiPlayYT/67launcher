@@ -29,6 +29,8 @@ import re
 import traceback
 import hashlib
 import websocket as ws_client
+from urllib.parse import unquote
+import multiprocessing
 
 RELAY_URL = "wss://screen-relay-production.up.railway.app"
 
@@ -43,7 +45,7 @@ def check_dependencies():
         except ImportError:
             missing.append(pip_names.get(pkg, pkg))
 
-    required_pip_only = {'websocket': 'websocket-client'}
+    required_pip_only = {'websocket': 'websocket-client', 'webview': 'pywebview'}
     for import_name, pip_name in required_pip_only.items():
         try:
             __import__(import_name)
@@ -59,6 +61,65 @@ def check_dependencies():
 
 
 check_dependencies()
+
+
+def _ms_login_webview_process(login_url, redirect_uri, result_queue):
+    """
+    Запускается в ОТДЕЛЬНОМ процессе, потому что pywebview требует,
+    чтобы webview.start() вызывался в главном потоке процесса - а
+    главный поток основного лаунчера занят циклом Tkinter.
+    """
+    try:
+        import re as _re
+        import webview
+        from urllib.parse import unquote as _unquote
+    except Exception as e:
+        result_queue.put({"code": None, "error": f"import_error: {e}"})
+        return
+
+    captured = {"code": None, "error": None, "done": False}
+
+    def check_url():
+        if captured["done"]:
+            return
+        try:
+            current_url = window.get_current_url()
+        except Exception:
+            return
+        if not current_url or not current_url.startswith(redirect_uri):
+            return
+
+        captured["done"] = True
+        match = _re.search(r'[?&]code=([^&]+)', current_url)
+        if match:
+            captured["code"] = _unquote(match.group(1))
+        else:
+            err_match = _re.search(r'[?&]error=([^&]+)', current_url)
+            captured["error"] = _unquote(err_match.group(1)) if err_match else "Вход отменён"
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    window = webview.create_window(
+        "Вход в Microsoft — залогинься своим аккаунтом",
+        login_url,
+        width=480,
+        height=640,
+        confirm_close=False,
+    )
+    window.events.loaded += check_url
+
+    try:
+        webview.start(gui="edgechromium", debug=False)
+    except Exception:
+        try:
+            webview.start(debug=False)
+        except Exception as e:
+            result_queue.put({"code": None, "error": f"webview_start_error: {e}"})
+            return
+
+    result_queue.put({"code": captured["code"], "error": captured["error"]})
 
 
 def resource_path(relative_path):
@@ -731,6 +792,161 @@ def refresh_microsoft_account(account):
                 save_accounts(accounts)
                 break
         return login_data
+    except Exception:
+        return None
+
+
+def get_or_create_elyby_client_token():
+    settings = load_launcher_settings()
+    token = settings.get("elyby_client_token", "").strip()
+    if not token:
+        token = hashlib.sha1(f"{time.time()}{random.random()}".encode()).hexdigest()
+        settings["elyby_client_token"] = token
+        save_launcher_settings(settings)
+    return token
+
+
+def format_uuid_with_dashes(raw_uuid):
+    raw_uuid = raw_uuid.replace("-", "")
+    if len(raw_uuid) != 32:
+        return raw_uuid
+    return f"{raw_uuid[0:8]}-{raw_uuid[8:12]}-{raw_uuid[12:16]}-{raw_uuid[16:20]}-{raw_uuid[20:32]}"
+
+
+def elyby_authenticate(login, password):
+    """
+    Настоящая авторизация через официальный (документированный) Yggdrasil-совместимый
+    API Ely.by: https://docs.ely.by/ru/minecraft-auth.html
+    Возвращает (True, login_data) или (False, "текст ошибки").
+    """
+    client_token = get_or_create_elyby_client_token()
+    try:
+        response = requests.post(
+            "https://authserver.ely.by/auth/authenticate",
+            json={
+                "username": login,
+                "password": password,
+                "clientToken": client_token,
+                "requestUser": True,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        return False, f"Не удалось связаться с ely.by: {e}"
+
+    data = {}
+    try:
+        data = response.json()
+    except Exception:
+        pass
+
+    if response.status_code != 200:
+        error_message = data.get("errorMessage") or data.get("error") or f"HTTP {response.status_code}"
+        return False, error_message
+
+    profile = data.get("selectedProfile") or {}
+    login_data = {
+        "name": profile.get("name", login),
+        "id": format_uuid_with_dashes(profile.get("id", "")),
+        "access_token": data.get("accessToken", ""),
+        "client_token": data.get("clientToken", client_token),
+    }
+    return True, login_data
+
+
+def create_elyby_account(login_data):
+    return {
+        "type": "elyby",
+        "username": login_data["name"],
+        "uuid": login_data["id"],
+        "access_token": login_data["access_token"],
+        "client_token": login_data.get("client_token", ""),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+
+def add_elyby_account(login_data):
+    accounts = load_accounts()
+    for i, acc in enumerate(accounts):
+        if acc.get("uuid") == login_data["id"] or acc["username"].lower() == login_data["name"].lower():
+            accounts[i] = create_elyby_account(login_data)
+            save_accounts(accounts)
+            return True, "Аккаунт обновлён"
+    accounts.append(create_elyby_account(login_data))
+    if save_accounts(accounts):
+        return True, "Ely.by-аккаунт добавлен"
+    return False, "Ошибка сохранения"
+
+
+def refresh_elyby_account(account):
+    if not account.get("access_token") or not account.get("client_token"):
+        return None
+    try:
+        response = requests.post(
+            "https://authserver.ely.by/auth/refresh",
+            json={
+                "accessToken": account["access_token"],
+                "clientToken": account["client_token"],
+                "requestUser": True,
+            },
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        profile = data.get("selectedProfile") or {}
+        login_data = {
+            "name": profile.get("name", account.get("username", "")),
+            "id": format_uuid_with_dashes(profile.get("id", account.get("uuid", ""))),
+            "access_token": data.get("accessToken", ""),
+            "client_token": data.get("clientToken", account["client_token"]),
+        }
+        accounts = load_accounts()
+        for i, acc in enumerate(accounts):
+            if acc.get("uuid") == account.get("uuid"):
+                accounts[i] = create_elyby_account(login_data)
+                save_accounts(accounts)
+                break
+        return login_data
+    except Exception:
+        return None
+
+
+def ensure_authlib_injector():
+    """
+    Скачивает (один раз, потом кешируется) authlib-injector.jar - это официально
+    рекомендованный Ely.by способ показывать скины в НЕмодифицированной игре,
+    без CustomSkinLoader. Подробности: https://docs.ely.by/ru/authlib-injector.html
+    Возвращает путь до jar-файла или None при ошибке.
+    """
+    injector_dir = os.path.join(MINECRAFT_DIR, "authlib-injector")
+    injector_path = os.path.join(injector_dir, "authlib-injector.jar")
+    if os.path.exists(injector_path) and os.path.getsize(injector_path) > 0:
+        return injector_path
+
+    os.makedirs(injector_dir, exist_ok=True)
+    try:
+        api_response = requests.get(
+            "https://api.github.com/repos/yushijinhun/authlib-injector/releases/latest",
+            timeout=15,
+        )
+        api_response.raise_for_status()
+        release_data = api_response.json()
+        download_url = None
+        for asset in release_data.get("assets", []):
+            if asset.get("name", "").endswith(".jar"):
+                download_url = asset.get("browser_download_url")
+                break
+        if not download_url:
+            return None
+
+        with requests.get(download_url, stream=True, timeout=60) as file_response:
+            file_response.raise_for_status()
+            with open(injector_path, "wb") as f:
+                for chunk in file_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        return injector_path
     except Exception:
         return None
 
@@ -1653,9 +1869,8 @@ class ChatWindow(ctk.CTkToplevel):
             self.title(f"💬 Чат 67Launcher ({self.unread_count} новых)")
         else:
             self.title("💬 Чат 67Launcher")
-
+#display_message
     def show_notification(self, message, sender=""):
-
         if threading.current_thread() is not threading.main_thread():
             try:
                 self.after(0, lambda: self.show_notification(message, sender))
@@ -1666,26 +1881,70 @@ class ChatWindow(ctk.CTkToplevel):
             self.unread_count += 1
             self.update_title()
         try:
-
             notif = tk.Toplevel(self)
             notif.title("")
             notif.overrideredirect(True)
             notif.attributes('-topmost', True)
-            screen_width = notif.winfo_screenwidth()
-            screen_height = notif.winfo_screenheight()
+
             width, height = 380, 120
+
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SetProcessDPIAware()
+                    screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+                    screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+                except:
+                    screen_width = notif.winfo_screenwidth()
+                    screen_height = notif.winfo_screenheight()
+            else:
+                screen_width = notif.winfo_screenwidth()
+                screen_height = notif.winfo_screenheight()
+
             x = screen_width - width - 20
             y = screen_height - height - 60
+
+            if x < 0: x = 10
+            if y < 0: y = 10
+
             notif.geometry(f"{width}x{height}+{x}+{y}")
+            notif.update_idletasks()
+
             notif.configure(bg="#100e1a")
 
             frame = tk.Frame(notif, bg="#100e1a", highlightbackground="#302c46", highlightthickness=1)
             frame.pack(fill="both", expand=True, padx=2, pady=2)
             header_frame = tk.Frame(frame, bg="#100e1a")
             header_frame.pack(fill="x", padx=15, pady=(10, 5))
+
+            # --- ХАК ДЛЯ ОПРЕДЕЛЕНИЯ ЦВЕТА НИКА В УВЕДОМЛЕНИИ ---
+            title_color = "#6d92ff"  # Стандартный синий дефолтный цвет
+            if sender:
+                try:
+                    # Подгружаем базу аккаунтов
+                    from __main__ import load_accounts
+                    accounts = load_accounts()
+                    for acc in accounts:
+                        # Если отправитель совпадает с ником лицензии, меняем цвет на золотой
+                        if acc["username"] == sender and acc.get("type") == "microsoft":
+                            title_color = "#FFD700"
+                            break
+                except:
+                    try:
+                        accounts = load_accounts()
+                        for acc in accounts:
+                            if acc["username"] == sender and acc.get("type") == "microsoft":
+                                title_color = "#FFD700"
+                                break
+                    except:
+                        pass
+
             title_text = f"💬 {sender}" if sender else "💬 Новое сообщение"
+
+            # Применяем вычисленный цвет title_color к метке заголовка
             tk.Label(header_frame, text=title_text, font=("Segoe UI", 12, "bold"),
-                     bg="#100e1a", fg="#6d92ff").pack(side="left")
+                     bg="#100e1a", fg=title_color).pack(side="left")
+
             close_btn = tk.Button(header_frame, text="✕", command=notif.destroy,
                                   bg="#100e1a", fg="#e5e2f0", activebackground="#d3453f",
                                   activeforeground="#e5e2f0", relief="flat", bd=0,
@@ -1694,6 +1953,7 @@ class ChatWindow(ctk.CTkToplevel):
             msg_text = message[:80] + "..." if len(message) > 80 else message
             tk.Label(frame, text=msg_text, font=("Segoe UI", 11), bg="#100e1a", fg="#e5e2f0",
                      wraplength=350, justify="left").pack(padx=15, pady=(5, 10), anchor="w")
+
             notif.after(5000, notif.destroy)
             notif.attributes('-alpha', 0.0)
 
@@ -1761,6 +2021,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.chat_display.insert("1.0", "💬 Чат готов к работе...\n")
         self.chat_display.insert("end", "━" * 50 + "\n")
         self.chat_display.configure(state="disabled")
+        self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")  # Золотой цвет для ников
 
         info_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         info_frame.pack(fill="x", pady=(0, 10))
@@ -1901,7 +2162,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.msg_count_label.configure(text="")
 
     def log(self, message):
-
         if threading.current_thread() is not threading.main_thread():
             try:
                 self.after(0, lambda: self.log(message))
@@ -1913,11 +2173,60 @@ class ChatWindow(ctk.CTkToplevel):
                 return
             self.chat_display.configure(state="normal")
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.chat_display.insert("end", f"[{timestamp}] {message}\n")
+
+            # Базовая позиция для вставки новой строки
+            start_index = self.chat_display.index("end-1c")
+
+            # Проверяем, содержит ли строка сообщение от пользователя (например, "VlipilOs: текст")
+            # или системное уведомление об отправке/получении ("💬 VlipilOs: текст", "📤 VlipilOs: текст")
+            clean_message = message.lstrip("💬 📤 📨 🔔 ")
+
+            is_licensed_msg = False
+            target_nick = ""
+
+            if ": " in clean_message:
+                possible_nick = clean_message.split(": ", 1)[0]
+                # Импортируем функцию загрузки аккаунтов для проверки типа
+                try:
+                    from __main__ import load_accounts
+                    accounts = load_accounts()
+                    for acc in accounts:
+                        if acc["username"] == possible_nick and acc.get("type") == "microsoft":
+                            is_licensed_msg = True
+                            target_nick = possible_nick
+                            break
+                except:
+                    # Если импорт напрямую не сработал, проверяем через глобальную область
+                    try:
+                        accounts = load_accounts()
+                        for acc in accounts:
+                            if acc["username"] == possible_nick and acc.get("type") == "microsoft":
+                                is_licensed_msg = True
+                                target_nick = possible_nick
+                                break
+                    except:
+                        pass
+
+            # Вставляем стандартный текст с временной меткой
+            full_text = f"[{timestamp}] {message}\n"
+            self.chat_display.insert("end", full_text)
+
+            # Если это сообщение от лицензионного аккаунта, точечно перекрашиваем его ник
+            if is_licensed_msg and target_nick:
+                # Ищем точное положение ника в только что вставленной строке чата
+                current_line = start_index.split('.')[0]
+                line_content = self.chat_display.get(f"{current_line}.0", f"{current_line}.end")
+                nick_start_offset = line_content.find(target_nick)
+
+                if nick_start_offset != -1:
+                    nick_start_idx = f"{current_line}.{nick_start_offset}"
+                    nick_end_idx = f"{current_line}.{nick_start_offset + len(target_nick)}"
+                    self.chat_display.tag_add("gold_chat_nick", nick_start_idx, nick_end_idx)
+
             self.chat_display.see("end")
             self.chat_display.configure(state="disabled")
-        except:
-            pass
+        except Exception as e:
+            print(f"Ошибка логирования в чате: {e}")
 
     def safe_update_widget(self, widget, **kwargs):
 
@@ -2022,6 +2331,8 @@ class ChatWindow(ctk.CTkToplevel):
                     sender, text = message.split(": ", 1)
                 else:
                     sender, text = "", message
+
+                # Показываем уведомление (это сработает только у принимающего игрока!)
                 self.show_notification(text, sender)
             else:
                 self.log(f"🔔 {message}")
@@ -2048,11 +2359,8 @@ class ChatWindow(ctk.CTkToplevel):
                     self.update_msg_count()
                     self.log(f"📤 {message}")
 
-                    if ": " in message:
-                        sender, text = message.split(": ", 1)
-                    else:
-                        sender, text = self.username, message
-                    self.show_notification(text, sender)
+                    # ХАК: Строка self.show_notification(text, sender) УДАЛЕНА ОТСЮДА,
+                    # чтобы у отправляющего игрока не всплывало собственное окно.
         except Exception as e:
             self.log(f"❌ Ошибка отправки: {e}")
             self.disconnect()
@@ -2302,6 +2610,24 @@ class LauncherApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.start_idle_timer()
 
+    def update_combo_text_color(self, selected_username=None):
+        if not selected_username:
+            selected_username = self.account_combo.get()
+
+        # Ищем тип выбранного аккаунта
+        accounts = load_accounts()
+        account_type = "offline"
+        for acc in accounts:
+            if acc["username"] == selected_username:
+                account_type = acc.get("type", "offline")
+                break
+
+        # Если это microsoft, красим текст в золотой, иначе возвращаем дефолтный белый/светлый
+        if account_type == "microsoft":
+            self.account_combo.configure(text_color="#FFD700")
+        else:
+            self.account_combo.configure(text_color=["#e5e2f0", "#e5e2f0"])
+
     def apply_theme(self):
         theme = self.settings.get("theme", "dark")
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
@@ -2428,9 +2754,9 @@ class LauncherApp(ctk.CTk):
         self.title(f"67Launcher - МЯУ | Запусков: {launches} | Время: {self.format_time(play_time)}")
 
     def restore_last_selection(self):
+        self.update_combo_text_color()
         last_account = self.settings.get("last_account", "")
         last_version = self.settings.get("last_version", "")
-        last_skin = self.settings.get("last_skin", "")
         if last_account:
             try:
                 self.account_combo.set(last_account)
@@ -2441,16 +2767,10 @@ class LauncherApp(ctk.CTk):
                 self.version_combo.set(last_version)
             except:
                 pass
-        if last_skin:
-            try:
-                self.skin_combo.set(last_skin)
-            except:
-                pass
 
     def save_current_selection(self):
         self.settings["last_account"] = self.account_combo.get()
         self.settings["last_version"] = self.version_combo.get()
-        self.settings["last_skin"] = self.skin_combo.get()
         save_launcher_settings(self.settings)
 
     def load_available_versions(self):
@@ -2701,156 +3021,83 @@ class LauncherApp(ctk.CTk):
                                       font=ctk.CTkFont(size=13))
         close_btn.grid(row=0, column=1, padx=10, pady=5)
 
-    def install_custom_skin_loader(self):
-        mods_path = os.path.join(MINECRAFT_DIR, "mods")
-        os.makedirs(mods_path, exist_ok=True)
-        for file in os.listdir(mods_path):
-            if "CustomSkinLoader" in file or "SkinLoader" in file:
-                self.ensure_elyby_in_skinloader_config()
-                self.log("✅ CustomSkinLoader уже установлен")
-                play_click()
-                messagebox.showinfo("Информация", "CustomSkinLoader и так уже стоит (конфиг Ely.by подтянут)")
-                return True
+    def add_elyby_account_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("🟢 Вход через Ely.by")
+        dialog.geometry("420x320")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self)
 
-        threading.Thread(target=self._install_custom_skin_loader_worker, daemon=True).start()
-        return True
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-    def _install_custom_skin_loader_worker(self):
-        try:
-            mods_path = os.path.join(MINECRAFT_DIR, "mods")
-            self.log("📥 Скачивание CustomSkinLoader Universal...")
-            mod_url = "https://github.com/xfl03/MCCustomSkinLoader/releases/download/v15.0.1/CustomSkinLoader_Universal-15.0.1.jar"
-            mod_file = os.path.join(mods_path, "CustomSkinLoader.jar")
-            success = self.download_with_progress(mod_url, mod_file, "Скачивание CustomSkinLoader")
+        ctk.CTkLabel(main_frame, text="🟢 Вход через Ely.by", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color="#6fce7f").pack(pady=(0, 10))
+        ctk.CTkLabel(main_frame,
+                     text="Ник или e-mail, и пароль от ely.by. Если у тебя уже\n"
+                          "залит свой скин на сайте ely.by — он появится в игре\n"
+                          "БЕЗ модов, authlib-injector сам его подставит.",
+                     font=ctk.CTkFont(size=11), text_color="#a8a4bd", justify="left").pack(pady=(0, 10))
+
+        login_entry = ctk.CTkEntry(main_frame, placeholder_text="Ник или e-mail", height=35)
+        login_entry.pack(fill="x", pady=(0, 8))
+        password_entry = ctk.CTkEntry(main_frame, placeholder_text="Пароль", show="•", height=35)
+        password_entry.pack(fill="x", pady=(0, 8))
+        totp_entry = ctk.CTkEntry(main_frame, placeholder_text="Код 2FA (если включена)", height=35)
+        totp_entry.pack(fill="x", pady=(0, 8))
+
+        status_label = ctk.CTkLabel(main_frame, text="", font=ctk.CTkFont(size=12), wraplength=360, justify="left")
+        status_label.pack(pady=(0, 8))
+
+        def do_submit():
+            login = login_entry.get().strip()
+            password = password_entry.get()
+            totp = totp_entry.get().strip()
+            if not login or not password:
+                play_error()
+                status_label.configure(text="Заполни ник/e-mail и пароль", text_color="#d3453f")
+                return
+
+            final_password = f"{password}:{totp}" if totp else password
+            status_label.configure(text="⏳ Вход...", text_color="#d9622f")
+            dialog.update_idletasks()
+
+            def worker():
+                success, result = elyby_authenticate(login, final_password)
+                self.after(0, lambda: on_result(success, result))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_result(success, result):
             if not success:
+                play_error()
+                if "two factor" in str(result).lower():
+                    status_label.configure(
+                        text="Включена двухфакторная аутентификация — впиши код из приложения "
+                             "в поле '2FA' и нажми ещё раз", text_color="#d3453f")
+                else:
+                    status_label.configure(text=f"Не вошёл: {result}", text_color="#d3453f")
                 return
-            self.log("✅ CustomSkinLoader Universal установлен!")
-            config_path = os.path.join(MINECRAFT_DIR, "config", "CustomSkinLoader")
-            os.makedirs(config_path, exist_ok=True)
-            config_file = os.path.join(config_path, "skinloader.json")
-            config_data = {
-                "enable": True,
-                "loadlist": [
-                    {"name": "LocalSkin", "type": "LocalSkin", "skin": "LocalSkin/%s.png"},
-                    {"name": "ElyBy", "type": "ElyByAPI"},
-                    {"name": "Mojang", "type": "MojangAPI"}
-                ]
-            }
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(config_data, f, indent=2, ensure_ascii=False)
-            self.log("✅ Конфиг CustomSkinLoader создан")
-            skins_local_path = os.path.join(MINECRAFT_DIR, "CustomSkinLoader", "LocalSkin")
-            os.makedirs(skins_local_path, exist_ok=True)
-            play_click()
-            self.after(0, lambda: messagebox.showinfo("Успешно", "Готово, CustomSkinLoader встал куда надо"))
-        except Exception as e:
-            err = str(e)
-            self.log(f"❌ Ошибка установки CustomSkinLoader: {err}")
-            play_error()
-            self.after(0, lambda: messagebox.showerror("Ошибка", f"CustomSkinLoader не встал :(\n\nПричина: {err}"))
 
-    def install_skin_loader_for_fabric(self):
-        self.log("🧵 Установка CustomSkinLoader для Fabric...")
-        return self.install_custom_skin_loader()
+            ok, msg = add_elyby_account(result)
+            if ok:
+                self.refresh_accounts()
+                self.refresh_accounts_listbox()
+                play_click()
+                dialog.destroy()
+                messagebox.showinfo("Готово", f"Залогинен как {result['name']} через Ely.by")
+            else:
+                play_error()
+                status_label.configure(text=msg, text_color="#d3453f")
 
-    def ensure_elyby_in_skinloader_config(self):
-        try:
-            config_file = os.path.join(MINECRAFT_DIR, "config", "CustomSkinLoader", "skinloader.json")
-            if not os.path.exists(config_file):
-                return
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-            loadlist = config_data.get("loadlist", [])
-            has_elyby = any(entry.get("type") == "ElyByAPI" for entry in loadlist)
-            if not has_elyby:
-                loadlist.append({"name": "ElyBy", "type": "ElyByAPI"})
-                config_data["loadlist"] = loadlist
-                with open(config_file, 'w', encoding='utf-8') as f:
-                    json.dump(config_data, f, indent=2, ensure_ascii=False)
-                self.log("✅ Добавил ElyBy в уже существующий конфиг CustomSkinLoader")
-        except Exception as e:
-            self.log(f"⚠️ Не удалось обновить конфиг CustomSkinLoader: {e}")
+        make_sound_button(main_frame, text="✅ Войти", command=do_submit,
+                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=40).pack(
+            fill="x", pady=(4, 8))
 
-    def create_skin_data(self, username, skin_path):
-        try:
-            skins_local_path = os.path.join(MINECRAFT_DIR, "CustomSkinLoader", "LocalSkin")
-            os.makedirs(skins_local_path, exist_ok=True)
-            skin_filename = f"{username}.png"
-            skin_dest = os.path.join(skins_local_path, skin_filename)
-            shutil.copy2(skin_path, skin_dest)
-            self.log(f"✅ Скин скопирован: .minecraft/CustomSkinLoader/LocalSkin/{skin_filename}")
-            return True
-        except Exception as e:
-            self.log(f"❌ Ошибка установки скина: {e}")
-            return False
-
-    def setup_elyby_skins(self):
-        mods_path = os.path.join(MINECRAFT_DIR, "mods")
-        has_loader = os.path.exists(mods_path) and any(
-            "CustomSkinLoader" in f or "SkinLoader" in f for f in os.listdir(mods_path)
-        )
-        if has_loader:
-            self.ensure_elyby_in_skinloader_config()
-            play_click()
-            messagebox.showinfo("Готово",
-                                "CustomSkinLoader уже стоит, конфиг Ely.by подтянут.\n\n"
-                                "Осталось зарегистрироваться на ely.by под своим ником и "
-                                "залить туда скин — жми кнопку 'Открыть ely.by' рядом.")
-        else:
-            self.install_custom_skin_loader()
-            self.log("⚙️ Ely.by будет добавлен в конфиг автоматически при установке")
-
-    def set_skin_for_nickname(self):
-        username = self.skin_target_nick_entry.get().strip()
-        if not username:
-            play_error()
-            messagebox.showwarning("Ошибка", "Сначала укажи ник")
-            return
-
-        file_path = filedialog.askopenfilename(
-            title="Выбери PNG скина",
-            filetypes=[("PNG изображения", "*.png"), ("Все файлы", "*.*")]
-        )
-        if not file_path:
-            return
-
-        mods_path = os.path.join(MINECRAFT_DIR, "mods")
-        has_loader = os.path.exists(mods_path) and any(
-            "CustomSkinLoader" in f or "SkinLoader" in f for f in os.listdir(mods_path)
-        )
-        if not has_loader:
-            if messagebox.askyesno("Нужен мод",
-                                   "Чтобы скины по нику вообще показывались в игре, нужен мод "
-                                   "CustomSkinLoader. Поставить сейчас?"):
-                self.install_custom_skin_loader()
-
-        success = self.create_skin_data(username, file_path)
-        if not success:
-            play_error()
-            messagebox.showerror("Ошибка", "Скин не применился")
-            return
-
-        play_click()
-        self.log(f"🎨 Скин поставлен на ник '{username}'")
-
-        sent_to_peer = False
-        chat = self.active_chat_window
-        try:
-            if chat is not None and chat.winfo_exists() and chat.connected:
-                sent_to_peer = chat.send_skin_file(username, file_path)
-        except:
-            pass
-
-        if sent_to_peer:
-            messagebox.showinfo("Готово",
-                                f"Скин поставлен на '{username}' и отправлен собеседнику в чате — "
-                                f"он тоже увидит этот ник со скином.")
-        else:
-            messagebox.showinfo("Готово",
-                                f"Скин поставлен на '{username}' у тебя локально.\n\n"
-                                f"Чтобы это увидел друг — подключись к нему через чат (вкладка "
-                                f"'Чат' в шапке) и повтори, тогда скин уйдёт ему автоматически.")
-        self.refresh_skins()
+        make_sound_button(main_frame, text="🌐 Открыть ely.by (регистрация / загрузка скина)",
+                          command=lambda: webbrowser.open("https://ely.by/skins"),
+                          fg_color="#2b2840", hover_color="#3d3a52", height=32).pack(fill="x")
 
     def open_mods_folder(self):
         mods_path = os.path.join(MINECRAFT_DIR, "mods")
@@ -2868,17 +3115,89 @@ class LauncherApp(ctk.CTk):
         if usernames and usernames[0] != "Нет аккаунтов":
             self.account_combo.set(usernames[0])
 
+        # --- ХАК ДЛЯ ПЕРЕКРАСКИ ВНУТРИ ВЫПАДАЮЩЕГО СПИСКА ---
+        try:
+            # Получаем доступ к скрытому стандартному меню tkinter внутри CTkComboBox
+            dropdown_menu = self.account_combo._dropdown_menu
+            if dropdown_menu and usernames != ["Нет аккаунтов"]:
+                for index, username in enumerate(usernames):
+                    # Ищем, является ли этот конкретный ник лицензионным
+                    is_microsoft = False
+                    for acc in accounts:
+                        if acc["username"] == username and acc.get("type") == "microsoft":
+                            is_microsoft = True
+                            break
+
+                    # Если нашли, принудительно красим текст строки в меню в золотой цвет
+                    if is_microsoft:
+                        dropdown_menu.entryconfigure(index, foreground="#FFD700")
+                    else:
+                        dropdown_menu.entryconfigure(index, foreground=["#e5e2f0", "#e5e2f0"])
+        except Exception as e:
+            print(f"Не удалось перекрасить пункты выпадающего меню: {e}")
+
+        # Не забываем обновить цвет главного выбранного текста
+        if hasattr(self, 'update_combo_text_color'):
+            self.update_combo_text_color()
+
+    def on_account_listbox_click(self, event):
+        try:
+            index = self.accounts_listbox.index(f"@{event.x},{event.y}")
+            line_num = int(index.split(".")[0])
+        except Exception:
+            return "break"
+
+        line_idx = line_num - 1
+        if line_idx < 0 or line_idx >= len(self._accounts_order):
+            return "break"
+
+        self._selected_account_username = self._accounts_order[line_idx]
+        self._highlight_account_line(line_num)
+        play_click()
+        return "break"
+
+    def _highlight_account_line(self, line_num):
+        try:
+            self.accounts_listbox.tag_remove("selected_account", "1.0", "end")
+            self.accounts_listbox.tag_add("selected_account", f"{line_num}.0", f"{line_num}.end+1c")
+        except Exception:
+            pass
+
     def refresh_accounts_listbox(self):
         accounts = load_accounts()
         self.accounts_listbox.delete("1.0", "end")
+        self._accounts_order = []
         if not accounts:
             self.accounts_listbox.insert("1.0", "Нет аккаунтов")
+            self._selected_account_username = None
             return
+
         for acc in accounts:
             created = acc.get('created', 'неизвестно')
-            icon = "🔷" if acc.get("type") == "microsoft" else "👤"
-            label = "лицензионный" if acc.get("type") == "microsoft" else "оффлайн"
-            self.accounts_listbox.insert("end", f"{icon} {acc['username']}  ({label}, создан: {created})\n")
+            acc_type = acc.get("type")
+
+            if acc_type == "microsoft":
+                icon, label = "🔷", "лицензионный"
+                # Запоминаем текущую позицию перед вставкой текста
+                start_pos = self.accounts_listbox.index("end-1c")
+                self.accounts_listbox.insert("end", f"{icon} {acc['username']}  ({label}, создан: {created})\n")
+                end_pos = self.accounts_listbox.index("end-1c")
+                # Красим эту строку в золотой цвет
+                self.accounts_listbox.tag_add("gold_account", start_pos, end_pos)
+            else:
+                if acc_type == "elyby":
+                    icon, label = "🟢", "Ely.by"
+                else:
+                    icon, label = "👤", "оффлайн"
+                self.accounts_listbox.insert("end", f"{icon} {acc['username']}  ({label}, создан: {created})\n")
+
+            self._accounts_order.append(acc['username'])
+
+        if self._selected_account_username in self._accounts_order:
+            line_num = self._accounts_order.index(self._selected_account_username) + 1
+            self._highlight_account_line(line_num)
+        else:
+            self._selected_account_username = None
 
     def add_account_dialog(self):
         dialog = ctk.CTkToplevel(self)
@@ -2934,11 +3253,9 @@ class LauncherApp(ctk.CTk):
             messagebox.showerror("Ошибка", f"Не получилось построить ссылку входа:\n{e}")
             return
 
-        webbrowser.open(login_url)
-
         dialog = ctk.CTkToplevel(self)
         dialog.title("🔷 Вход через Microsoft")
-        dialog.geometry("1500x300")
+        dialog.geometry("420x170")
         dialog.resizable(False, False)
         dialog.grab_set()
         dialog.transient(self)
@@ -2948,121 +3265,137 @@ class LauncherApp(ctk.CTk):
 
         ctk.CTkLabel(main_frame, text="🔷 Вход через Microsoft", font=ctk.CTkFont(size=18, weight="bold"),
                      text_color="#6d92ff").pack(pady=(0, 10))
-        ctk.CTkLabel(main_frame,
-                     text="Браузер уже открылся. Залогинься там своим Microsoft-аккаунтом\n"
-                          "(тем самым, где куплен Minecraft), а когда тебя перекинет на\n"
-                          "финальную страницу — скопируй ссылку из адресной строки целиком\n"
-                          "и вставь сюда:",
-                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="left").pack(pady=(0, 10))
-
-        url_entry = ctk.CTkEntry(main_frame, placeholder_text="Вставь сюда ссылку после логина", height=35)
-        url_entry.pack(fill="x", pady=(0, 15))
-
-        status_label = ctk.CTkLabel(main_frame, text="", font=ctk.CTkFont(size=12))
+        status_label = ctk.CTkLabel(main_frame, text="⏳ Открываю окно входа...",
+                                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", wraplength=360, justify="left")
         status_label.pack(pady=(0, 10))
 
-        # Вместо старого парсинга, добавьте этот код:
-        def finish_login():
-            redirect_url = url_entry.get().strip()
-            if not redirect_url:
-                play_error()
-                status_label.configure(text="Вставь ссылку", text_color="#d3453f")
-                return
-
-            # Извлекаем код из URL
-            import re
-            match = re.search(r'code=([^&]+)', redirect_url)
-            if not match:
-                play_error()
-                status_label.configure(text="В ссылке нет кода", text_color="#d3453f")
-                return
-
-            auth_code = match.group(1)
-            # Декодируем URL-кодировку
-            from urllib.parse import unquote
-            auth_code = unquote(auth_code)
-
-            status_label.configure(text="⏳ Получение токена...", text_color="#d9622f")
-            dialog.update_idletasks()
-
-            def do_login():
+        def set_status(text, color="#a8a4bd"):
+            def _apply():
                 try:
-                    # Используем ручной обмен кода на токен
-                    import requests
-                    token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-                    data = {
-                        "client_id": client_id,
-                        "code": auth_code,
-                        "redirect_uri": redirect_uri,
-                        "grant_type": "authorization_code",
-                        "scope": "XboxLive.signin offline_access User.Read"
-                    }
-                    response = requests.post(token_url, data=data)
-                    if response.status_code != 200:
-                        self.after(0, lambda: login_failed(f"Ошибка: {response.text}"))
-                        return
+                    if dialog.winfo_exists():
+                        status_label.configure(text=text, text_color=color)
+                except Exception:
+                    pass
+            self.after(0, _apply)
 
-                    token_data = response.json()
-                    # Теперь нужно получить данные пользователя
-                    # Для этого используем Microsoft Graph
-                    headers = {"Authorization": f"Bearer {token_data['access_token']}"}
-                    user_response = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-                    if user_response.status_code != 200:
-                        self.after(0, lambda: login_failed("Не удалось получить профиль"))
-                        return
+        def do_login(auth_code):
+            try:
+                login_data = mll.microsoft_account.complete_login(
+                    client_id, None, redirect_uri, auth_code, code_verifier
+                )
+                self.after(0, lambda: login_success(login_data))
+            except Exception as e:
+                self.after(0, lambda: login_failed(str(e)))
 
-                    user_data = user_response.json()
-                    login_data = {
-                        "name": user_data.get("displayName", "Игрок"),
-                        "id": user_data.get("id", ""),
-                        "access_token": token_data.get("access_token", ""),
-                        "refresh_token": token_data.get("refresh_token", "")
-                    }
-                    self.after(0, lambda: login_success(login_data))
-                except Exception as e:
-                    self.after(0, lambda: login_failed(str(e)))
-
-            threading.Thread(target=do_login, daemon=True).start()
-
-            def login_success(login_data):
-                success, msg = add_microsoft_account(login_data)
-                if success:
-                    self.refresh_accounts()
-                    self.refresh_accounts_listbox()
-                    play_click()
+        def login_success(login_data):
+            success, msg = add_microsoft_account(login_data)
+            if success:
+                self.refresh_accounts()
+                self.refresh_accounts_listbox()
+                play_click()
+                try:
                     dialog.destroy()
-                    messagebox.showinfo("Готово", f"Залогинен как {login_data['name']} — можно играть")
-                else:
-                    play_error()
-                    status_label.configure(text=msg, text_color="#d3453f")
-
-            def login_failed(err):
+                except Exception:
+                    pass
+                messagebox.showinfo("Готово", f"Залогинен как {login_data['name']} — можно играть")
+            else:
                 play_error()
-                if "AzureAppNotPermitted" in err:
-                    status_label.configure(
-                        text="Твоему Azure-приложению не дали доступ к API Minecraft — "
-                             "нужно подать заявку в форме Microsoft",
-                        text_color="#d3453f"
-                    )
+                set_status(msg, "#d3453f")
+
+        def login_failed(err):
+            play_error()
+            if "AzureAppNotPermitted" in err:
+                set_status(
+                    "Твоему Azure-приложению не дали доступ к API Minecraft — "
+                    "нужно подать заявку в форме Microsoft", "#d3453f"
+                )
+            else:
+                set_status(f"Не залогинился: {err}", "#d3453f")
+
+        def run_embedded_login():
+            try:
+                import webview  # noqa: F401 - только для быстрой проверки, что пакет установлен
+            except ImportError:
+                play_error()
+                messagebox.showerror(
+                    "Нужен pywebview",
+                    "Для встроенного окна входа нужен пакет pywebview.\n"
+                    "Установи его командой:\npip install pywebview"
+                )
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                return
+
+            result_queue = multiprocessing.Queue()
+            proc = multiprocessing.Process(
+                target=_ms_login_webview_process,
+                args=(login_url, redirect_uri, result_queue),
+                daemon=True,
+            )
+            proc.start()
+
+            def poll_result():
+                try:
+                    if not dialog.winfo_exists():
+                        return
+                except Exception:
+                    return
+
+                if not result_queue.empty():
+                    result = result_queue.get()
+                    code = result.get("code")
+                    error = result.get("error")
+
+                    if code:
+                        set_status("⏳ Получение токена...", "#d9622f")
+                        threading.Thread(target=do_login, args=(code,), daemon=True).start()
+                    elif error and error.startswith("import_error"):
+                        play_error()
+                        messagebox.showerror(
+                            "Нужен pywebview",
+                            "Для встроенного окна входа нужен пакет pywebview.\n"
+                            "Установи его командой:\npip install pywebview"
+                        )
+                        try:
+                            dialog.destroy()
+                        except Exception:
+                            pass
+                    elif error:
+                        play_error()
+                        set_status(f"Вход не завершён: {error}", "#d3453f")
+                    else:
+                        play_error()
+                        set_status("Окно входа закрыто без логина", "#d3453f")
+                    return
+
+                if proc.is_alive():
+                    self.after(200, poll_result)
                 else:
-                    status_label.configure(text=f"Не залогинился: {err}", text_color="#d3453f")
+                    # процесс закрылся, но ничего не положил в очередь
+                    play_error()
+                    set_status("Окно входа закрыто без логина", "#d3453f")
 
-            threading.Thread(target=do_login, daemon=True).start()
+            self.after(200, poll_result)
 
-        make_sound_button(main_frame, text="✅ Войти", command=finish_login,
-                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=40).pack(fill="x")
+        run_embedded_login()
 
     def delete_selected_account(self):
-        selection = self.accounts_listbox.get("1.0", "end").strip()
-        if not selection or selection == "Нет аккаунтов":
+        if not self._accounts_order:
             play_error()
             messagebox.showwarning("Ошибка", "Удалять нечего, аккаунтов нет")
             return
-        first_line = selection.split("\n")[0]
-        username = re.sub(r"^[👤🔷]\s*", "", first_line).split("(")[0].strip()
+        if not self._selected_account_username:
+            play_error()
+            messagebox.showwarning("Ошибка", "Сначала кликни по аккаунту в списке, который хочешь удалить")
+            return
+
+        username = self._selected_account_username
         if messagebox.askyesno("Подтверждение", f"Удалить аккаунт '{username}'?"):
             success, msg = delete_account(username)
             if success:
+                self._selected_account_username = None
                 self.refresh_accounts()
                 self.refresh_accounts_listbox()
                 play_click()
@@ -3244,16 +3577,10 @@ class LauncherApp(ctk.CTk):
         self.skins_listbox.delete(0, "end")
         if not skins:
             self.skins_listbox.insert("end", "📭 Скины не установлены")
-            self.skin_combo.configure(values=["Нет скинов"])
             return
-        skin_names = []
         for skin in skins:
             info = f"🎨 {skin['name']} ({skin['size']})"
             self.skins_listbox.insert("end", info)
-            skin_names.append(skin['name'])
-        self.skin_combo.configure(values=skin_names)
-        if skin_names:
-            self.skin_combo.set(skin_names[0])
 
     def import_skin(self):
         file_path = filedialog.askopenfilename(
@@ -3312,11 +3639,17 @@ class LauncherApp(ctk.CTk):
         self.delete_skin(name)
 
     def preview_skin(self):
-        skin_name = self.skin_combo.get()
-        if not skin_name or skin_name == "Нет скинов":
+        selection = self.skins_listbox.curselection()
+        if not selection:
+            play_error()
+            messagebox.showinfo("Информация", "Сначала выбери скин в списке слева")
+            return
+        selected_text = self.skins_listbox.get(selection[0])
+        if "📭" in selected_text:
             play_error()
             messagebox.showinfo("Информация", "Скин не выбран — глянуть нечего")
             return
+        skin_name = selected_text.split("🎨 ")[1].split(" (")[0].strip()
         skins_path = get_skins_folder()
         skin_path = os.path.join(skins_path, skin_name)
         if not os.path.exists(skin_path):
@@ -3378,7 +3711,8 @@ class LauncherApp(ctk.CTk):
 📁 Путь: {skin_path}
 📏 Размер: {self.format_size(os.path.getsize(skin_path))}
 
-💡 Для использования выберите этот скин на вкладке "Игра"
+💡 Это просто файл в папке скинов. Чтобы скин показывался
+   в игре — используй вход через Ely.by (вкладка "Аккаунты").
         """
         self.skin_info.configure(state="normal")
         self.skin_info.delete("1.0", "end")
@@ -3522,37 +3856,39 @@ class LauncherApp(ctk.CTk):
         ctk.CTkLabel(main_frame, text="🎮 Запуск игры", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0,
                                                                                                       pady=(0, 20))
         ctk.CTkLabel(main_frame, text="👤 Аккаунт:", font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="w")
-        self.account_combo = ctk.CTkComboBox(main_frame, values=["Нет аккаунтов"], width=300, height=35)
+        self.account_combo = ctk.CTkComboBox(
+            main_frame,
+            values=["Нет аккаунтов"],
+            width=300,
+            height=35,
+            command=self.update_combo_text_color
+        )
         self.account_combo.grid(row=2, column=0, sticky="w", pady=(0, 15))
 
         ctk.CTkLabel(main_frame, text="📦 Версия:", font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="w")
         self.version_combo = ctk.CTkComboBox(main_frame, values=["Нет версий"], width=300, height=35)
         self.version_combo.grid(row=4, column=0, sticky="w", pady=(0, 15))
 
-        ctk.CTkLabel(main_frame, text="🎨 Скин:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
-        self.skin_combo = ctk.CTkComboBox(main_frame, values=["Нет скинов"], width=300, height=35)
-        self.skin_combo.grid(row=6, column=0, sticky="w", pady=(0, 15))
-
-        ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=7, column=0, sticky="w")
+        ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
         self.ram_var = ctk.StringVar(value="2G")
         ram_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        ram_frame.grid(row=8, column=0, sticky="w", pady=(0, 20))
+        ram_frame.grid(row=6, column=0, sticky="w", pady=(0, 20))
         for ram in ["1G", "2G", "3G", "4G", "6G", "8G"]:
             ctk.CTkRadioButton(ram_frame, text=ram, variable=self.ram_var, value=ram).pack(side="left", padx=5)
 
         self.launch_status_label = ctk.CTkLabel(main_frame, text="✅ Погнали", font=ctk.CTkFont(size=13))
-        self.launch_status_label.grid(row=9, column=0, sticky="w", pady=(0, 10))
+        self.launch_status_label.grid(row=7, column=0, sticky="w", pady=(0, 10))
 
         self.launch_progressbar = AnimatedProgressBar(main_frame, width=300, height=15)
-        self.launch_progressbar.grid(row=10, column=0, sticky="ew", pady=(0, 15))
+        self.launch_progressbar.grid(row=8, column=0, sticky="ew", pady=(0, 15))
 
         self.launch_btn = make_sound_button(main_frame, text="🚀 ЗАПУСТИТЬ ИГРУ", command=self.launch_game, height=50,
                                             font=ctk.CTkFont(size=16, weight="bold"), fg_color="#7896f7",
                                             hover_color="#5f7fe0")
-        self.launch_btn.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+        self.launch_btn.grid(row=9, column=0, sticky="ew", pady=(0, 10))
 
         self.timer_label = ctk.CTkLabel(main_frame, text="⏱ Время игры: 0с", font=ctk.CTkFont(size=13))
-        self.timer_label.grid(row=12, column=0, sticky="w")
+        self.timer_label.grid(row=10, column=0, sticky="w")
 
     def create_install_tab(self):
         tab = self.tab_view.tab("📦 Установка")
@@ -3738,9 +4074,14 @@ class LauncherApp(ctk.CTk):
         _c = self.get_theme_colors()
         self.accounts_listbox = tk.Text(left_frame, bg=_c["listbox_bg"], fg=_c["listbox_fg"], font=("Consolas", 11),
                                         height=15,
-                                        relief="flat")
+                                        relief="flat", cursor="hand2")
         self.accounts_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.register_themed_widget(self.accounts_listbox)
+        self.accounts_listbox.tag_configure("selected_account", background="#3d3a52", foreground="#ffffff")
+        self.accounts_listbox.tag_configure("gold_account", foreground="#FFD700")  # Золотой цвет текста
+        self.accounts_listbox.bind("<Button-1>", self.on_account_listbox_click)
+        self._accounts_order = []
+        self._selected_account_username = None
 
         btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
         btn_frame.grid(row=2, column=0, sticky="ew")
@@ -3759,6 +4100,11 @@ class LauncherApp(ctk.CTk):
                                    fg_color="#2b2840", hover_color="#3d3a52")
         ms_btn.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
+        elyby_btn = make_sound_button(left_frame, text="🟢 Добавить Ely.by",
+                                      command=self.add_elyby_account_dialog,
+                                      fg_color="#2b2840", hover_color="#3d3a52")
+        elyby_btn.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+
         right_frame = ctk.CTkFrame(tab)
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
         right_frame.grid_columnconfigure(0, weight=1)
@@ -3771,9 +4117,13 @@ class LauncherApp(ctk.CTk):
 1. "Добавить" — обычный оффлайн-ник
 2. "Добавить лицензионный" — вход через
    настоящий аккаунт Microsoft
+3. "Добавить Ely.by" — вход через ely.by,
+   скин с сайта покажется без модов
 
 💡 Для лицензионного входа нужен свой
    Client ID — впиши его в Настройках
+💡 Скин на ely.by заливается на их сайте —
+   у них просто нет API для загрузки скина
 💡 Аккаунты живут в папке игры"""
         ctk.CTkLabel(right_frame, text=info_text, font=ctk.CTkFont(size=13), justify="left").grid(row=1, column=0,
                                                                                                   sticky="n")
@@ -3942,41 +4292,36 @@ class LauncherApp(ctk.CTk):
                                        fg_color="#d3453f", hover_color="#b83530", height=35)
         delete_btn.grid(row=0, column=2, padx=2)
 
-        mod_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        mod_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(10, 0))
+        elyby_frame = ctk.CTkFrame(left_frame, fg_color="#201d30", corner_radius=8)
+        elyby_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(10, 0))
 
-        ctk.CTkLabel(mod_frame, text="📦 Установка мода для скинов:", font=ctk.CTkFont(size=12, weight="bold"),
-                     text_color="#6d92ff").pack(anchor="w")
-
-        forge_btn = make_sound_button(mod_frame, text="🔥 Forge", command=self.install_custom_skin_loader,
-                                      fg_color="#e67e22", hover_color="#d35400", text_color="white", height=30)
-        forge_btn.pack(side="left", padx=2, pady=2)
-
-        fabric_btn = make_sound_button(mod_frame, text="🧵 Fabric", command=self.install_skin_loader_for_fabric,
-                                       fg_color="#2ecc71", hover_color="#27ae60", text_color="white", height=30)
-        fabric_btn.pack(side="left", padx=2, pady=2)
-
-        nick_skin_frame = ctk.CTkFrame(left_frame, fg_color="#201d30", corner_radius=8)
-        nick_skin_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=(15, 0))
-
-        ctk.CTkLabel(nick_skin_frame, text="🎨 Поставить скин на ник",
-                     font=ctk.CTkFont(size=13, weight="bold"), text_color="#6d92ff").pack(anchor="w", padx=12,
+        ctk.CTkLabel(elyby_frame, text="🟢 Скин через Ely.by — без модов",
+                     font=ctk.CTkFont(size=13, weight="bold"), text_color="#6fce7f").pack(anchor="w", padx=12,
                                                                                           pady=(10, 2))
-        ctk.CTkLabel(nick_skin_frame,
-                     text="Работает у тебя сразу. Если открыт и подключён чат с другом —\n"
-                          "скин уйдёт ему автоматически, и он тоже увидит этот ник со скином.",
+        ctk.CTkLabel(elyby_frame,
+                     text="У ely.by нет API для загрузки скина файлом — залить PNG можно\n"
+                          "только на их сайте. Зато показ скина в игре не требует модов:\n"
+                          "1. Залей скин на сайте (кнопка ниже).\n"
+                          "2. Войди через свой Ely.by-аккаунт (вкладка «Аккаунты»).\n"
+                          "3. Запусти игру этим аккаунтом — лаунчер сам подключит\n"
+                          "   authlib-injector, и твой скин из ely.by появится у всех.",
                      font=ctk.CTkFont(size=11), text_color="#a8a4bd", justify="left").pack(anchor="w", padx=12)
 
-        nick_row = ctk.CTkFrame(nick_skin_frame, fg_color="transparent")
-        nick_row.pack(fill="x", padx=12, pady=(8, 12))
-        nick_row.grid_columnconfigure(0, weight=1)
-        self.skin_target_nick_entry = ctk.CTkEntry(nick_row, placeholder_text="Ник (например: moring)", height=32)
-        self.skin_target_nick_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        apply_nick_skin_btn = make_sound_button(nick_row, text="📂 Выбрать PNG и поставить",
-                                                command=self.set_skin_for_nickname,
-                                                fg_color="#6fce7f", hover_color="#5cb56c",
-                                                text_color="#16141f", height=32)
-        apply_nick_skin_btn.grid(row=0, column=1)
+        elyby_btn_row = ctk.CTkFrame(elyby_frame, fg_color="transparent")
+        elyby_btn_row.pack(fill="x", padx=12, pady=(8, 12))
+        elyby_btn_row.grid_columnconfigure(0, weight=1)
+        elyby_btn_row.grid_columnconfigure(1, weight=1)
+
+        elyby_upload_btn = make_sound_button(elyby_btn_row, text="🌐 Открыть ely.by и загрузить скин",
+                                             command=lambda: webbrowser.open("https://ely.by/skins"),
+                                             fg_color="#2b2840", hover_color="#3d3a52", height=32)
+        elyby_upload_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        elyby_login_btn = make_sound_button(elyby_btn_row, text="🟢 Войти через Ely.by",
+                                            command=self.add_elyby_account_dialog,
+                                            fg_color="#6fce7f", hover_color="#5cb56c",
+                                            text_color="#16141f", height=32)
+        elyby_login_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         right_frame = ctk.CTkFrame(tab)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=(0, 10))
@@ -4331,7 +4676,7 @@ class LauncherApp(ctk.CTk):
         ms_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         ms_frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
         ms_frame.grid_columnconfigure(0, weight=1)
-
+#self.accounts_listbox.grid
         ctk.CTkLabel(ms_frame, text="Client ID своего Azure-приложения (portal.azure.com):",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=0, column=0, sticky="w")
         self.ms_client_id_entry = ctk.CTkEntry(ms_frame, placeholder_text="6ca935f1-4e54-484c-bbe2-482a8dcf9b33",
@@ -4719,12 +5064,6 @@ class LauncherApp(ctk.CTk):
             return
 
         ram = self.ram_var.get()
-        skin_name = self.skin_combo.get()
-        skin_path = None
-        if skin_name and skin_name != "Нет скинов":
-            skin_path = os.path.join(get_skins_folder(), skin_name)
-            if not os.path.exists(skin_path):
-                skin_path = None
 
         self.is_launching = True
         self.launch_btn.configure(state="disabled", text="⏳ ЗАПУСК...")
@@ -4760,9 +5099,6 @@ class LauncherApp(ctk.CTk):
                     return
                 self.set_launch_progress(45, "⏳ Проверка файлов версии...")
 
-                if skin_path and os.path.exists(skin_path):
-                    self.create_skin_data(username, skin_path)
-                    self.log(f"🎨 Скин установлен для {username}")
                 self.set_launch_progress(55)
 
                 command = mll.command.get_minecraft_command(
@@ -4783,6 +5119,7 @@ class LauncherApp(ctk.CTk):
                     i += 1
                 command = cleaned_command
 
+                injector_path = None
                 if account_data and account_data.get("type") == "microsoft":
                     self.set_launch_progress(75, "⏳ Обновляю токен Microsoft...")
                     refreshed = refresh_microsoft_account(account_data)
@@ -4791,11 +5128,26 @@ class LauncherApp(ctk.CTk):
                     command.extend(["--uuid", login_data["id"] if refreshed else login_data["uuid"]])
                     command.extend(["--accessToken", login_data["access_token"]])
                     command.extend(["--userType", "msa"])
+                elif account_data and account_data.get("type") == "elyby":
+                    self.set_launch_progress(75, "⏳ Обновляю токен Ely.by...")
+                    refreshed = refresh_elyby_account(account_data)
+                    login_data = refreshed if refreshed else account_data
+                    command.extend(["--username", login_data["name"] if refreshed else login_data["username"]])
+                    command.extend(["--uuid", login_data["id"] if refreshed else login_data["uuid"]])
+                    command.extend(["--accessToken", login_data["access_token"]])
+                    command.extend(["--userType", "mojang"])
+                    self.set_launch_progress(78, "⏳ Подключаю authlib-injector (Ely.by)...")
+                    injector_path = ensure_authlib_injector()
+                    if not injector_path:
+                        self.log("⚠️ Не удалось скачать authlib-injector — скин Ely.by в игре не покажется")
                 else:
                     command.extend(["--username", username])
                     command.extend(["--uuid", "00000000-0000-0000-0000-000000000000"])
                     command.extend(["--accessToken", "0"])
                     command.extend(["--userType", "mojang"])
+
+                if injector_path:
+                    command.insert(0, f"-javaagent:{injector_path}=ely.by")
 
                 if java_path != "java":
                     command.insert(0, java_path)
@@ -5438,6 +5790,7 @@ class LauncherApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     try:
         app = LauncherApp()
         app.mainloop()
@@ -5446,7 +5799,7 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-
+#refresh_accounts
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(f"Ошибка: {e}\n")
             f.write(traceback.format_exc())
