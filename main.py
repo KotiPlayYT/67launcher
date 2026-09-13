@@ -237,13 +237,72 @@ def play_error():
     threading.Thread(target=lambda: play_sound("error"), daemon=True).start()
 
 
+GOLDEN_THEME_ACTIVE = {"value": False}
+_GOLDEN_BUTTON_REGISTRY = []
+
+GOLDEN_FG_COLOR = "#FFD700"
+GOLDEN_HOVER_COLOR = "#C9A400"
+GOLDEN_TEXT_COLOR = "#16141f"
+
+
+def _register_golden_button(button):
+    try:
+        original = {
+            "fg_color": button.cget("fg_color"),
+            "hover_color": button.cget("hover_color"),
+            "text_color": button.cget("text_color"),
+        }
+    except Exception:
+        original = None
+    _GOLDEN_BUTTON_REGISTRY.append((button, original))
+    if GOLDEN_THEME_ACTIVE["value"] and original is not None:
+        _apply_golden_to_button(button)
+
+
+def _apply_golden_to_button(button):
+    try:
+        button.configure(fg_color=GOLDEN_FG_COLOR, hover_color=GOLDEN_HOVER_COLOR,
+                          text_color=GOLDEN_TEXT_COLOR)
+    except Exception:
+        pass
+
+
+def _restore_button_color(button, original):
+    if original is None:
+        return
+    try:
+        button.configure(**original)
+    except Exception:
+        pass
+
+
+def set_golden_button_theme(active):
+    """Включает/выключает золотую тему для ВСЕХ кнопок приложения разом."""
+    GOLDEN_THEME_ACTIVE["value"] = active
+    alive_registry = []
+    for button, original in _GOLDEN_BUTTON_REGISTRY:
+        try:
+            if not button.winfo_exists():
+                continue
+        except Exception:
+            continue
+        alive_registry.append((button, original))
+        if active:
+            _apply_golden_to_button(button)
+        else:
+            _restore_button_color(button, original)
+    _GOLDEN_BUTTON_REGISTRY[:] = alive_registry
+
+
 def make_sound_button(master, text, command, **kwargs):
     def wrapped_command():
         play_click()
         if command:
             command()
 
-    return ctk.CTkButton(master, text=text, command=wrapped_command, **kwargs)
+    btn = ctk.CTkButton(master, text=text, command=wrapped_command, **kwargs)
+    _register_golden_button(btn)
+    return btn
 
 
 def generate_room_code(length=6):
@@ -346,128 +405,128 @@ if sys.platform == "win32":
         pass
 
 _THEME_67LAUNCHER = {
-    "CTk": {"fg_color": ["#16141f", "#16141f"]},
-    "CTkToplevel": {"fg_color": ["#16141f", "#16141f"]},
+    "CTk": {"fg_color": ["#f3f2f9", "#16141f"]},
+    "CTkToplevel": {"fg_color": ["#f3f2f9", "#16141f"]},
     "CTkFrame": {
         "corner_radius": 6, "border_width": 0,
-        "fg_color": ["#1a1826", "#1a1826"],
-        "top_fg_color": ["#1c1a29", "#1c1a29"],
-        "border_color": ["#26243a", "#26243a"]
+        "fg_color": ["#ffffff", "#1a1826"],
+        "top_fg_color": ["#f6f5fb", "#1c1a29"],
+        "border_color": ["#ddd9ec", "#26243a"]
     },
     "CTkButton": {
         "corner_radius": 5, "border_width": 0,
         "fg_color": ["#3d6bf0", "#3d6bf0"],
         "hover_color": ["#3157c4", "#3157c4"],
-        "border_color": ["#302c46", "#302c46"],
+        "border_color": ["#c7c2df", "#302c46"],
         "text_color": ["#ffffff", "#ffffff"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkLabel": {
         "corner_radius": 0, "fg_color": "transparent",
-        "text_color": ["#e5e2f0", "#e5e2f0"]
+        "text_color": ["#221f30", "#e5e2f0"]
     },
     "CTkEntry": {
         "corner_radius": 5, "border_width": 1,
-        "fg_color": ["#201d30", "#201d30"],
-        "border_color": ["#302c46", "#302c46"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "placeholder_text_color": ["#7a7791", "#7a7791"]
+        "fg_color": ["#ffffff", "#201d30"],
+        "border_color": ["#c9c4de", "#302c46"],
+        "text_color": ["#221f30", "#e5e2f0"],
+        "placeholder_text_color": ["#8f89a8", "#7a7791"]
     },
     "CTkCheckBox": {
         "corner_radius": 4, "border_width": 2,
         "fg_color": ["#3d6bf0", "#3d6bf0"],
-        "border_color": ["#4a4664", "#4a4664"],
+        "border_color": ["#b6b0cf", "#4a4664"],
         "hover_color": ["#3157c4", "#3157c4"],
         "checkmark_color": ["#ffffff", "#ffffff"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "text_color": ["#221f30", "#e5e2f0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkSwitch": {
         "corner_radius": 1000, "border_width": 3, "button_length": 0,
-        "fg_color": ["#302c46", "#302c46"],
+        "fg_color": ["#dedaee", "#302c46"],
         "progress_color": ["#3d6bf0", "#3d6bf0"],
-        "button_color": ["#e5e2f0", "#e5e2f0"],
-        "button_hover_color": ["#ffffff", "#ffffff"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "button_color": ["#ffffff", "#e5e2f0"],
+        "button_hover_color": ["#f3f2f9", "#ffffff"],
+        "text_color": ["#221f30", "#e5e2f0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkRadioButton": {
         "corner_radius": 1000, "border_width_checked": 4, "border_width_unchecked": 2,
-        "fg_color": ["#6d92ff", "#6d92ff"],
-        "border_color": ["#4a4664", "#4a4664"],
-        "hover_color": ["#5a7dd8", "#5a7dd8"],
-        "text_color": ["#cfcbe0", "#cfcbe0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "fg_color": ["#3d6bf0", "#6d92ff"],
+        "border_color": ["#b6b0cf", "#4a4664"],
+        "hover_color": ["#3157c4", "#5a7dd8"],
+        "text_color": ["#3c3852", "#cfcbe0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkProgressBar": {
         "corner_radius": 3, "border_width": 0,
-        "fg_color": ["#2b2840", "#2b2840"],
-        "progress_color": ["#6d92ff", "#6d92ff"],
-        "border_color": ["#26243a", "#26243a"]
+        "fg_color": ["#e4e1f2", "#2b2840"],
+        "progress_color": ["#3d6bf0", "#6d92ff"],
+        "border_color": ["#ddd9ec", "#26243a"]
     },
     "CTkSlider": {
         "corner_radius": 1000, "button_corner_radius": 1000, "border_width": 6,
-        "fg_color": ["#2b2840", "#2b2840"],
-        "progress_color": ["#302c46", "#302c46"],
+        "fg_color": ["#e4e1f2", "#2b2840"],
+        "progress_color": ["#cfc9e8", "#302c46"],
         "button_color": ["#3d6bf0", "#3d6bf0"],
         "button_hover_color": ["#3157c4", "#3157c4"]
     },
     "CTkOptionMenu": {
         "corner_radius": 5,
-        "fg_color": ["#201d30", "#201d30"],
-        "button_color": ["#302c46", "#302c46"],
+        "fg_color": ["#ffffff", "#201d30"],
+        "button_color": ["#e4e1f2", "#302c46"],
         "button_hover_color": ["#3d6bf0", "#3d6bf0"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "text_color": ["#221f30", "#e5e2f0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkComboBox": {
         "corner_radius": 5, "border_width": 1,
-        "fg_color": ["#201d30", "#201d30"],
-        "border_color": ["#302c46", "#302c46"],
-        "button_color": ["#302c46", "#302c46"],
+        "fg_color": ["#ffffff", "#201d30"],
+        "border_color": ["#c9c4de", "#302c46"],
+        "button_color": ["#e4e1f2", "#302c46"],
         "button_hover_color": ["#3d6bf0", "#3d6bf0"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "text_color": ["#221f30", "#e5e2f0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkScrollbar": {
         "corner_radius": 1000, "border_spacing": 4, "fg_color": "transparent",
-        "button_color": ["#302c46", "#302c46"],
+        "button_color": ["#d3cee6", "#302c46"],
         "button_hover_color": ["#3d6bf0", "#3d6bf0"]
     },
     "CTkSegmentedButton": {
         "corner_radius": 5, "border_width": 2,
-        "fg_color": ["#201d30", "#201d30"],
+        "fg_color": ["#ffffff", "#201d30"],
         "selected_color": ["#3d6bf0", "#3d6bf0"],
         "selected_hover_color": ["#3157c4", "#3157c4"],
-        "unselected_color": ["#201d30", "#201d30"],
-        "unselected_hover_color": ["#2b2840", "#2b2840"],
-        "text_color": ["#e5e2f0", "#e5e2f0"],
-        "text_color_disabled": ["#7a7791", "#7a7791"]
+        "unselected_color": ["#ffffff", "#201d30"],
+        "unselected_hover_color": ["#eeecf8", "#2b2840"],
+        "text_color": ["#221f30", "#e5e2f0"],
+        "text_color_disabled": ["#a29cc0", "#7a7791"]
     },
     "CTkTextbox": {
         "corner_radius": 5, "border_width": 0,
-        "fg_color": ["#100e1a", "#100e1a"],
-        "border_color": ["#26243a", "#26243a"],
-        "text_color": ["#8f8ba6", "#8f8ba6"],
-        "scrollbar_button_color": ["#302c46", "#302c46"],
+        "fg_color": ["#ffffff", "#100e1a"],
+        "border_color": ["#ddd9ec", "#26243a"],
+        "text_color": ["#4b4763", "#8f8ba6"],
+        "scrollbar_button_color": ["#d3cee6", "#302c46"],
         "scrollbar_button_hover_color": ["#3d6bf0", "#3d6bf0"]
     },
-    "CTkScrollableFrame": {"label_fg_color": ["#1a1826", "#1a1826"]},
+    "CTkScrollableFrame": {"label_fg_color": ["#ffffff", "#1a1826"]},
     "CTkTabview": {
         "corner_radius": 6, "border_width": 0,
-        "fg_color": ["#1a1826", "#1a1826"],
-        "segmented_button_fg_color": ["#1a1826", "#1a1826"],
-        "segmented_button_selected_color": ["#1c1a29", "#1c1a29"],
-        "segmented_button_selected_hover_color": ["#1c1a29", "#1c1a29"],
-        "segmented_button_unselected_color": ["#1a1826", "#1a1826"],
-        "segmented_button_unselected_hover_color": ["#201d30", "#201d30"],
-        "text_color": ["#a8a4bd", "#a8a4bd"],
-        "text_color_disabled": ["#4a4664", "#4a4664"]
+        "fg_color": ["#ffffff", "#1a1826"],
+        "segmented_button_fg_color": ["#eeecf8", "#1a1826"],
+        "segmented_button_selected_color": ["#ffffff", "#1c1a29"],
+        "segmented_button_selected_hover_color": ["#ffffff", "#1c1a29"],
+        "segmented_button_unselected_color": ["#eeecf8", "#1a1826"],
+        "segmented_button_unselected_hover_color": ["#e2dff2", "#201d30"],
+        "text_color": ["#4b4763", "#a8a4bd"],
+        "text_color_disabled": ["#c2bdd6", "#4a4664"]
     },
     "DropdownMenu": {
-        "fg_color": ["#201d30", "#201d30"],
-        "hover_color": ["#2b2840", "#2b2840"],
-        "text_color": ["#e5e2f0", "#e5e2f0"]
+        "fg_color": ["#ffffff", "#201d30"],
+        "hover_color": ["#eeecf8", "#2b2840"],
+        "text_color": ["#221f30", "#e5e2f0"]
     },
     "CTkFont": {
         "macOS": {"family": "SF Display", "size": -13, "weight": "normal"},
@@ -540,7 +599,6 @@ def fix_game_path():
                     json.dump(settings, f, indent=2, ensure_ascii=False)
         except:
             pass
-#Пер
 
 fix_game_path()
 
@@ -557,7 +615,9 @@ def log_message(message):
     if log_callback:
         log_callback(message)
 
-#pin
+DEFAULT_MS_CLIENT_ID = "6ca935f1-4e54-484c-bbe2-482a8dcf9b33"
+
+
 def load_launcher_settings():
     default_settings = {
         "game_dir": DEFAULT_GAME_DIR,
@@ -571,10 +631,11 @@ def load_launcher_settings():
         "hygiene_reminders": True,
         "support_shown_5": False,
         "theme": "dark",
+        "golden_theme_enabled": True,
         "secret_clicks": 0,
         "show_game_logs": False,
         "chat_window_size": "800x850",
-        "ms_client_id": "",
+        "ms_client_id": DEFAULT_MS_CLIENT_ID,
         "ms_redirect_uri": "https://login.microsoftonline.com/common/oauth2/nativeclient"
     }
     if os.path.exists(SETTINGS_FILE):
@@ -776,7 +837,7 @@ def add_microsoft_account(login_data):
 
 
 def refresh_microsoft_account(account):
-    client_id = load_launcher_settings().get("ms_client_id", "").strip()
+    client_id = load_launcher_settings().get("ms_client_id", "").strip() or DEFAULT_MS_CLIENT_ID
     redirect_uri = load_launcher_settings().get("ms_redirect_uri",
                                                 "https://login.microsoftonline.com/common/oauth2/nativeclient").strip()
     if not client_id or not account.get("refresh_token"):
@@ -1607,7 +1668,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                                             state="disabled")
         self.launch_btn.grid(row=0, column=1, padx=5)
 
-        update_btn = ctk.CTkButton(main_frame, text="🔄 Обновить статус",
+        update_btn = make_sound_button(main_frame, text="🔄 Обновить статус",
                                    command=self.check_installation,
                                    width=200, height=35,
                                    fg_color="#d9622f", hover_color="#c14f26",
@@ -1750,7 +1811,6 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         play_click()
         messagebox.showinfo("Успешно!",
                             "🎮 Geometry Dash успешно установлен!\n\n📁 Папка: " + self.gd_path + "\n🚀 Нажмите 'Запустить GD' для игры!")
-
     def install_error(self, error):
         self.progressbar.set(0.3)
         self.progressbar.configure(progress_color="#d3453f")
@@ -1869,7 +1929,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.title(f"💬 Чат 67Launcher ({self.unread_count} новых)")
         else:
             self.title("💬 Чат 67Launcher")
-#display_message
     def show_notification(self, message, sender=""):
         if threading.current_thread() is not threading.main_thread():
             try:
@@ -1917,15 +1976,12 @@ class ChatWindow(ctk.CTkToplevel):
             header_frame = tk.Frame(frame, bg="#100e1a")
             header_frame.pack(fill="x", padx=15, pady=(10, 5))
 
-            # --- ХАК ДЛЯ ОПРЕДЕЛЕНИЯ ЦВЕТА НИКА В УВЕДОМЛЕНИИ ---
-            title_color = "#6d92ff"  # Стандартный синий дефолтный цвет
+            title_color = "#6d92ff"
             if sender:
                 try:
-                    # Подгружаем базу аккаунтов
                     from __main__ import load_accounts
                     accounts = load_accounts()
                     for acc in accounts:
-                        # Если отправитель совпадает с ником лицензии, меняем цвет на золотой
                         if acc["username"] == sender and acc.get("type") == "microsoft":
                             title_color = "#FFD700"
                             break
@@ -1941,7 +1997,6 @@ class ChatWindow(ctk.CTkToplevel):
 
             title_text = f"💬 {sender}" if sender else "💬 Новое сообщение"
 
-            # Применяем вычисленный цвет title_color к метке заголовка
             tk.Label(header_frame, text=title_text, font=("Segoe UI", 12, "bold"),
                      bg="#100e1a", fg=title_color).pack(side="left")
 
@@ -2021,7 +2076,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.chat_display.insert("1.0", "💬 Чат готов к работе...\n")
         self.chat_display.insert("end", "━" * 50 + "\n")
         self.chat_display.configure(state="disabled")
-        self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")  # Золотой цвет для ников
+        self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")
 
         info_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         info_frame.pack(fill="x", pady=(0, 10))
@@ -2174,11 +2229,8 @@ class ChatWindow(ctk.CTkToplevel):
             self.chat_display.configure(state="normal")
             timestamp = datetime.now().strftime("%H:%M:%S")
 
-            # Базовая позиция для вставки новой строки
             start_index = self.chat_display.index("end-1c")
 
-            # Проверяем, содержит ли строка сообщение от пользователя (например, "VlipilOs: текст")
-            # или системное уведомление об отправке/получении ("💬 VlipilOs: текст", "📤 VlipilOs: текст")
             clean_message = message.lstrip("💬 📤 📨 🔔 ")
 
             is_licensed_msg = False
@@ -2186,7 +2238,6 @@ class ChatWindow(ctk.CTkToplevel):
 
             if ": " in clean_message:
                 possible_nick = clean_message.split(": ", 1)[0]
-                # Импортируем функцию загрузки аккаунтов для проверки типа
                 try:
                     from __main__ import load_accounts
                     accounts = load_accounts()
@@ -2196,7 +2247,6 @@ class ChatWindow(ctk.CTkToplevel):
                             target_nick = possible_nick
                             break
                 except:
-                    # Если импорт напрямую не сработал, проверяем через глобальную область
                     try:
                         accounts = load_accounts()
                         for acc in accounts:
@@ -2207,13 +2257,10 @@ class ChatWindow(ctk.CTkToplevel):
                     except:
                         pass
 
-            # Вставляем стандартный текст с временной меткой
             full_text = f"[{timestamp}] {message}\n"
             self.chat_display.insert("end", full_text)
 
-            # Если это сообщение от лицензионного аккаунта, точечно перекрашиваем его ник
             if is_licensed_msg and target_nick:
-                # Ищем точное положение ника в только что вставленной строке чата
                 current_line = start_index.split('.')[0]
                 line_content = self.chat_display.get(f"{current_line}.0", f"{current_line}.end")
                 nick_start_offset = line_content.find(target_nick)
@@ -2332,7 +2379,6 @@ class ChatWindow(ctk.CTkToplevel):
                 else:
                     sender, text = "", message
 
-                # Показываем уведомление (это сработает только у принимающего игрока!)
                 self.show_notification(text, sender)
             else:
                 self.log(f"🔔 {message}")
@@ -2359,8 +2405,6 @@ class ChatWindow(ctk.CTkToplevel):
                     self.update_msg_count()
                     self.log(f"📤 {message}")
 
-                    # ХАК: Строка self.show_notification(text, sender) УДАЛЕНА ОТСЮДА,
-                    # чтобы у отправляющего игрока не всплывало собственное окно.
         except Exception as e:
             self.log(f"❌ Ошибка отправки: {e}")
             self.disconnect()
@@ -2464,7 +2508,7 @@ class EmojiPicker(ctk.CTkToplevel):
         row = 0
         col = 0
         for emoji in emojis:
-            btn = ctk.CTkButton(scroll_frame, text=emoji, width=50, height=50,
+            btn = make_sound_button(scroll_frame, text=emoji, width=50, height=50,
                                 font=ctk.CTkFont(size=20),
                                 fg_color="transparent", hover_color="#201d30",
                                 command=lambda e=emoji: self.select_emoji(e))
@@ -2568,8 +2612,19 @@ class LauncherApp(ctk.CTk):
         LAUNCHER_PROFILES_FILE = os.path.join(MINECRAFT_DIR, "launcher_profiles.json")
 
         self.title("67Launcher - МЯУ")
-        self.geometry("1200x950")
+
+        window_width = 1200
+        window_height = 950
         self.minsize(1000, 800)
+
+        self.update_idletasks()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        x = (screen_width // 2) - (window_width // 2)
+        y = (screen_height // 2) - (window_height // 2)
+
+        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
         set_log_callback(self.log)
@@ -2614,7 +2669,6 @@ class LauncherApp(ctk.CTk):
         if not selected_username:
             selected_username = self.account_combo.get()
 
-        # Ищем тип выбранного аккаунта
         accounts = load_accounts()
         account_type = "offline"
         for acc in accounts:
@@ -2622,17 +2676,46 @@ class LauncherApp(ctk.CTk):
                 account_type = acc.get("type", "offline")
                 break
 
-        # Если это microsoft, красим текст в золотой, иначе возвращаем дефолтный белый/светлый
         if account_type == "microsoft":
             self.account_combo.configure(text_color="#FFD700")
         else:
-            self.account_combo.configure(text_color=["#e5e2f0", "#e5e2f0"])
+            self.account_combo.configure(text_color=["#221f30", "#e5e2f0"])
+
+        golden_enabled = self.settings.get("golden_theme_enabled", True)
+        set_golden_button_theme(account_type == "microsoft" and golden_enabled)
 
     def apply_theme(self):
         theme = self.settings.get("theme", "dark")
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
 
+    def toggle_theme(self):
+        is_dark = self.theme_switch.get() == 1
+        theme = "dark" if is_dark else "light"
+        self.settings["theme"] = theme
+        save_launcher_settings(self.settings)
+        ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
+        self.apply_widget_theme()
+        self.refresh_accounts()
+        play_click()
+        self.log(f"🎨 Тема оформления: {'тёмная' if theme == 'dark' else 'светлая'} (сохранено)")
+
+    def toggle_golden_theme_setting(self):
+        enabled = self.golden_theme_switch.get() == 1
+        self.settings["golden_theme_enabled"] = enabled
+        save_launcher_settings(self.settings)
+        play_click()
+        self.update_combo_text_color()
+        self.log(f"🔶 Золотая тема лицензионных аккаунтов: {'включена' if enabled else 'выключена'} (сохранено)")
+
     def get_theme_colors(self):
+        if self.settings.get("theme", "dark") == "light":
+            return {
+                "listbox_bg": "#ffffff",
+                "listbox_fg": "#221f30",
+                "listbox_select": "#6d92ff",
+                "card_bg": "#f6f5fb",
+                "card_bg_selected": "#e2dff2",
+            }
         return {
             "listbox_bg": "#100e1a",
             "listbox_fg": "#e5e2f0",
@@ -2665,6 +2748,17 @@ class LauncherApp(ctk.CTk):
         for i, card in enumerate(getattr(self, 'mod_cards', [])):
             try:
                 is_selected = (i == self.selected_mod_index)
+                card.configure(fg_color=colors["card_bg_selected"] if is_selected else colors["card_bg"])
+            except:
+                pass
+        try:
+            if hasattr(self, 'rp_desc_card'):
+                self.rp_desc_card.configure(fg_color=colors["card_bg"])
+        except:
+            pass
+        for i, card in enumerate(getattr(self, 'rp_cards', [])):
+            try:
+                is_selected = (i == getattr(self, 'selected_rp_index', -1))
                 card.configure(fg_color=colors["card_bg_selected"] if is_selected else colors["card_bg"])
             except:
                 pass
@@ -2754,7 +2848,6 @@ class LauncherApp(ctk.CTk):
         self.title(f"67Launcher - МЯУ | Запусков: {launches} | Время: {self.format_time(play_time)}")
 
     def restore_last_selection(self):
-        self.update_combo_text_color()
         last_account = self.settings.get("last_account", "")
         last_version = self.settings.get("last_version", "")
         if last_account:
@@ -2767,6 +2860,7 @@ class LauncherApp(ctk.CTk):
                 self.version_combo.set(last_version)
             except:
                 pass
+        self.update_combo_text_color()
 
     def save_current_selection(self):
         self.settings["last_account"] = self.account_combo.get()
@@ -2923,7 +3017,7 @@ class LauncherApp(ctk.CTk):
         self.log(f"🎮 Логи игры: {'включены' if enabled else 'выключены'}")
 
     def save_ms_settings(self):
-        self.settings["ms_client_id"] = self.ms_client_id_entry.get().strip()
+        self.settings["ms_client_id"] = self.ms_client_id_entry.get().strip() or DEFAULT_MS_CLIENT_ID
         self.settings["ms_redirect_uri"] = self.ms_redirect_entry.get().strip()
         save_launcher_settings(self.settings)
         play_click()
@@ -3115,28 +3209,24 @@ class LauncherApp(ctk.CTk):
         if usernames and usernames[0] != "Нет аккаунтов":
             self.account_combo.set(usernames[0])
 
-        # --- ХАК ДЛЯ ПЕРЕКРАСКИ ВНУТРИ ВЫПАДАЮЩЕГО СПИСКА ---
         try:
-            # Получаем доступ к скрытому стандартному меню tkinter внутри CTkComboBox
             dropdown_menu = self.account_combo._dropdown_menu
             if dropdown_menu and usernames != ["Нет аккаунтов"]:
                 for index, username in enumerate(usernames):
-                    # Ищем, является ли этот конкретный ник лицензионным
                     is_microsoft = False
                     for acc in accounts:
                         if acc["username"] == username and acc.get("type") == "microsoft":
                             is_microsoft = True
                             break
 
-                    # Если нашли, принудительно красим текст строки в меню в золотой цвет
                     if is_microsoft:
                         dropdown_menu.entryconfigure(index, foreground="#FFD700")
                     else:
-                        dropdown_menu.entryconfigure(index, foreground=["#e5e2f0", "#e5e2f0"])
+                        default_fg = "#221f30" if self.settings.get("theme", "dark") == "light" else "#e5e2f0"
+                        dropdown_menu.entryconfigure(index, foreground=default_fg)
         except Exception as e:
             print(f"Не удалось перекрасить пункты выпадающего меню: {e}")
 
-        # Не забываем обновить цвет главного выбранного текста
         if hasattr(self, 'update_combo_text_color'):
             self.update_combo_text_color()
 
@@ -3178,11 +3268,9 @@ class LauncherApp(ctk.CTk):
 
             if acc_type == "microsoft":
                 icon, label = "🔷", "лицензионный"
-                # Запоминаем текущую позицию перед вставкой текста
                 start_pos = self.accounts_listbox.index("end-1c")
                 self.accounts_listbox.insert("end", f"{icon} {acc['username']}  ({label}, создан: {created})\n")
                 end_pos = self.accounts_listbox.index("end-1c")
-                # Красим эту строку в золотой цвет
                 self.accounts_listbox.tag_add("gold_account", start_pos, end_pos)
             else:
                 if acc_type == "elyby":
@@ -3229,18 +3317,7 @@ class LauncherApp(ctk.CTk):
                           fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f").pack(pady=10)
 
     def add_microsoft_account_dialog(self):
-        client_id = self.settings.get("ms_client_id", "").strip()
-        if not client_id:
-            play_error()
-            messagebox.showwarning(
-                "Нужен Client ID",
-                "Для входа через настоящий Microsoft-аккаунт нужен свой Client ID "
-                "зарегистрированного Azure-приложения — впиши его во вкладке "
-                "'⚙️ Настройки' (поле 'Microsoft Client ID').\n\n"
-                "Зарегистрировать приложение можно на portal.azure.com — это "
-                "бесплатно, но требует своего аккаунта разработчика."
-            )
-            return
+        client_id = self.settings.get("ms_client_id", "").strip() or DEFAULT_MS_CLIENT_ID
 
         redirect_uri = self.settings.get(
             "ms_redirect_uri", "https://login.microsoftonline.com/common/oauth2/nativeclient"
@@ -3314,7 +3391,7 @@ class LauncherApp(ctk.CTk):
 
         def run_embedded_login():
             try:
-                import webview  # noqa: F401 - только для быстрой проверки, что пакет установлен
+                import webview
             except ImportError:
                 play_error()
                 messagebox.showerror(
@@ -3373,7 +3450,6 @@ class LauncherApp(ctk.CTk):
                 if proc.is_alive():
                     self.after(200, poll_result)
                 else:
-                    # процесс закрылся, но ничего не положил в очередь
                     play_error()
                     set_status("Окно входа закрыто без логина", "#d3453f")
 
@@ -3864,6 +3940,11 @@ class LauncherApp(ctk.CTk):
             command=self.update_combo_text_color
         )
         self.account_combo.grid(row=2, column=0, sticky="w", pady=(0, 15))
+        try:
+            self.account_combo._entry.bind("<KeyRelease>", lambda e: self.update_combo_text_color())
+            self.account_combo._entry.bind("<FocusOut>", lambda e: self.update_combo_text_color())
+        except Exception:
+            pass
 
         ctk.CTkLabel(main_frame, text="📦 Версия:", font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="w")
         self.version_combo = ctk.CTkComboBox(main_frame, values=["Нет версий"], width=300, height=35)
@@ -3910,7 +3991,6 @@ class LauncherApp(ctk.CTk):
         for text, value in types:
             ctk.CTkRadioButton(type_frame, text=text, variable=self.install_type_var, value=value).pack(side="left",
                                                                                                         padx=10)
-
         version_header = ctk.CTkFrame(main_frame, fg_color="transparent")
         version_header.grid(row=3, column=0, sticky="ew", pady=(0, 4))
         version_header.grid_columnconfigure(0, weight=1)
@@ -3929,7 +4009,7 @@ class LauncherApp(ctk.CTk):
         self.version_search_entry = ctk.CTkEntry(search_row, placeholder_text="Фильтр версий (например: 1.20)",
                                                  height=35)
         self.version_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.version_search_entry.bind("<KeyRelease>", lambda e: self.filter_install_versions())
+        self.version_search_entry.bind("<KeyRelease>", lambda e: self.filter_install_versions(e))
         refresh_versions_btn = make_sound_button(search_row, text="🔄", command=self.refresh_available_versions,
                                                  width=40, height=35, fg_color="#6d92ff", hover_color="#5a7dd8")
         refresh_versions_btn.grid(row=0, column=1)
@@ -3981,7 +4061,15 @@ class LauncherApp(ctk.CTk):
         self.show_install_versions_placeholder()
         threading.Thread(target=self.load_available_versions, daemon=True).start()
 
-    def filter_install_versions(self):
+    def filter_install_versions(self, event=None):
+        query = self.version_search_entry.get().strip().lower()
+
+        if query == "gd2026":
+            if event and event.keysym == "Return":
+                self.version_search_entry.delete(0, "end")
+                self.open_secret_launcher()
+                return
+
         for widget in self.version_results_frame.winfo_children():
             widget.destroy()
         self.version_result_widgets = []
@@ -3991,7 +4079,6 @@ class LauncherApp(ctk.CTk):
             self.show_install_versions_placeholder()
             return
 
-        query = self.version_search_entry.get().strip().lower()
         show_snapshots = self.show_snapshots_var.get()
 
         matches = []
@@ -4003,7 +4090,7 @@ class LauncherApp(ctk.CTk):
             matches.append(v)
 
         if not matches:
-            ctk.CTkLabel(self.version_results_frame, text="Ничего не нашлось",
+            ctk.CTkLabel(self.version_results_frame, text="Ничего не найдено",
                          font=ctk.CTkFont(size=12), text_color="#a8a4bd").pack(pady=15)
             return
 
@@ -4078,7 +4165,7 @@ class LauncherApp(ctk.CTk):
         self.accounts_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.register_themed_widget(self.accounts_listbox)
         self.accounts_listbox.tag_configure("selected_account", background="#3d3a52", foreground="#ffffff")
-        self.accounts_listbox.tag_configure("gold_account", foreground="#FFD700")  # Золотой цвет текста
+        self.accounts_listbox.tag_configure("gold_account", foreground="#FFD700")
         self.accounts_listbox.bind("<Button-1>", self.on_account_listbox_click)
         self._accounts_order = []
         self._selected_account_username = None
@@ -4647,7 +4734,7 @@ class LauncherApp(ctk.CTk):
         tab = self.tab_view.tab("⚙️ Настройки")
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
-        main_frame = ctk.CTkFrame(tab)
+        main_frame = ctk.CTkScrollableFrame(tab)
         main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
         main_frame.grid_columnconfigure(0, weight=1)
 
@@ -4671,18 +4758,44 @@ class LauncherApp(ctk.CTk):
             self.game_logs_switch.deselect()
         self.game_logs_switch.pack(side="left")
 
-        ctk.CTkLabel(main_frame, text="🔷 Вход через Microsoft", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(main_frame, text="🎨 Тема оформления", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=3, column=0, sticky="w", pady=(0, 5))
+        theme_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        theme_frame.grid(row=4, column=0, sticky="w", pady=(0, 15))
+        self.theme_switch = ctk.CTkSwitch(theme_frame,
+                                          text="Тёмная тема (выключи для светлой)",
+                                          command=self.toggle_theme, font=ctk.CTkFont(size=13))
+        if self.settings.get("theme", "dark") == "dark":
+            self.theme_switch.select()
+        else:
+            self.theme_switch.deselect()
+        self.theme_switch.pack(side="left")
+
+        ctk.CTkLabel(main_frame, text="🔶 Золотая тема аккаунта", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=5, column=0, sticky="w", pady=(0, 5))
+        golden_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        golden_frame.grid(row=6, column=0, sticky="w", pady=(0, 15))
+        self.golden_theme_switch = ctk.CTkSwitch(golden_frame,
+                                                  text="Красить все кнопки в золотой при выборе лицензионного аккаунта",
+                                                  command=self.toggle_golden_theme_setting,
+                                                  font=ctk.CTkFont(size=13))
+        if self.settings.get("golden_theme_enabled", True):
+            self.golden_theme_switch.select()
+        else:
+            self.golden_theme_switch.deselect()
+        self.golden_theme_switch.pack(side="left")
+
+        ctk.CTkLabel(main_frame, text="🔷 Вход через Microsoft", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=7, column=0, sticky="w", pady=(0, 5))
         ms_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        ms_frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
+        ms_frame.grid(row=8, column=0, sticky="ew", pady=(0, 15))
         ms_frame.grid_columnconfigure(0, weight=1)
-#self.accounts_listbox.grid
         ctk.CTkLabel(ms_frame, text="Client ID своего Azure-приложения (portal.azure.com):",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=0, column=0, sticky="w")
         self.ms_client_id_entry = ctk.CTkEntry(ms_frame, placeholder_text="6ca935f1-4e54-484c-bbe2-482a8dcf9b33",
                                                height=32)
         self.ms_client_id_entry.grid(row=1, column=0, sticky="ew", pady=(2, 6))
-        self.ms_client_id_entry.insert(0, self.settings.get("ms_client_id", ""))
+        self.ms_client_id_entry.insert(0, self.settings.get("ms_client_id", "").strip() or DEFAULT_MS_CLIENT_ID)
 
         ctk.CTkLabel(ms_frame, text="Redirect URI (должен совпадать с тем, что указан в Azure):",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=2, column=0, sticky="w")
@@ -4695,12 +4808,12 @@ class LauncherApp(ctk.CTk):
                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
         save_ms_btn.grid(row=4, column=0, sticky="w")
 
-        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=5,
+        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=9,
                                                                                                           column=0,
                                                                                                           sticky="w",
                                                                                                           pady=(15, 10))
         links_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        links_frame.grid(row=6, column=0, sticky="w", pady=(0, 15))
+        links_frame.grid(row=10, column=0, sticky="w", pady=(0, 15))
 
         github_btn = make_sound_button(links_frame, text="⭐ GitHub",
                                        command=lambda: webbrowser.open("https://github.com/KotiPlayYT/67launcher/"),
@@ -5690,21 +5803,9 @@ class LauncherApp(ctk.CTk):
             messagebox.showerror("Ошибка", "IP не скопировался")
 
     def on_stats_refresh_click(self):
-        self.settings["secret_clicks"] = self.settings.get("secret_clicks", 0) + 1
-        save_launcher_settings(self.settings)
-        clicks = self.settings["secret_clicks"]
-
-        if clicks <= 5:
-            self.log(f"ыть {clicks}/5")
-            self.update_stats_display()
-            if clicks == 5:
-                self.log("🎮 Открываем секретный лаунчер!")
-                self.after(500, self.open_secret_launcher)
-        else:
-            self.settings["secret_clicks"] = 0
-            save_launcher_settings(self.settings)
-            self.update_stats_display()
-            self.log("🔄 Статистика обновлена")
+        play_click()
+        self.update_stats_display()
+        self.log("🔄 Статистика обновлена")
 
     def open_secret_launcher(self):
         try:
@@ -5719,10 +5820,12 @@ class LauncherApp(ctk.CTk):
 
             self._secret_launcher = SecretGeometryDashLauncher(self)
             self._secret_launcher.focus_force()
-            self.log("ты чё?")
+            self.log("🎮 Секретный лаунчер открыт!")
 
             def on_close():
-                self._secret_launcher = None
+                if self._secret_launcher:
+                    self._secret_launcher.destroy()
+                    self._secret_launcher = None
 
             self._secret_launcher.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -5799,7 +5902,6 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-#refresh_accounts
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(f"Ошибка: {e}\n")
             f.write(traceback.format_exc())
