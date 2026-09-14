@@ -32,7 +32,84 @@ import websocket as ws_client
 from urllib.parse import unquote
 import multiprocessing
 
-RELAY_URL = "wss://screen-relay-production.up.railway.app"
+RELAY_URL_DEFAULT = "wss://screen-relay-production.up.railway.app"
+RELAY_URL_API_SOURCE = "https://api.github.com/repos/KotiPlayYT/67launcher/contents/relay.active.txt?ref=main"
+RELAY_URL_RAW_SOURCE = "https://raw.githubusercontent.com/KotiPlayYT/67launcher/main/relay.active.txt"
+RELAY_URL = RELAY_URL_DEFAULT
+
+
+def _extract_relay_candidate(text):
+    text = (text or "").strip()
+    return text.splitlines()[0].strip() if text else ""
+
+
+def fetch_active_relay_url(timeout=5):
+    global RELAY_URL
+    candidate = ""
+    source_used = None
+
+    try:
+        response = requests.get(
+            RELAY_URL_API_SOURCE,
+            timeout=timeout,
+            headers={"User-Agent": "67Launcher", "Accept": "application/vnd.github.v3.raw"},
+        )
+        if response.status_code == 200:
+            candidate = _extract_relay_candidate(response.text)
+            source_used = "api"
+        else:
+            print(f"[relay] GitHub API вернул код {response.status_code}, пробую raw.githubusercontent.com")
+    except Exception as e:
+        print(f"[relay] GitHub API недоступен ({e}), пробую raw.githubusercontent.com")
+
+    if not candidate:
+        try:
+            cache_buster = f"?_={int(time.time())}"
+            response = requests.get(
+                RELAY_URL_RAW_SOURCE + cache_buster,
+                timeout=timeout,
+                headers={"User-Agent": "67Launcher", "Cache-Control": "no-cache", "Pragma": "no-cache"},
+            )
+            if response.status_code == 200:
+                candidate = _extract_relay_candidate(response.text)
+                source_used = "raw"
+            else:
+                print(f"[relay] raw.githubusercontent.com вернул код {response.status_code}")
+        except Exception as e:
+            print(f"[relay] raw.githubusercontent.com недоступен: {e}")
+
+    if candidate and (candidate.startswith("ws://") or candidate.startswith("wss://")):
+        changed = candidate != RELAY_URL
+        RELAY_URL = candidate
+        print(f"[relay] Релей ({source_used}): {RELAY_URL}")
+        return RELAY_URL, ("updated" if changed else "unchanged")
+    elif candidate:
+        print(f"[relay] relay.active.txt содержит не wss:// адрес ('{candidate}'), использую прежний: {RELAY_URL}")
+        return RELAY_URL, "invalid_content"
+    else:
+        print(f"[relay] Не удалось получить relay.active.txt ни через API, ни через raw, использую прежний: {RELAY_URL}")
+        return RELAY_URL, "network_error"
+
+
+def check_room_active(relay_url, room, timeout=5):
+    ws = ws_client.create_connection(relay_url, timeout=timeout)
+    try:
+        ws.settimeout(timeout)
+        ws.send(json.dumps({"action": "check_room", "room": room}))
+        raw = ws.recv()
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8')
+        data = json.loads(raw)
+        if data.get("type") != "room_status":
+            raise RuntimeError(
+                "релей не поддерживает проверку кода комнаты (нужно обновить relay.py на сервере)"
+            )
+        return bool(data.get("active")), int(data.get("count", 0)), int(data.get("max", 20))
+    finally:
+        try:
+            ws.close()
+        except:
+            pass
 
 
 def check_dependencies():
@@ -64,11 +141,6 @@ check_dependencies()
 
 
 def _ms_login_webview_process(login_url, redirect_uri, result_queue):
-    """
-    Запускается в ОТДЕЛЬНОМ процессе, потому что pywebview требует,
-    чтобы webview.start() вызывался в главном потоке процесса - а
-    главный поток основного лаунчера занят циклом Tkinter.
-    """
     try:
         import re as _re
         import webview
@@ -277,7 +349,6 @@ def _restore_button_color(button, original):
 
 
 def set_golden_button_theme(active):
-    """Включает/выключает золотую тему для ВСЕХ кнопок приложения разом."""
     GOLDEN_THEME_ACTIVE["value"] = active
     alive_registry = []
     for button, original in _GOLDEN_BUTTON_REGISTRY:
@@ -808,6 +879,13 @@ def save_accounts(accounts):
         return False
 
 
+def has_microsoft_account():
+    try:
+        return any(acc.get("type") == "microsoft" for acc in load_accounts())
+    except:
+        return False
+
+
 def create_offline_account(username):
     return {"type": "offline", "username": username, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -875,11 +953,6 @@ def format_uuid_with_dashes(raw_uuid):
 
 
 def elyby_authenticate(login, password):
-    """
-    Настоящая авторизация через официальный (документированный) Yggdrasil-совместимый
-    API Ely.by: https://docs.ely.by/ru/minecraft-auth.html
-    Возвращает (True, login_data) или (False, "текст ошибки").
-    """
     client_token = get_or_create_elyby_client_token()
     try:
         response = requests.post(
@@ -974,12 +1047,6 @@ def refresh_elyby_account(account):
 
 
 def ensure_authlib_injector():
-    """
-    Скачивает (один раз, потом кешируется) authlib-injector.jar - это официально
-    рекомендованный Ely.by способ показывать скины в НЕмодифицированной игре,
-    без CustomSkinLoader. Подробности: https://docs.ely.by/ru/authlib-injector.html
-    Возвращает путь до jar-файла или None при ошибке.
-    """
     injector_dir = os.path.join(MINECRAFT_DIR, "authlib-injector")
     injector_path = os.path.join(injector_dir, "authlib-injector.jar")
     if os.path.exists(injector_path) and os.path.getsize(injector_path) > 0:
@@ -1160,8 +1227,6 @@ def get_java_version(java_path="java"):
 
 
 def resolve_version_jar_path(version, minecraft_dir, _depth=0):
-    """Находит реальный .jar для версии, следуя за 'inheritsFrom' у модифицированных
-    версий (Forge/Fabric/Quilt не хранят свой jar, а используют ванильный)."""
     if _depth > 6:
         return None
     version_path = os.path.join(minecraft_dir, "versions", version)
@@ -1183,9 +1248,6 @@ def resolve_version_jar_path(version, minecraft_dir, _depth=0):
 
 
 def is_legacy_mc_version(version):
-    """Версии до 1.13 используют старый формат установщика Forge (без 'inheritsFrom'
-    и с патчингом классов в рантайме через FMLDeobfuscatingRemapper) — для них
-    официальный .jar-установщик надёжнее, чем встроенная в minecraft_launcher_lib логика."""
     try:
         parts = version.split('.')
         major = int(parts[0])
@@ -1196,7 +1258,6 @@ def is_legacy_mc_version(version):
 
 
 def get_forge_full_version(mc_version):
-    """Возвращает полный ID сборки Forge (например '1.12.2-14.23.5.2860') для версии Minecraft."""
     try:
         if hasattr(mll.forge, 'find_forge_version'):
             found = mll.forge.find_forge_version(mc_version)
@@ -1852,12 +1913,13 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
 
 
 class ChatWindow(ctk.CTkToplevel):
-    def __init__(self, master, mode="server", room=""):
+    def __init__(self, master, mode="server", room="", relay_url=None):
         super().__init__(master)
         self.master = master
         self.mode = mode
         self.role = "streamer" if mode == "server" else "viewer"
         self.room = room
+        self.relay_url = (relay_url or RELAY_URL).strip() or RELAY_URL
         self.running = True
         self.connected = False
         self.client_socket = None
@@ -1865,6 +1927,8 @@ class ChatWindow(ctk.CTkToplevel):
         self.message_history = []
         self.is_minimized = False
         self.unread_count = 0
+        self.participant_count = 1
+        self.max_room_size = 20
 
         self.title("💬 Чат 67Launcher")
 
@@ -1911,7 +1975,7 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("✅ Интернет соединение: Есть")
         except:
             self.log("❌ Интернет соединение: Нет")
-        self.log(f"🌐 Релей: {RELAY_URL}")
+        self.log(f"🌐 Релей: {self.relay_url}")
         self.log(f"🚪 Комната: {self.room}")
         self.log("━" * 50)
 
@@ -2097,7 +2161,7 @@ class ChatWindow(ctk.CTkToplevel):
         ip_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         ip_frame.pack(fill="x", pady=(5, 10))
 
-        room_text = f"🚪 Код комнаты: {self.room}   |   🌐 Релей: {RELAY_URL}"
+        room_text = f"🚪 Код комнаты: {self.room}   |   🌐 Релей: {self.relay_url}"
         ctk.CTkLabel(ip_frame, text=room_text,
                      font=ctk.CTkFont(size=12), text_color="#d9622f").pack(side="left")
         copy_btn = make_sound_button(ip_frame, text="📋 Копировать код",
@@ -2294,23 +2358,18 @@ class ChatWindow(ctk.CTkToplevel):
     def run_relay(self):
         role_text = "хостом (стример)" if self.role == "streamer" else "гостем (зритель)"
         try:
-            self.log(f"🌐 Подключаюсь к релею {RELAY_URL}...")
+            self.log(f"🌐 Подключаюсь к релею {self.relay_url}...")
             self.log(f"🚪 Комната: {self.room}, роль: {role_text}")
-            self.client_socket = ws_client.create_connection(RELAY_URL, timeout=15)
+            self.client_socket = ws_client.create_connection(self.relay_url, timeout=15)
             self.client_socket.settimeout(0.5)
-            hello = json.dumps({"room": self.room, "role": self.role})
+            hello = json.dumps({"room": self.room, "role": self.role, "username": self.username})
             self.client_socket.send(hello)
             self.connected = True
             self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
             self.safe_update_widget(self.send_btn, state="normal")
-            if hasattr(self, 'connection_status_label'):
-                self.safe_update_widget(
-                    self.connection_status_label,
-                    text=f"👤 В комнате «{self.room}», ждём собеседника...",
-                    text_color="#6fce7f"
-                )
+            self.participant_count = 1
+            self.update_participant_status()
             self.log(f"✅ Подключено к релею! Комната: {self.room}")
-            self.after(300, lambda: self.send_message_raw(f"👤 {self.username} присоединился к комнате!"))
             threading.Thread(target=self.receive_messages_thread, daemon=True).start()
         except Exception as e:
             self.log(f"❌ Не удалось подключиться к релею: {e}")
@@ -2351,6 +2410,8 @@ class ChatWindow(ctk.CTkToplevel):
                             self.receive_skin_file(username, b64_data)
                         except Exception as e:
                             self.log(f"❌ Битые данные скина: {e}")
+                    elif message.startswith("{"):
+                        self.handle_control_message(message)
                     else:
                         self.display_message(message)
                 except ws_client.WebSocketTimeoutException:
@@ -2382,8 +2443,54 @@ class ChatWindow(ctk.CTkToplevel):
                 self.show_notification(text, sender)
             else:
                 self.log(f"🔔 {message}")
+                if "присоединился" in message:
+                    self.participant_count = min(self.participant_count + 1, self.max_room_size)
+                    self.update_participant_status()
         except:
             pass
+
+    def update_participant_status(self):
+        if not hasattr(self, 'connection_status_label'):
+            return
+        if self.participant_count <= 1:
+            text = f"👤 В комнате «{self.room}», ждём собеседника..."
+        else:
+            text = f"✅ В комнате «{self.room}»: {self.participant_count}/{self.max_room_size} участников"
+        self.safe_update_widget(self.connection_status_label, text=text, text_color="#6fce7f")
+
+    def handle_control_message(self, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            self.display_message(message)
+            return
+
+        msg_type = data.get("type")
+        if msg_type == "error" and data.get("reason") == "room_full":
+            max_size = data.get("max", self.max_room_size)
+            self.log(f"❌ Комната «{self.room}» заполнена ({max_size}/{max_size})")
+            self.connected = False
+            self.after(0, lambda: messagebox.showerror(
+                "Комната заполнена",
+                f"В комнате «{self.room}» уже {max_size} участников — это максимум.\n"
+                f"Попробуйте другой код комнаты или подождите, пока кто-то освободит место."
+            ))
+        elif msg_type == "assigned_username":
+            new_username = data.get("username")
+            if new_username:
+                if new_username != self.username:
+                    self.log(f"ℹ️ Ник «{self.username}» уже занят в комнате — вам присвоен ник «{new_username}»")
+                    self.username = new_username
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Ник изменён",
+                        f"В комнате «{self.room}» уже есть участник с таким ником.\n"
+                        f"Ваш ник в этом чате: «{new_username}»"
+                    ))
+                else:
+                    self.username = new_username
+                self.send_message_raw(f"👤 {self.username} присоединился к комнате!")
+        else:
+            self.log(f"ℹ️ Служебное сообщение от релея: {message}")
 
     def send_message(self):
         if not self.connected or self.client_socket is None:
@@ -2590,6 +2697,8 @@ class LauncherApp(ctk.CTk):
         self.game_console = None
         self.active_chat_window = None
 
+        threading.Thread(target=fetch_active_relay_url, daemon=True).start()
+
         theme = self.settings.get("theme", "dark")
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
 
@@ -2675,7 +2784,6 @@ class LauncherApp(ctk.CTk):
             if acc["username"] == selected_username:
                 account_type = acc.get("type", "offline")
                 break
-
         if account_type == "microsoft":
             self.account_combo.configure(text_color="#FFD700")
         else:
@@ -3078,6 +3186,10 @@ class LauncherApp(ctk.CTk):
     def show_support_dialog(self):
         if self.settings.get("support_shown_5", False):
             return
+        if has_microsoft_account():
+            self.settings["support_shown_5"] = True
+            save_launcher_settings(self.settings)
+            return
         self.settings["support_shown_5"] = True
         save_launcher_settings(self.settings)
         dialog = ctk.CTkToplevel(self)
@@ -3205,8 +3317,11 @@ class LauncherApp(ctk.CTk):
         usernames = [acc['username'] for acc in accounts]
         if not usernames:
             usernames = ["Нет аккаунтов"]
+        current = self.account_combo.get()
         self.account_combo.configure(values=usernames)
-        if usernames and usernames[0] != "Нет аккаунтов":
+        if current in usernames:
+            self.account_combo.set(current)
+        elif usernames and usernames[0] != "Нет аккаунтов":
             self.account_combo.set(usernames[0])
 
         try:
@@ -5625,6 +5740,18 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=do_install, daemon=True).start()
 
     def open_chat_window(self):
+        try:
+            new_relay, relay_status = fetch_active_relay_url(timeout=3)
+            status_text = {
+                "updated": f"🌐 Релей обновлён из GitHub: {new_relay}",
+                "unchanged": f"🌐 Релей из GitHub (без изменений): {new_relay}",
+                "invalid_content": "⚠️ relay.active.txt на GitHub содержит некорректный адрес, использую прежний релей",
+                "network_error": "⚠️ Не удалось проверить relay.active.txt (нет сети/лимиты API), использую прежний релей",
+            }.get(relay_status, f"🌐 Релей: {new_relay}")
+            self.log(status_text)
+        except Exception as e:
+            self.log(f"⚠️ Ошибка проверки relay.active.txt: {e}")
+
         dialog = ctk.CTkToplevel(self)
         dialog.title("💬 Настройка чата")
 
@@ -5670,8 +5797,36 @@ class LauncherApp(ctk.CTk):
         ctk.CTkLabel(relay_frame, text="🌍 ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЛЕЙ (работает через интернет, без проброса портов):",
                      font=ctk.CTkFont(size=12, weight="bold"), text_color="#6fce7f",
                      wraplength=520, justify="center").pack(pady=(8, 4), padx=10)
-        ctk.CTkLabel(relay_frame, text=RELAY_URL,
-                     font=ctk.CTkFont(size=13, weight="bold"), text_color="#6d92ff").pack(pady=(0, 8))
+
+        relay_row = ctk.CTkFrame(relay_frame, fg_color="transparent")
+        relay_row.pack(pady=(0, 8), padx=10, fill="x")
+
+        custom_relay_url = ""
+        try:
+            custom_relay_url = (self.settings.get("custom_relay_url", "") or "").strip()
+        except:
+            pass
+
+        relay_entry = ctk.CTkEntry(relay_row, placeholder_text=RELAY_URL, height=32,
+                                   font=ctk.CTkFont(size=12))
+        relay_entry.pack(side="left", fill="x", expand=True)
+        relay_entry.insert(0, custom_relay_url or RELAY_URL)
+
+        def reset_relay():
+            relay_entry.delete(0, 'end')
+            relay_entry.insert(0, RELAY_URL)
+            play_click()
+
+        reset_relay_btn = make_sound_button(relay_row, text="↩️ По умолчанию",
+                                            command=reset_relay,
+                                            width=110, height=32,
+                                            fg_color="#2b2840", hover_color="#3d3a52",
+                                            font=ctk.CTkFont(size=11))
+        reset_relay_btn.pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(relay_frame, text="Можно вписать свой адрес релея (wss://...), если не хотите использовать релей по умолчанию",
+                     font=ctk.CTkFont(size=10), text_color="#8b87a3",
+                     wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
 
         instr_frame = ctk.CTkFrame(main_frame, fg_color="#201d30", corner_radius=10)
         instr_frame.pack(fill="x", pady=(0, 10))
@@ -5720,19 +5875,6 @@ class LauncherApp(ctk.CTk):
         room_entry = ctk.CTkEntry(room_row, placeholder_text="Код комнаты сюда", width=180, height=35,
                                   font=ctk.CTkFont(size=13))
         room_entry.pack(side="left", padx=(10, 0))
-        room_entry.insert(0, generate_room_code())
-
-        def regenerate_room():
-            room_entry.delete(0, 'end')
-            room_entry.insert(0, generate_room_code())
-            play_click()
-
-        new_code_btn = make_sound_button(room_row, text="🎲 Новый",
-                                         command=regenerate_room,
-                                         width=75, height=30,
-                                         fg_color="#2b2840", hover_color="#3d3a52",
-                                         font=ctk.CTkFont(size=11))
-        new_code_btn.pack(side="left", padx=(5, 0))
 
         paste_btn = make_sound_button(room_row, text="📋 Вставить",
                                       command=lambda: self.paste_ip_to_entry(room_entry),
@@ -5751,21 +5893,79 @@ class LauncherApp(ctk.CTk):
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(fill="x", pady=(5, 0))
 
+        def open_chat_and_finish(mode, room, relay_url):
+            try:
+                self.settings["custom_relay_url"] = relay_url if relay_url != RELAY_URL else ""
+                save_launcher_settings(self.settings)
+            except:
+                pass
+            _save_setup_size_only()
+            dialog.destroy()
+            chat_window = ChatWindow(self, mode, room, relay_url=relay_url)
+            self.active_chat_window = chat_window
+            self.log(f"💬 Чат открыт в режиме: {mode}, комната: {room}, релей: {relay_url}")
+
         def start_chat():
             try:
                 mode = mode_var.get()
                 room = room_entry.get().strip()
+                relay_url = relay_entry.get().strip() or RELAY_URL
 
                 if not room:
                     play_error()
                     messagebox.showwarning("Ошибка", "Код комнаты пустой")
                     return
 
-                _save_setup_size_only()
-                dialog.destroy()
-                chat_window = ChatWindow(self, mode, room)
-                self.active_chat_window = chat_window
-                self.log(f"💬 Чат открыт в режиме: {mode}, комната: {room}")
+                if mode != "server":
+                    open_chat_and_finish(mode, room, relay_url)
+                    return
+
+                start_btn.configure(state="disabled", text="⏳ Проверяем код...")
+                cancel_btn.configure(state="disabled")
+
+                def do_check():
+                    try:
+                        active, count, max_size = check_room_active(relay_url, room, timeout=5)
+                        error_text = None
+                    except Exception as e:
+                        active, count, max_size, error_text = False, 0, 20, str(e)
+
+                    def after_check():
+                        try:
+                            start_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ЧАТ")
+                            cancel_btn.configure(state="normal")
+                        except:
+                            return
+
+                        if error_text:
+                            self.log(f"⚠️ Не удалось проверить код комнаты ({error_text}) — создаю без проверки")
+                            open_chat_and_finish(mode, room, relay_url)
+                        elif active and count >= max_size:
+                            play_error()
+                            messagebox.showwarning(
+                                "Комната заполнена",
+                                f"Комната «{room}» уже существует и заполнена ({count}/{max_size}).\n"
+                                f"Выберите другой код комнаты."
+                            )
+                        elif active:
+                            play_click()
+                            join_instead = messagebox.askyesno(
+                                "Комната уже существует",
+                                f"Комната «{room}» уже существует ({count}/{max_size} участников) —\n"
+                                f"её создавать не нужно, можно просто присоединиться.\n\n"
+                                f"Присоединиться к ней как гость?"
+                            )
+                            if join_instead:
+                                open_chat_and_finish("client", room, relay_url)
+                        else:
+                            open_chat_and_finish(mode, room, relay_url)
+
+                    try:
+                        dialog.after(0, after_check)
+                    except:
+                        pass
+
+                threading.Thread(target=do_check, daemon=True).start()
 
             except Exception as e:
                 play_error()
@@ -5900,7 +6100,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ ОШИБКА: {e}")
         import traceback
-
         traceback.print_exc()
         with open("error_log.txt", "w", encoding="utf-8") as f:
             f.write(f"Ошибка: {e}\n")
