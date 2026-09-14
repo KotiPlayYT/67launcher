@@ -3131,58 +3131,7 @@ class LauncherApp(ctk.CTk):
         play_click()
         self.log("🔷 Настройки Microsoft-входа сохранены")
         messagebox.showinfo("Готово", "Настройки Microsoft-входа сохранены")
-
-    def show_first_launch_server_dialog(self):
-        server_ip = "smpametist.aternos.me"
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("🎮 С почином!")
-        dialog.geometry("480x340")
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        dialog.transient(self)
-
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-        y = (dialog.winfo_screenheight() // 2) - (height // 2)
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-
-        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        main_frame.pack(fill="both", expand=True, padx=25, pady=25)
-
-        ctk.CTkLabel(main_frame, text="🎉", font=ctk.CTkFont(size=50)).pack(pady=(0, 5))
-        ctk.CTkLabel(main_frame, text="ЭТО НЕ МОЙ СЕРВАК!!!", font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color="#6d92ff").pack(pady=(0, 5))
-        ctk.CTkLabel(main_frame, text="Заходи серв там бесплатный кит старт!!!:", font=ctk.CTkFont(size=13),
-                     text_color="#a8a4bd").pack(pady=(0, 10))
-
-        ip_frame = ctk.CTkFrame(main_frame, fg_color="#100e1a", corner_radius=8)
-        ip_frame.pack(fill="x", pady=(0, 15))
-        ip_label = ctk.CTkLabel(ip_frame, text=server_ip, font=ctk.CTkFont(size=17, weight="bold"),
-                                text_color="#6fce7f")
-        ip_label.pack(pady=12)
-
-        def copy_server_ip():
-            try:
-                self.clipboard_clear()
-                self.clipboard_append(server_ip)
-                play_click()
-                copy_btn.configure(text="✅ Скопировано")
-                dialog.after(1500, lambda: copy_btn.configure(text="📋 Копировать IP"))
-            except Exception as e:
-                play_error()
-                messagebox.showerror("Ошибка", f"IP не скопировался:\n{e}")
-
-        copy_btn = make_sound_button(main_frame, text="📋 Копировать IP", command=copy_server_ip,
-                                     fg_color="#6d92ff", hover_color="#5a7dd8", height=42,
-                                     font=ctk.CTkFont(size=14, weight="bold"))
-        copy_btn.pack(fill="x", pady=(0, 10))
-
-        close_btn = make_sound_button(main_frame, text="Погнали", command=dialog.destroy,
-                                      fg_color="#2b2840", hover_color="#3d3a52", height=36)
-        close_btn.pack(fill="x")
-
+        
     def show_support_dialog(self):
         if self.settings.get("support_shown_5", False):
             return
@@ -6091,7 +6040,7 @@ class LauncherApp(ctk.CTk):
         except:
             pass
 
-
+#ЭТО НЕ МОЙ
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
