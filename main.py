@@ -21,7 +21,7 @@ import certifi
 from datetime import datetime
 import pickle
 import random
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, Image, ImageTk
 from io import BytesIO
 import socket
 import base64
@@ -31,6 +31,7 @@ import hashlib
 import websocket as ws_client
 from urllib.parse import unquote
 import multiprocessing
+import pystray
 
 RELAY_URL_DEFAULT = "wss://screen-relay-production.up.railway.app"
 RELAY_URL_API_SOURCE = "https://api.github.com/repos/KotiPlayYT/67launcher/contents/relay.active.txt?ref=main"
@@ -1930,6 +1931,14 @@ class ChatWindow(ctk.CTkToplevel):
         self.participant_count = 1
         self.max_room_size = 20
 
+        self.notifications_enabled = True
+        self.notification_size = 100
+        try:
+            self.notifications_enabled = bool(master.settings.get("chat_notifications_enabled", True))
+            self.notification_size = int(master.settings.get("chat_notification_size", 100))
+        except:
+            pass
+
         self.title("💬 Чат 67Launcher")
 
         saved_size = "800x850"
@@ -1940,7 +1949,6 @@ class ChatWindow(ctk.CTkToplevel):
         self.geometry(saved_size)
         self.minsize(650, 500)
         self.resizable(True, True)
-        self.grab_set()
 
         self.update_idletasks()
         width = self.winfo_width()
@@ -1964,7 +1972,6 @@ class ChatWindow(ctk.CTkToplevel):
         self.log(f"🔍 Инициализация чата в режиме: {mode} (комната «{self.room}»)")
 
         threading.Thread(target=self.run_diagnostics, daemon=True).start()
-
         threading.Thread(target=self.run_relay, daemon=True).start()
 
     def run_diagnostics(self):
@@ -1979,9 +1986,17 @@ class ChatWindow(ctk.CTkToplevel):
         self.log(f"🚪 Комната: {self.room}")
         self.log("━" * 50)
 
+    def restore_chat_only(self, event=None):
+        """Открывает и разворачивает ТОЛЬКО ЧАТ без разворачивания лаунчера"""
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.is_minimized = False
+        self.unread_count = 0
+        self.update_title()
+
     def on_minimize(self, event):
         self.is_minimized = True
-        self.unread_count = 0
 
     def on_restore(self, event):
         self.is_minimized = False
@@ -1993,23 +2008,28 @@ class ChatWindow(ctk.CTkToplevel):
             self.title(f"💬 Чат 67Launcher ({self.unread_count} новых)")
         else:
             self.title("💬 Чат 67Launcher")
-    def show_notification(self, message, sender=""):
+
+    def show_notification(self, message, sender="", title=None, force=False):
         if threading.current_thread() is not threading.main_thread():
             try:
-                self.after(0, lambda: self.show_notification(message, sender))
+                self.after(0, lambda: self.show_notification(message, sender, title, force))
             except:
                 pass
             return
         if self.is_minimized:
             self.unread_count += 1
             self.update_title()
+        if not force and not getattr(self, 'notifications_enabled', True):
+            return
         try:
+            scale = max(50, min(200, getattr(self, 'notification_size', 100))) / 100.0
+
             notif = tk.Toplevel(self)
             notif.title("")
             notif.overrideredirect(True)
             notif.attributes('-topmost', True)
 
-            width, height = 380, 120
+            width, height = int(380 * scale), int(120 * scale)
 
             if sys.platform == "win32":
                 try:
@@ -2035,43 +2055,49 @@ class ChatWindow(ctk.CTkToplevel):
 
             notif.configure(bg="#100e1a")
 
-            frame = tk.Frame(notif, bg="#100e1a", highlightbackground="#302c46", highlightthickness=1)
+            frame = tk.Frame(notif, bg="#100e1a", highlightbackground="#302c46", highlightthickness=1, cursor="hand2")
             frame.pack(fill="both", expand=True, padx=2, pady=2)
+
+            # Нажатие на само уведомление открывает ТОЛЬКО чат!
+            def on_notif_click(e=None):
+                notif.destroy()
+                self.restore_chat_only()
+
+            frame.bind("<Button-1>", on_notif_click)
+
             header_frame = tk.Frame(frame, bg="#100e1a")
             header_frame.pack(fill="x", padx=15, pady=(10, 5))
+            header_frame.bind("<Button-1>", on_notif_click)
 
             title_color = "#6d92ff"
             if sender:
                 try:
-                    from __main__ import load_accounts
                     accounts = load_accounts()
                     for acc in accounts:
                         if acc["username"] == sender and acc.get("type") == "microsoft":
                             title_color = "#FFD700"
                             break
                 except:
-                    try:
-                        accounts = load_accounts()
-                        for acc in accounts:
-                            if acc["username"] == sender and acc.get("type") == "microsoft":
-                                title_color = "#FFD700"
-                                break
-                    except:
-                        pass
+                    pass
 
-            title_text = f"💬 {sender}" if sender else "💬 Новое сообщение"
+            title_text = title if title else (f"💬 {sender}" if sender else "💬 Новое сообщение")
 
-            tk.Label(header_frame, text=title_text, font=("Segoe UI", 12, "bold"),
-                     bg="#100e1a", fg=title_color).pack(side="left")
+            l1 = tk.Label(header_frame, text=title_text, font=("Segoe UI", max(8, int(12 * scale)), "bold"),
+                         bg="#100e1a", fg=title_color)
+            l1.pack(side="left")
+            l1.bind("<Button-1>", on_notif_click)
 
             close_btn = tk.Button(header_frame, text="✕", command=notif.destroy,
                                   bg="#100e1a", fg="#e5e2f0", activebackground="#d3453f",
                                   activeforeground="#e5e2f0", relief="flat", bd=0,
-                                  font=("Segoe UI", 10), cursor="hand2")
+                                  font=("Segoe UI", max(7, int(10 * scale))), cursor="hand2")
             close_btn.pack(side="right")
+
             msg_text = message[:80] + "..." if len(message) > 80 else message
-            tk.Label(frame, text=msg_text, font=("Segoe UI", 11), bg="#100e1a", fg="#e5e2f0",
-                     wraplength=350, justify="left").pack(padx=15, pady=(5, 10), anchor="w")
+            l2 = tk.Label(frame, text=msg_text, font=("Segoe UI", max(7, int(11 * scale))), bg="#100e1a", fg="#e5e2f0",
+                         wraplength=int(350 * scale), justify="left")
+            l2.pack(padx=15, pady=(5, 10), anchor="w")
+            l2.bind("<Button-1>", on_notif_click)
 
             notif.after(5000, notif.destroy)
             notif.attributes('-alpha', 0.0)
@@ -2087,6 +2113,104 @@ class ChatWindow(ctk.CTkToplevel):
             fade_in()
         except Exception as e:
             print(f"Ошибка уведомления: {e}")
+
+    def _save_chat_settings(self):
+        try:
+            self.master.settings["chat_notifications_enabled"] = self.notifications_enabled
+            self.master.settings["chat_notification_size"] = self.notification_size
+            save_launcher_settings(self.master.settings)
+        except:
+            pass
+
+    def open_chat_settings(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("⚙️ Настройки чата")
+        dialog.geometry("420x360")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (width // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        main = ctk.CTkFrame(dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(main, text="⚙️ Настройки уведомлений чата",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 15))
+
+        notif_switch_var = ctk.BooleanVar(value=self.notifications_enabled)
+
+        def on_switch_toggle():
+            self.notifications_enabled = bool(notif_switch_var.get())
+            self._save_chat_settings()
+            play_click()
+            size_slider.configure(state="normal" if self.notifications_enabled else "disabled")
+            preview_btn.configure(state="normal" if self.notifications_enabled else "disabled")
+
+        notif_switch = ctk.CTkSwitch(main, text="🔔 Показывать всплывающие уведомления",
+                                     variable=notif_switch_var, onvalue=True, offvalue=False,
+                                     command=on_switch_toggle,
+                                     font=ctk.CTkFont(size=13),
+                                     progress_color="#6fce7f")
+        notif_switch.pack(anchor="w", pady=(0, 20))
+
+        size_header = ctk.CTkFrame(main, fg_color="transparent")
+        size_header.pack(fill="x")
+        ctk.CTkLabel(size_header, text="📏 Размер уведомлений",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        size_value_label = ctk.CTkLabel(size_header, text=f"{self.notification_size}%",
+                                        font=ctk.CTkFont(size=13, weight="bold"), text_color="#6d92ff")
+        size_value_label.pack(side="right")
+
+        def on_size_change(value):
+            size = int(round(value / 10.0) * 10)
+            size_value_label.configure(text=f"{size}%")
+            self.notification_size = size
+
+        size_slider = ctk.CTkSlider(main, from_=50, to=200, number_of_steps=15,
+                                    command=on_size_change,
+                                    progress_color="#6d92ff", button_color="#6d92ff",
+                                    button_hover_color="#5a7dd8")
+        size_slider.set(self.notification_size)
+        size_slider.pack(fill="x", pady=(8, 2))
+        size_slider.configure(state="normal" if self.notifications_enabled else "disabled")
+
+        scale_frame = ctk.CTkFrame(main, fg_color="transparent")
+        scale_frame.pack(fill="x", pady=(0, 15))
+        ctk.CTkLabel(scale_frame, text="Меньше", font=ctk.CTkFont(size=10), text_color="#a8a4bd").pack(side="left")
+        ctk.CTkLabel(scale_frame, text="Больше", font=ctk.CTkFont(size=10), text_color="#a8a4bd").pack(side="right")
+
+        def on_slider_release(event=None):
+            self._save_chat_settings()
+            play_click()
+
+        size_slider.bind("<ButtonRelease-1>", on_slider_release)
+
+        preview_btn = make_sound_button(main, text="👁️ Показать пример уведомления",
+                                        command=lambda: self.show_notification(
+                                            "Вот так будут выглядеть уведомления в чате",
+                                            "Тест", title="🔔 Пример уведомления", force=True),
+                                        fg_color="#6d92ff", hover_color="#5a7dd8", height=35,
+                                        font=ctk.CTkFont(size=12))
+        preview_btn.pack(fill="x", pady=(0, 10))
+        preview_btn.configure(state="normal" if self.notifications_enabled else "disabled")
+
+        def close_dialog():
+            self._save_chat_settings()
+            dialog.destroy()
+
+        close_btn = make_sound_button(main, text="✅ Готово", command=close_dialog,
+                                      fg_color="#6fce7f", hover_color="#5cb56c",
+                                      text_color="#16141f", height=40,
+                                      font=ctk.CTkFont(size=13, weight="bold"))
+        close_btn.pack(fill="x", side="bottom")
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def copy_ip_to_clipboard(self, ip):
         try:
@@ -2217,6 +2341,13 @@ class ChatWindow(ctk.CTkToplevel):
                                        height=35,
                                        font=ctk.CTkFont(size=12))
         export_btn.pack(side="left", padx=(0, 10))
+
+        settings_btn = make_sound_button(btn_frame, text="⚙️ Настройки",
+                                         command=self.open_chat_settings,
+                                         fg_color="#4a4666", hover_color="#3d3a52",
+                                         height=35,
+                                         font=ctk.CTkFont(size=12))
+        settings_btn.pack(side="left", padx=(0, 10))
 
         if self.mode == "client":
             reconnect_btn = make_sound_button(btn_frame, text="🔄 Переподключиться",
@@ -2443,9 +2574,15 @@ class ChatWindow(ctk.CTkToplevel):
                 self.show_notification(text, sender)
             else:
                 self.log(f"🔔 {message}")
+                body = message.lstrip("👤 ").strip()
                 if "присоединился" in message:
                     self.participant_count = min(self.participant_count + 1, self.max_room_size)
                     self.update_participant_status()
+                    self.show_notification(body, title="🟢 Участник присоединился")
+                elif "покинул" in message:
+                    self.participant_count = max(self.participant_count - 1, 1)
+                    self.update_participant_status()
+                    self.show_notification(body, title="🔴 Участник покинул чат")
         except:
             pass
 
@@ -2555,6 +2692,11 @@ class ChatWindow(ctk.CTkToplevel):
 
     def disconnect(self):
         if self.connected:
+            try:
+                if self.client_socket:
+                    self.client_socket.send(f"👤 {self.username} покинул комнату!")
+            except:
+                pass
             self.connected = False
             self.safe_update_widget(self.send_btn, state="disabled")
             self.update_status()
@@ -2567,25 +2709,10 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
 
     def on_close(self):
-        self.running = False
-        self.disconnect()
-        try:
-            if getattr(self.master, 'active_chat_window', None) is self:
-                self.master.active_chat_window = None
-        except:
-            pass
-
-        try:
-            raw_size = f"{self.winfo_width()}x{self.winfo_height()}"
-            size = safe_window_geometry(raw_size, default=None)
-            if size:
-                self.master.settings["chat_window_size"] = size
-                save_launcher_settings(self.master.settings)
-        except:
-            pass
-        self.destroy()
+        """Сворачивает чат в фоновый режим при закрытии крестиком"""
+        self.withdraw()
+        self.is_minimized = True
         play_click()
-
 
 class EmojiPicker(ctk.CTkToplevel):
     def __init__(self, master, callback):
@@ -2690,7 +2817,7 @@ class LauncherApp(ctk.CTk):
 
         super().__init__()
         LauncherApp.instance = self
-
+        LauncherApp.setup_tray_icons(self)
         self.settings = load_launcher_settings()
         self.stats = load_stats()
         self._secret_launcher = None
@@ -2773,6 +2900,59 @@ class LauncherApp(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.start_idle_timer()
+
+    def create_emoji_icon(emoji_text="💬"):
+        """Создает иконку для трея с эмодзи чата"""
+        img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("seguiemj.ttf", 48)
+            d.text((8, 4), emoji_text, font=font, embedded_color=True)
+        except:
+            d.ellipse((8, 8, 56, 56), fill=(61, 107, 240))
+            d.text((22, 16), "C", fill=(255, 255, 255))
+        return img
+
+    def create_launcher_icon():
+        """Создает иконку для трея 67Лаунчера"""
+        img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle((4, 4, 60, 60), fill="#3d6bf0", outline="#ffffff", width=2)
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 28)
+            d.text((14, 12), "67", fill=(255, 255, 255), font=font)
+        except:
+            d.text((14, 12), "67", fill=(255, 255, 255))
+        return img
+
+    @staticmethod
+    def setup_tray_icons(launcher_app):
+        def show_chat_only(icon, item):
+            if hasattr(launcher_app, 'active_chat_window') and launcher_app.active_chat_window:
+                launcher_app.active_chat_window.after(0, launcher_app.active_chat_window.restore_chat_only)
+
+        chat_menu = pystray.Menu(
+            pystray.MenuItem("💬 Открыть Чат", show_chat_only, default=True),
+            pystray.MenuItem("❌ Закрыть чат", lambda icon, item: launcher_app.active_chat_window.withdraw() if launcher_app.active_chat_window else None)
+        )
+        chat_icon = pystray.Icon("67_chat", LauncherApp.create_emoji_icon("💬"), "Чат 67Launcher", chat_menu)
+
+        def show_launcher_only(icon, item):
+            launcher_app.after(0, lambda: (launcher_app.deiconify(), launcher_app.lift(), launcher_app.focus_force()))
+
+        def quit_app(icon, item):
+            chat_icon.stop()
+            icon.stop()
+            launcher_app.after(0, launcher_app.destroy)
+
+        launcher_menu = pystray.Menu(
+            pystray.MenuItem("🚀 Открыть 67Launcher", show_launcher_only, default=True),
+            pystray.MenuItem("❌ Полный выход", quit_app)
+        )
+        launcher_icon = pystray.Icon("67_launcher", LauncherApp.create_launcher_icon(), "67Launcher", launcher_menu)
+
+        threading.Thread(target=chat_icon.run, daemon=True).start()
+        threading.Thread(target=launcher_icon.run, daemon=True).start()
 
     def update_combo_text_color(self, selected_username=None):
         if not selected_username:
@@ -3131,7 +3311,7 @@ class LauncherApp(ctk.CTk):
         play_click()
         self.log("🔷 Настройки Microsoft-входа сохранены")
         messagebox.showinfo("Готово", "Настройки Microsoft-входа сохранены")
-        
+
     def show_support_dialog(self):
         if self.settings.get("support_shown_5", False):
             return
@@ -6031,16 +6211,10 @@ class LauncherApp(ctk.CTk):
             print(f"LOG: {message}")
 
     def on_closing(self):
-        if self.timer_running:
-            self.stop_game_timer()
-        self._closing = True
-        self.save_current_selection()
-        try:
-            self.destroy()
-        except:
-            pass
+        self.withdraw()
+        self.log(".")
 
-#ЭТО НЕ МОЙ
+#setup_tray_icons
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
