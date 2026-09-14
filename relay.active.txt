@@ -1,1 +1,1 @@
-wss://screen-relay-production.up.railway.app тус
+wss://screen-relay-production.up.railway.ru
