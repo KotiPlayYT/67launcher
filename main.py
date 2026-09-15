@@ -21,7 +21,7 @@ import certifi
 from datetime import datetime
 import pickle
 import random
-from PIL import Image, ImageDraw, ImageFont, Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 from io import BytesIO
 import socket
 import base64
@@ -1940,22 +1940,10 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
         self.title("💬 Чат 67Launcher")
-
-        saved_size = "800x850"
-        try:
-            saved_size = safe_window_geometry(master.settings.get("chat_window_size", "800x850"), default="800x850")
-        except:
-            pass
-        self.geometry(saved_size)
-        self.minsize(650, 500)
+        self._apply_chat_window_geometry()
+        self.minsize(800, 800)
         self.resizable(True, True)
-
-        self.update_idletasks()
-        width = self.winfo_width()
-        height = self.winfo_height()
-        x = (self.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.winfo_screenheight() // 2) - (height // 2)
-        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.after(80, self._apply_chat_window_geometry)
 
         self.bind("<Unmap>", self.on_minimize)
         self.bind("<Map>", self.on_restore)
@@ -1973,6 +1961,23 @@ class ChatWindow(ctk.CTkToplevel):
 
         threading.Thread(target=self.run_diagnostics, daemon=True).start()
         threading.Thread(target=self.run_relay, daemon=True).start()
+
+    def _apply_chat_window_geometry(self):
+        try:
+            self.update_idletasks()
+            screen_w = self.winfo_screenwidth()
+            screen_h = self.winfo_screenheight()
+
+            width = max(700, min(1400, int(screen_w * 0.72)))
+            height = max(600, min(1000, int(screen_h * 0.80)))
+
+            x = (screen_w - width) // 2
+            y = (screen_h - height) // 2
+
+            self._chat_window_size = (width, height)
+            self.wm_geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
 
     def run_diagnostics(self):
         self.log("━" * 50)
@@ -2058,7 +2063,6 @@ class ChatWindow(ctk.CTkToplevel):
             frame = tk.Frame(notif, bg="#100e1a", highlightbackground="#302c46", highlightthickness=1, cursor="hand2")
             frame.pack(fill="both", expand=True, padx=2, pady=2)
 
-            # Нажатие на само уведомление открывает ТОЛЬКО чат!
             def on_notif_click(e=None):
                 notif.destroy()
                 self.restore_chat_only()
@@ -2356,6 +2360,13 @@ class ChatWindow(ctk.CTkToplevel):
                                               text_color="#16141f", height=35,
                                               font=ctk.CTkFont(size=12))
             reconnect_btn.pack(side="left", padx=(0, 10))
+
+        leave_room_btn = make_sound_button(btn_frame, text="🚪 Выйти из комнаты",
+                                           command=self.leave_room,
+                                           fg_color="#d9622f", hover_color="#c14f26",
+                                           text_color="#16141f", height=35,
+                                           font=ctk.CTkFont(size=12))
+        leave_room_btn.pack(side="right", padx=(0, 10))
 
         close_btn = make_sound_button(btn_frame, text="❌ Закрыть чат",
                                       command=self.on_close,
@@ -2714,6 +2725,30 @@ class ChatWindow(ctk.CTkToplevel):
         self.is_minimized = True
         play_click()
 
+    def leave_room(self):
+        """Настоящий выход из комнаты: разрывает соединение, уведомляет
+        собеседника и полностью закрывает окно чата (в отличие от
+        «Закрыть чат», который просто сворачивает окно в фон)."""
+        if not messagebox.askyesno(
+            "Выйти из комнаты",
+            f"Выйти из комнаты «{self.room}»?\n"
+            f"Соединение будет разорвано, окно чата закроется."
+        ):
+            return
+        play_click()
+        self.log(f"🚪 Выходим из комнаты «{self.room}»...")
+        self.running = False
+        self.disconnect()
+        try:
+            if hasattr(self.master, 'active_chat_window') and self.master.active_chat_window is self:
+                self.master.active_chat_window = None
+        except:
+            pass
+        try:
+            self.destroy()
+        except:
+            pass
+
 class EmojiPicker(ctk.CTkToplevel):
     def __init__(self, master, callback):
         super().__init__(master)
@@ -2807,6 +2842,254 @@ class GameConsoleWindow(ctk.CTkToplevel):
             self.text.delete("1.0", "end")
         except:
             pass
+
+
+def _make_dropdown_chevron_image(size=14, thickness=2,
+                                  color_light="#221f30", color_dark="#e5e2f0"):
+    """
+    Рисует ровный шеврон-стрелочку вниз через PIL (а не текстовым символом),
+    чтобы она выглядела так же аккуратно и одинаково, как встроенная
+    стрелочка у CTkComboBox, независимо от шрифтов на компьютере пользователя.
+    """
+    def draw(color):
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        pad = size * 0.22
+        top_y = size * 0.36
+        bottom_y = size * 0.64
+        mid_x = size / 2
+        d.line([(pad, top_y), (mid_x, bottom_y)], fill=color, width=thickness)
+        d.line([(mid_x, bottom_y), (size - pad, top_y)], fill=color, width=thickness)
+        return img
+
+    return ctk.CTkImage(light_image=draw(color_light), dark_image=draw(color_dark), size=(size, size))
+
+
+class SearchableComboBox(ctk.CTkFrame):
+    """
+    Комбобокс с поповером: показывает не больше max_visible_items строк
+    (дальше — скролл) и строку поиска сверху для фильтрации версий.
+    Совместим по интерфейсу с CTkComboBox: get() / set() / configure(values=...).
+    """
+
+    _ROW_HEIGHT = 30
+
+    def __init__(self, master, values=None, width=300, height=35,
+                 max_visible_items=10, placeholder_text="Поиск версий...",
+                 command=None, **kwargs):
+        super().__init__(master, width=width, height=height, fg_color="transparent")
+        self.grid_propagate(False)
+        self.pack_propagate(False)
+
+        self._all_values = list(values) if values else []
+        self._max_visible_items = max_visible_items
+        self._command = command
+        self._popup = None
+        self._popup_buttons = []
+        self._current_value = self._all_values[0] if self._all_values else ""
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.display_entry = ctk.CTkEntry(self, height=height, corner_radius=5)
+        self.display_entry.grid(row=0, column=0, sticky="nsew")
+        self.display_entry.configure(state="normal")
+        self.display_entry.insert(0, self._current_value)
+        self.display_entry.configure(state="readonly")
+        self.display_entry.bind("<Button-1>", lambda e: self._toggle_popup())
+
+        self._chevron_image = _make_dropdown_chevron_image()
+        self.arrow_btn = ctk.CTkButton(
+            self, text="", image=self._chevron_image, width=28, height=height, corner_radius=5,
+            fg_color=["#e4e1f2", "#302c46"], hover_color=["#3d6bf0", "#3d6bf0"],
+            command=self._toggle_popup
+        )
+        self.arrow_btn.grid(row=0, column=1, padx=(4, 0))
+
+        self.bind("<Destroy>", lambda e: self._close_popup())
+
+    def get(self):
+        return self._current_value
+
+    def set(self, value):
+        self._current_value = value
+        try:
+            self.display_entry.configure(state="normal")
+            self.display_entry.delete(0, "end")
+            self.display_entry.insert(0, value)
+            self.display_entry.configure(state="readonly")
+        except Exception:
+            pass
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            values = kwargs.pop("values")
+            self._all_values = list(values) if values else []
+            if self._popup is not None:
+                self._render_list(self._all_values)
+        if "state" in kwargs:
+            state = kwargs.pop("state")
+            try:
+                self.display_entry.configure(state="readonly" if state != "disabled" else "disabled")
+                self.arrow_btn.configure(state=state)
+            except Exception:
+                pass
+        if "text_color" in kwargs:
+            tc = kwargs.pop("text_color")
+            try:
+                self.display_entry.configure(text_color=tc)
+            except Exception:
+                pass
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if kwargs:
+            try:
+                super().configure(**kwargs)
+            except Exception:
+                pass
+
+    def _toggle_popup(self):
+        if self._popup is not None and self._popup.winfo_exists():
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _open_popup(self):
+        if not self.winfo_exists():
+            return
+
+        self._popup = ctk.CTkToplevel(self)
+        self._popup.overrideredirect(True)
+        self._popup.attributes("-topmost", True)
+        try:
+            self._popup.transient(self.winfo_toplevel())
+        except Exception:
+            pass
+
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + 2
+        popup_width = max(self.winfo_width(), 220)
+        self._popup.geometry(f"{popup_width}x10+{x}+{y}")
+
+        container = ctk.CTkFrame(self._popup, corner_radius=6,
+                                  fg_color=["#ffffff", "#1a1826"],
+                                  border_width=1, border_color=["#c9c4de", "#302c46"])
+        container.pack(fill="both", expand=True)
+
+        self._search_var = tk.StringVar()
+        search_entry = ctk.CTkEntry(container, height=30, corner_radius=4,
+                                     placeholder_text="🔍 Поиск установленных версий",
+                                     textvariable=self._search_var)
+        search_entry.pack(fill="x", padx=6, pady=(6, 4))
+        search_entry.bind("<KeyRelease>", lambda e: self._on_search())
+        search_entry.bind("<Escape>", lambda e: self._close_popup())
+
+        list_height = self._ROW_HEIGHT * min(len(self._all_values) or 1, self._max_visible_items)
+        self._scroll_frame = ctk.CTkScrollableFrame(
+            container, height=list_height, corner_radius=0,
+            fg_color="transparent"
+        )
+        self._scroll_frame.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        self._scroll_frame.columnconfigure(0, weight=1)
+
+        self._render_list(self._all_values)
+
+        self._popup.update_idletasks()
+        total_height = search_entry.winfo_reqheight() + list_height + 24
+        self._popup.geometry(f"{popup_width}x{total_height}+{x}+{y}")
+
+        search_entry.focus_set()
+
+        self._popup.bind("<FocusOut>", self._on_popup_focus_out)
+        self._popup_click_id = self.winfo_toplevel().bind(
+            "<Button-1>", self._on_root_click, add="+"
+        )
+
+    def _render_list(self, values):
+        if self._popup is None or not self._popup.winfo_exists():
+            return
+        for btn in self._popup_buttons:
+            try:
+                btn.destroy()
+            except Exception:
+                pass
+        self._popup_buttons = []
+
+        if not values:
+            empty_label = ctk.CTkLabel(self._scroll_frame, text="Ничего не найдено",
+                                        text_color=["#8f89a8", "#7a7791"])
+            empty_label.grid(row=0, column=0, sticky="ew", pady=6)
+            self._popup_buttons.append(empty_label)
+            return
+
+        for i, val in enumerate(values):
+            is_selected = (val == self._current_value)
+            btn = ctk.CTkButton(
+                self._scroll_frame, text=val, anchor="w", height=self._ROW_HEIGHT - 4,
+                corner_radius=4,
+                fg_color=["#e4e1f2", "#302c46"] if is_selected else "transparent",
+                hover_color=["#dedaee", "#26243a"],
+                text_color=["#221f30", "#e5e2f0"],
+                command=lambda v=val: self._on_select(v)
+            )
+            btn.grid(row=i, column=0, sticky="ew", pady=1)
+            self._popup_buttons.append(btn)
+
+    def _on_search(self):
+        query = self._search_var.get().strip().lower()
+        if not query:
+            filtered = self._all_values
+        else:
+            filtered = [v for v in self._all_values if query in v.lower()]
+        self._render_list(filtered)
+
+    def _on_select(self, value):
+        self.set(value)
+        self._close_popup()
+        if self._command:
+            try:
+                self._command(value)
+            except Exception:
+                pass
+
+    def _on_popup_focus_out(self, event):
+        self.after(150, self._close_popup_if_unfocused)
+
+    def _close_popup_if_unfocused(self):
+        try:
+            if self._popup is None or not self._popup.winfo_exists():
+                return
+            focused = self._popup.focus_get()
+            if focused is None:
+                self._close_popup()
+        except Exception:
+            self._close_popup()
+
+    def _on_root_click(self, event):
+        if self._popup is None or not self._popup.winfo_exists():
+            return
+        widget = event.widget
+        try:
+            if str(widget).startswith(str(self._popup)):
+                return
+            if str(widget).startswith(str(self)):
+                return
+        except Exception:
+            pass
+        self._close_popup()
+
+    def _close_popup(self):
+        if self._popup is not None:
+            try:
+                self.winfo_toplevel().unbind("<Button-1>", self._popup_click_id)
+            except Exception:
+                pass
+            try:
+                self._popup.destroy()
+            except Exception:
+                pass
+            self._popup = None
+            self._popup_buttons = []
 
 
 class LauncherApp(ctk.CTk):
@@ -3151,9 +3434,21 @@ class LauncherApp(ctk.CTk):
         self.update_combo_text_color()
 
     def save_current_selection(self):
-        self.settings["last_account"] = self.account_combo.get()
-        self.settings["last_version"] = self.version_combo.get()
-        save_launcher_settings(self.settings)
+        try:
+            if hasattr(self, 'account_combo'):
+                self.settings["last_account"] = self.account_combo.get()
+            if hasattr(self, 'version_combo'):
+                self.settings["last_version"] = self.version_combo.get()
+            save_launcher_settings(self.settings)
+        except Exception:
+            pass
+
+    def on_account_combo_change(self, selected_username=None):
+        self.update_combo_text_color(selected_username)
+        self.save_current_selection()
+
+    def on_version_combo_change(self, selected_version=None):
+        self.save_current_selection()
 
     def load_available_versions(self):
         try:
@@ -3606,7 +3901,8 @@ class LauncherApp(ctk.CTk):
                 )
                 self.after(0, lambda: login_success(login_data))
             except Exception as e:
-                self.after(0, lambda: login_failed(str(e)))
+                err_msg = str(e)
+                self.after(0, lambda: login_failed(err_msg))
 
         def login_success(login_data):
             success, msg = add_microsoft_account(login_data)
@@ -4181,17 +4477,18 @@ class LauncherApp(ctk.CTk):
             values=["Нет аккаунтов"],
             width=300,
             height=35,
-            command=self.update_combo_text_color
+            command=self.on_account_combo_change
         )
         self.account_combo.grid(row=2, column=0, sticky="w", pady=(0, 15))
         try:
             self.account_combo._entry.bind("<KeyRelease>", lambda e: self.update_combo_text_color())
-            self.account_combo._entry.bind("<FocusOut>", lambda e: self.update_combo_text_color())
+            self.account_combo._entry.bind("<FocusOut>", lambda e: self.on_account_combo_change())
         except Exception:
             pass
 
         ctk.CTkLabel(main_frame, text="📦 Версия:", font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="w")
-        self.version_combo = ctk.CTkComboBox(main_frame, values=["Нет версий"], width=300, height=35)
+        self.version_combo = SearchableComboBox(main_frame, values=["Нет версий"], width=300, height=35,
+                                                 max_visible_items=10, command=self.on_version_combo_change)
         self.version_combo.grid(row=4, column=0, sticky="w", pady=(0, 15))
 
         ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
@@ -5092,12 +5389,6 @@ class LauncherApp(ctk.CTk):
 
         self.update_stats_display()
 
-    def show_install_versions_placeholder(self):
-        for widget in self.version_results_frame.winfo_children():
-            widget.destroy()
-        ctk.CTkLabel(self.version_results_frame, text="⏳ Список версий ещё грузится...",
-                     font=ctk.CTkFont(size=12), text_color="#a8a4bd").pack(pady=15)
-
     def search_mods(self):
         query = self.mod_search_entry.get().strip()
         if not query:
@@ -5926,7 +6217,6 @@ class LauncherApp(ctk.CTk):
         ctk.CTkLabel(relay_frame, text="🌍 ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЛЕЙ (работает через интернет, без проброса портов):",
                      font=ctk.CTkFont(size=12, weight="bold"), text_color="#6fce7f",
                      wraplength=520, justify="center").pack(pady=(8, 4), padx=10)
-
         relay_row = ctk.CTkFrame(relay_frame, fg_color="transparent")
         relay_row.pack(pady=(0, 8), padx=10, fill="x")
 
@@ -6214,7 +6504,6 @@ class LauncherApp(ctk.CTk):
         self.withdraw()
         self.log(".")
 
-#setup_tray_icons
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
