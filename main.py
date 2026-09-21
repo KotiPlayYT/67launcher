@@ -28,6 +28,7 @@ import base64
 import re
 import traceback
 import hashlib
+import uuid
 import websocket as ws_client
 from urllib.parse import unquote
 import multiprocessing
@@ -201,6 +202,26 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+
+def get_launcher_dir():
+    """Папка, в которой лежит сам 67launcher (exe при сборке через PyInstaller,
+    либо папка со скриптом при запуске из исходников). Используется как база
+    для папки download с файлами, которыми поделились в чате."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def sanitize_shared_filename(name):
+    """Убирает путь/спецсимволы из присланного имени файла, чтобы нельзя было
+    выйти за пределы папки download (../../..) или подсунуть кривое имя."""
+    name = unquote(name or "")
+    name = os.path.basename(name.replace("\\", "/"))
+    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip().strip(".")
+    if not name:
+        name = "file.bin"
+    return name[:150]
 
 
 def add_firewall_rule():
@@ -708,7 +729,9 @@ def load_launcher_settings():
         "show_game_logs": False,
         "chat_window_size": "800x850",
         "ms_client_id": DEFAULT_MS_CLIENT_ID,
-        "ms_redirect_uri": "https://login.microsoftonline.com/common/oauth2/nativeclient"
+        "ms_redirect_uri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
+        "user_id": "",
+        "personal_chats": []
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -742,6 +765,16 @@ def save_launcher_settings(settings):
         return True
     except:
         return False
+
+
+def ensure_user_id(settings):
+    """Гарантирует, что у этого пользователя (этой установки лаунчера) есть
+    свой персональный ID для личных чатов. Генерируется один раз и хранится
+    в launcher_settings — не пересоздаётся между запусками."""
+    if not settings.get("user_id"):
+        settings["user_id"] = "u-" + uuid.uuid4().hex[:10]
+        save_launcher_settings(settings)
+    return settings["user_id"]
 
 
 def load_stats():
@@ -1913,14 +1946,217 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
             messagebox.showerror("Ошибка", f"Не запустилось:\n{e}")
 
 
+MAX_PERSONAL_CHATS = 10  # максимум личных чатов в списке «Чаты»
+class _ChatMessagebox:
+    """Обёртка над tkinter.messagebox для окна чата: диалог привязывается к окну
+    чата (parent), чтобы не оказаться спрятанным за ним — иначе кажется, что весь
+    лаунчер завис, ведь окно сообщения модальное. Если окно чата скрыто в фон,
+    parent не передаётся."""
+
+    def __init__(self, window):
+        self._window = window
+
+    def __getattr__(self, name):
+        func = getattr(messagebox, name)
+
+        def call(*args, **kwargs):
+            try:
+                if "parent" not in kwargs and self._window.winfo_viewable():
+                    kwargs["parent"] = self._window
+            except Exception:
+                pass
+            return func(*args, **kwargs)
+        return call
+
+
+def release_and_destroy(window):
+    """Закрывает диалог и заодно гарантированно снимает с него захват ввода (grab)."""
+    try:
+        window.grab_release()
+    except Exception:
+        pass
+    window.destroy()
+
+
+CHAT_HISTORY_MAX_LOAD = 200
+CHAT_HISTORY_MAX_KEEP = 2000
+_CHAT_HISTORY_LOCK = threading.Lock()
+
+CHAT_URL_PATTERN = "https?://[^\\s<>\"']+"  # синтаксис Tcl-regexp для Text.search
+CHAT_COMMAND_RE = re.compile(r"^/([A-Za-zА-Яа-яЁё?]+)(?:\s+(.*))?$", re.S)
+CHAT_COMMAND_ALIASES = {
+    "help": "help", "помощь": "help", "команды": "help", "?": "help",
+    "roll": "roll", "кубик": "roll",
+    "flip": "flip", "монетка": "flip",
+    "choose": "choose", "выбери": "choose",
+    "me": "me",
+    "shrug": "shrug",
+    "time": "time", "время": "time",
+    "coords": "coords", "координаты": "coords", "коорд": "coords",
+    "search": "search", "поиск": "search",
+    "clear": "clear", "очистить": "clear",
+    "export": "export", "экспорт": "export",
+    "mute": "mute", "unmute": "unmute",
+    "copy": "copy", "копировать": "copy",
+}
+
+
+def chat_history_path(contact_id):
+    """Файл с сохранённой перепиской для личного чата. ID собеседника вводится
+    руками, поэтому имя файла очищается от спецсимволов (защита от «../») и
+    дополняется хэшем, чтобы разные ID не склеивались в один файл."""
+    cid = str(contact_id or "")
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", cid)[:48] or "unknown"
+    digest = hashlib.sha1(cid.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(os.path.dirname(SETTINGS_FILE), "chat_history", f"{safe}-{digest}.jsonl")
+
+
+def append_chat_history(contact_id, text, mine):
+    try:
+        path = chat_history_path(contact_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        line = json.dumps({"ts": time.time(), "text": text, "mine": bool(mine)}, ensure_ascii=False)
+        with _CHAT_HISTORY_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def load_chat_history(contact_id, limit=CHAT_HISTORY_MAX_LOAD):
+    """Возвращает последние `limit` сообщений [{ts, text, mine}]. Битые строки
+    пропускаются; если файл разросся больше CHAT_HISTORY_MAX_KEEP — старое обрезается."""
+    path = chat_history_path(contact_id)
+    entries = []
+    try:
+        with _CHAT_HISTORY_LOCK:
+            if not os.path.exists(path):
+                return []
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().split("\n")
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                    msg = item["text"]
+                    if isinstance(msg, str) and msg:
+                        entries.append({"ts": float(item.get("ts", 0)), "text": msg,
+                                        "mine": bool(item.get("mine"))})
+                except Exception:
+                    continue
+            if len(entries) > CHAT_HISTORY_MAX_KEEP:
+                entries = entries[-CHAT_HISTORY_MAX_KEEP:]
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        for e in entries:
+                            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+    except Exception:
+        return []
+    return entries[-limit:]
+
+
+def delete_chat_history(contact_id):
+    try:
+        with _CHAT_HISTORY_LOCK:
+            path = chat_history_path(contact_id)
+            if os.path.exists(path):
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def parse_roll_spec(arg):
+    """'' -> (1, 6); '20' / 'd20' -> (1, 20); '2d6' / '2к6' -> (2, 6).
+    Возвращает (кубиков, граней) или None, если формат неверный."""
+    spec = (arg or "").strip().lower().replace("к", "d").replace("д", "d")
+    if not spec:
+        return 1, 6
+    m = re.fullmatch(r"([0-9]{0,2})d([0-9]{1,4})", spec)
+    if m:
+        count, sides = int(m.group(1) or 1), int(m.group(2))
+    elif re.fullmatch(r"[0-9]{1,4}", spec):
+        count, sides = 1, int(spec)
+    else:
+        return None
+    if not (1 <= count <= 20 and 2 <= sides <= 1000):
+        return None
+    return count, sides
+
+
+def roll_dice(count, sides):
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    return rolls, sum(rolls)
+
+
+def convert_coords(arg):
+    """'/coords 100 64 -200 [незер|энд|верхний]' (или только X Z) -> готовый текст
+    сообщения с пересчётом Верхний мир ⇄ Незер (÷8 / ×8). None — неверный формат."""
+    tokens = (arg or "").replace(",", " ").split()
+    world = "overworld"
+    if tokens and re.fullmatch(r"[A-Za-zА-Яа-яЁё]+", tokens[-1]):
+        word = tokens.pop().lower()
+        if word in ("nether", "незер", "ад", "нижний"):
+            world = "nether"
+        elif word in ("end", "энд", "край"):
+            world = "end"
+        elif word in ("overworld", "world", "верх", "верхний", "обычный", "овер", "мир"):
+            world = "overworld"
+        else:
+            return None
+    try:
+        nums = [int(float(t)) for t in tokens]
+    except (ValueError, OverflowError):
+        return None
+    if any(abs(n) > 30000000 for n in nums):
+        return None
+    if len(nums) == 2:
+        x, z = nums
+        y = None
+    elif len(nums) == 3:
+        x, y, z = nums
+    else:
+        return None
+    names = {"overworld": "Верхний мир", "nether": "Незер", "end": "Энд"}
+    pos = f"X {x}, " + (f"Y {y}, " if y is not None else "") + f"Z {z}"
+    result = f"📍 {names[world]}: {pos}"
+    if world == "overworld":
+        result += f" → в Незере: X {x // 8}, Z {z // 8}"
+    elif world == "nether":
+        result += f" → в Верхнем мире: X {x * 8}, Z {z * 8}"
+    return result
+
+
+def format_utc_offset(minutes):
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(int(minutes)), 60)
+    return f"UTC{sign}{hours}" + (f":{mins:02d}" if mins else "")
+
+
+def trim_link_tail(url):
+    """Срезает с конца ссылки знаки, которые к ней не относятся (точка в конце
+    предложения, скобка вокруг ссылки). Закрывающая «)» остаётся, если внутри
+    ссылки есть парная «(» — как в ссылках на Википедию."""
+    while url:
+        last = url[-1]
+        if last in ".,;:!?»]}":
+            url = url[:-1]
+        elif last == ")" and url.count(")") > url.count("("):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
 class ChatWindow(ctk.CTkToplevel):
-    def __init__(self, master, mode="server", room="", relay_url=None):
+    def __init__(self, master, mode="server", room="", relay_url=None, personal_contact=None):
         super().__init__(master)
         self.master = master
         self.mode = mode
         self.role = "streamer" if mode == "server" else "viewer"
         self.room = room
         self.relay_url = (relay_url or RELAY_URL).strip() or RELAY_URL
+        self.personal_contact = personal_contact
         self.running = True
         self.connected = False
         self.client_socket = None
@@ -1931,6 +2167,15 @@ class ChatWindow(ctk.CTkToplevel):
         self.participant_count = 1
         self.max_room_size = 20
 
+        self.muted = bool(personal_contact.get("muted", False)) if personal_contact else False
+        self._input_history = []
+        self._input_history_pos = None
+        self._input_draft = ""
+        self._search_visible = False
+        self._search_matches = []
+        self._search_index = -1
+        self._search_last_query = None
+
         self.notifications_enabled = True
         self.notification_size = 100
         try:
@@ -1939,7 +2184,7 @@ class ChatWindow(ctk.CTkToplevel):
         except:
             pass
 
-        self.title("💬 Чат 67Launcher")
+        self.update_title()
         self._apply_chat_window_geometry()
         self.minsize(800, 800)
         self.resizable(True, True)
@@ -1957,6 +2202,8 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
         self.create_widgets()
+        self._clear_personal_unread()
+        self._load_personal_history()
         self.log(f"🔍 Инициализация чата в режиме: {mode} (комната «{self.room}»)")
 
         threading.Thread(target=self.run_diagnostics, daemon=True).start()
@@ -1995,24 +2242,118 @@ class ChatWindow(ctk.CTkToplevel):
         """Открывает и разворачивает ТОЛЬКО ЧАТ без разворачивания лаунчера"""
         self.deiconify()
         self.lift()
+        try:
+            # Windows не любит, когда фоновое окно выдёргивают наверх — на мгновение
+            # делаем его «поверх всех», иначе чат может остаться за чужими окнами.
+            self.attributes("-topmost", True)
+
+            def _drop_topmost():
+                try:
+                    self.attributes("-topmost", False)
+                except Exception:
+                    pass
+            self.after(300, _drop_topmost)
+        except Exception:
+            pass
         self.focus_force()
+        try:
+            self.master.active_chat_window = self
+        except Exception:
+            pass
         self.is_minimized = False
         self.unread_count = 0
         self.update_title()
+        self._clear_personal_unread()
 
     def on_minimize(self, event):
+        if event.widget is not self:
+            return  # <Unmap> прилетает и от дочерних виджетов (например, панели поиска)
         self.is_minimized = True
 
     def on_restore(self, event):
+        if event.widget is not self:
+            return
         self.is_minimized = False
         self.unread_count = 0
         self.update_title()
+        self._clear_personal_unread()
 
     def update_title(self):
-        if self.unread_count > 0:
-            self.title(f"💬 Чат 67Launcher ({self.unread_count} новых)")
+        if self.personal_contact:
+            base = f"💬 Чат с «{self.personal_contact.get('name', '???')}»"
         else:
-            self.title("💬 Чат 67Launcher")
+            base = "💬 Чат 67Launcher"
+        if self.unread_count > 0:
+            self.title(f"{base} ({self.unread_count} новых)")
+        else:
+            self.title(base)
+
+    def _update_personal_preview(self, text, mine):
+        """Обновляет превью последнего сообщения в списке «Чаты» (личных
+        переписок) и сохраняет его в launcher_settings, чтобы список не
+        сбрасывался при перезапуске лаунчера."""
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.after(0, lambda: self._update_personal_preview(text, mine))
+            except Exception:
+                pass
+            return
+        if not self.personal_contact:
+            return
+        try:
+            settings = getattr(self.master, "settings", None)
+            if settings is None:
+                return
+            contact_id = self.personal_contact.get("id")
+            contacts = settings.setdefault("personal_chats", [])
+            changed = False
+            for c in contacts:
+                if c.get("id") == contact_id:
+                    c["last_message"] = (text or "")[:200]
+                    c["last_message_time"] = datetime.now().strftime("%d.%m %H:%M")
+                    c["last_message_ts"] = datetime.now().timestamp()
+                    c["last_message_mine"] = bool(mine)
+                    c["unread"] = False if mine else True
+                    changed = True
+                    break
+            if changed:
+                save_launcher_settings(settings)
+                refresh_cb = getattr(self.master, "chats_list_refresh_callback", None)
+                if refresh_cb:
+                    try:
+                        refresh_cb()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _clear_personal_unread(self):
+        """Сбрасывает пометку «непрочитано» у этого собеседника — вызывается,
+        когда окно личного чата открыто/развёрнуто."""
+        if not self.personal_contact:
+            return
+        try:
+            settings = getattr(self.master, "settings", None)
+            if settings is None:
+                return
+            contact_id = self.personal_contact.get("id")
+            contacts = settings.setdefault("personal_chats", [])
+            changed = False
+            for c in contacts:
+                if c.get("id") == contact_id and c.get("unread"):
+                    c["unread"] = False
+                    changed = True
+                    break
+            if changed:
+                save_launcher_settings(settings)
+                refresh_cb = getattr(self.master, "chats_list_refresh_callback", None)
+                if refresh_cb:
+                    try:
+                        refresh_cb()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def show_notification(self, message, sender="", title=None, force=False):
         if threading.current_thread() is not threading.main_thread():
@@ -2024,7 +2365,7 @@ class ChatWindow(ctk.CTkToplevel):
         if self.is_minimized:
             self.unread_count += 1
             self.update_title()
-        if not force and not getattr(self, 'notifications_enabled', True):
+        if not force and (getattr(self, 'muted', False) or not getattr(self, 'notifications_enabled', True)):
             return
         try:
             scale = max(50, min(200, getattr(self, 'notification_size', 100))) / 100.0
@@ -2034,7 +2375,7 @@ class ChatWindow(ctk.CTkToplevel):
             notif.overrideredirect(True)
             notif.attributes('-topmost', True)
 
-            width, height = int(380 * scale), int(120 * scale)
+            width, height = int(380 * scale), int(132 * scale)
 
             if sys.platform == "win32":
                 try:
@@ -2069,8 +2410,18 @@ class ChatWindow(ctk.CTkToplevel):
 
             frame.bind("<Button-1>", on_notif_click)
 
+            # Маленькая подпись сверху: откуда пришло — из группового или из личного чата
+            if self.personal_contact:
+                kind_text, kind_color = "личные", "#ffb35c"
+            else:
+                kind_text, kind_color = "груп.чат", "#6fce7f"
+            kind_label = tk.Label(frame, text=kind_text, font=("Segoe UI", max(6, int(8 * scale))),
+                                  bg="#100e1a", fg=kind_color)
+            kind_label.pack(anchor="w", padx=15, pady=(6, 0))
+            kind_label.bind("<Button-1>", on_notif_click)
+
             header_frame = tk.Frame(frame, bg="#100e1a")
-            header_frame.pack(fill="x", padx=15, pady=(10, 5))
+            header_frame.pack(fill="x", padx=15, pady=(2, 5))
             header_frame.bind("<Button-1>", on_notif_click)
 
             title_color = "#6d92ff"
@@ -2221,10 +2572,10 @@ class ChatWindow(ctk.CTkToplevel):
             self.clipboard_clear()
             self.clipboard_append(ip)
             play_click()
-            messagebox.showinfo("Скопировано", f"Скопировано в буфер обмена:\n{ip}")
+            self._mb.showinfo("Скопировано", f"Скопировано в буфер обмена:\n{ip}")
         except:
             play_error()
-            messagebox.showerror("Ошибка", "Не скопировалось")
+            self._mb.showerror("Ошибка", "Не скопировалось")
 
     def open_emoji_picker(self):
         EmojiPicker(self, self.insert_emoji)
@@ -2265,10 +2616,45 @@ class ChatWindow(ctk.CTkToplevel):
 
         self.chat_display = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Consolas", size=14), height=350)
         self.chat_display.pack(fill="both", expand=True, pady=(0, 10))
-        self.chat_display.insert("1.0", "💬 Чат готов к работе...\n")
+        self.chat_display.insert("1.0", "💬 Чат готов к работе... (команды — /help, поиск — Ctrl+F)\n")
         self.chat_display.insert("end", "━" * 50 + "\n")
         self.chat_display.configure(state="disabled")
         self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")
+        self.chat_display.tag_config("chat_link", foreground="#6d92ff", underline=True)
+        self.chat_display.tag_config("chat_mention", foreground="#ffb35c")
+        self.chat_display.tag_config("search_hit", background="#4a4666")
+        self.chat_display.tag_config("search_current", background="#d9622f", foreground="#16141f")
+        self.chat_display._textbox.tag_raise("search_current")
+        self._bind_chat_links()
+
+        # Панель поиска по чату (появляется по Ctrl+F, пока скрыта)
+        self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
+        self.search_entry = ctk.CTkEntry(self.search_bar, placeholder_text="Что ищем?...", height=32)
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 6), pady=6)
+        self.search_entry.bind("<KeyRelease>", self._on_search_key)
+        self.search_entry.bind("<Return>", lambda e: self.search_step(-1))
+        self.search_entry.bind("<Shift-Return>", lambda e: self.search_step(1))
+        self.search_entry.bind("<Escape>", lambda e: self.close_search())
+        self.search_count_label = ctk.CTkLabel(self.search_bar, text="", width=90,
+                                               font=ctk.CTkFont(size=12), text_color="#a8a4bd")
+        self.search_count_label.pack(side="left", padx=(0, 6))
+        make_sound_button(self.search_bar, text="▲", command=lambda: self.search_step(-1),
+                          width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
+        make_sound_button(self.search_bar, text="▼", command=lambda: self.search_step(1),
+                          width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
+        make_sound_button(self.search_bar, text="✕", command=self.close_search,
+                          width=32, height=28, fg_color="#d3453f", hover_color="#b83530").pack(side="left", padx=(2, 8))
+
+        # Контекстное меню чата (правая кнопка мыши)
+        self._chat_menu = tk.Menu(self, tearoff=0, bg="#201d30", fg="#e5e2f0",
+                                  activebackground="#6d92ff", activeforeground="#16141f", bd=0)
+        self._chat_menu.add_command(label="📋 Скопировать выделенное", command=self.copy_selection)
+        self._chat_menu.add_command(label="📋 Скопировать весь чат", command=self.copy_all)
+        self._chat_menu.add_command(label="📋 Скопировать последнее сообщение", command=self.copy_last_message)
+        self._chat_menu.add_separator()
+        self._chat_menu.add_command(label="🔍 Найти в чате (Ctrl+F)", command=self.open_search)
+        self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
+        self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
 
         info_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         info_frame.pack(fill="x", pady=(0, 10))
@@ -2312,6 +2698,28 @@ class ChatWindow(ctk.CTkToplevel):
                                       text_color="#16141f",
                                       font=ctk.CTkFont(size=16))
         emoji_btn.pack(side="left", padx=2)
+
+        search_btn = make_sound_button(format_frame, text="🔍 Поиск",
+                                       command=self.open_search,
+                                       width=100, height=30,
+                                       fg_color="#4a4666", hover_color="#3d3a52",
+                                       font=ctk.CTkFont(size=12))
+        search_btn.pack(side="left", padx=2)
+
+        self.mute_btn = make_sound_button(format_frame,
+                                          text="🔕 Без звука" if self.muted else "🔔 Уведомления",
+                                          command=self.toggle_mute,
+                                          width=150, height=30,
+                                          fg_color="#4a4666", hover_color="#3d3a52",
+                                          font=ctk.CTkFont(size=12))
+        self.mute_btn.pack(side="left", padx=2)
+
+        help_btn = make_sound_button(format_frame, text="❓ Команды",
+                                     command=self.show_chat_help,
+                                     width=110, height=30,
+                                     fg_color="#4a4666", hover_color="#3d3a52",
+                                     font=ctk.CTkFont(size=12))
+        help_btn.pack(side="left", padx=2)
 
         input_frame = ctk.CTkFrame(input_container, fg_color="transparent")
         input_frame.pack(fill="x")
@@ -2375,10 +2783,19 @@ class ChatWindow(ctk.CTkToplevel):
                                       font=ctk.CTkFont(size=12))
         close_btn.pack(side="right")
 
+        self.message_entry.bind("<Up>", self._history_prev)
+        self.message_entry.bind("<Down>", self._history_next)
+        for seq in ("<Control-f>", "<Control-F>", "<Control-Cyrillic_a>", "<Control-Cyrillic_A>"):
+            self.bind(seq, self._on_ctrl_f)
+        self.bind("<Escape>", lambda e: self.close_search() if self._search_visible else None)
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def clear_chat(self):
-        if messagebox.askyesno("Очистка чата", "Очистить все сообщения?"):
+        question = "Точно очистить чат?"
+        if self.personal_contact:
+            question += "\n\nИстория этого чата на диске тоже сотрётся."
+        if self._mb.askyesno("Очистка чата", question):
             self.chat_display.configure(state="normal")
             self.chat_display.delete("1.0", "end")
             self.chat_display.insert("1.0", "💬 Чат очищен\n")
@@ -2386,12 +2803,16 @@ class ChatWindow(ctk.CTkToplevel):
             self.chat_display.configure(state="disabled")
             self.message_history = []
             self.update_msg_count()
+            if self.personal_contact:
+                delete_chat_history(self.personal_contact.get("id"))
+            if self._search_visible:
+                self._run_search()
             self.log("🗑️ Чат очищен")
 
     def export_chat(self):
         if not self.message_history:
             play_error()
-            messagebox.showinfo("Информация", "Экспортировать нечего, чат пустой")
+            self._mb.showinfo("Информация", "Экспортировать нечего, чат пустой")
             return
         try:
             file_path = filedialog.asksaveasfilename(
@@ -2410,22 +2831,28 @@ class ChatWindow(ctk.CTkToplevel):
                 for msg in self.message_history:
                     f.write(msg + "\n")
             play_click()
-            messagebox.showinfo("Успешно", f"Сохранил чат сюда:\n{file_path}")
+            self._mb.showinfo("Успешно", f"Сохранил чат сюда:\n{file_path}")
         except Exception as e:
             play_error()
-            messagebox.showerror("Ошибка", f"Чат не сохранился:\n{e}")
+            self._mb.showerror("Ошибка", f"Чат не сохранился:\n{e}")
 
     def update_msg_count(self):
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.after(0, self.update_msg_count)
+            except Exception:
+                pass
+            return
         count = len(self.message_history)
         if count > 0:
             self.msg_count_label.configure(text=f"📨 {count}")
         else:
             self.msg_count_label.configure(text="")
 
-    def log(self, message):
+    def log(self, message, ts=None):
         if threading.current_thread() is not threading.main_thread():
             try:
-                self.after(0, lambda: self.log(message))
+                self.after(0, lambda: self.log(message, ts))
             except:
                 pass
             return
@@ -2433,7 +2860,7 @@ class ChatWindow(ctk.CTkToplevel):
             if not self.winfo_exists():
                 return
             self.chat_display.configure(state="normal")
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            timestamp = ts or datetime.now().strftime("%H:%M:%S")
 
             start_index = self.chat_display.index("end-1c")
 
@@ -2444,39 +2871,27 @@ class ChatWindow(ctk.CTkToplevel):
 
             if ": " in clean_message:
                 possible_nick = clean_message.split(": ", 1)[0]
-                try:
-                    from __main__ import load_accounts
-                    accounts = load_accounts()
-                    for acc in accounts:
-                        if acc["username"] == possible_nick and acc.get("type") == "microsoft":
-                            is_licensed_msg = True
-                            target_nick = possible_nick
-                            break
-                except:
-                    try:
-                        accounts = load_accounts()
-                        for acc in accounts:
-                            if acc["username"] == possible_nick and acc.get("type") == "microsoft":
-                                is_licensed_msg = True
-                                target_nick = possible_nick
-                                break
-                    except:
-                        pass
+                if possible_nick in self._licensed_nicks():
+                    is_licensed_msg = True
+                    target_nick = possible_nick
 
             full_text = f"[{timestamp}] {message}\n"
             self.chat_display.insert("end", full_text)
 
             if is_licensed_msg and target_nick:
                 current_line = start_index.split('.')[0]
-                line_content = self.chat_display.get(f"{current_line}.0", f"{current_line}.end")
-                nick_start_offset = line_content.find(target_nick)
+                nick_len = tk.IntVar()
+                nick_pos = self.chat_display._textbox.search(
+                    target_nick, f"{current_line}.0", stopindex=f"{current_line}.end", count=nick_len)
+                if nick_pos and nick_len.get() > 0:
+                    self.chat_display.tag_add("gold_chat_nick", nick_pos, f"{nick_pos}+{nick_len.get()}c")
 
-                if nick_start_offset != -1:
-                    nick_start_idx = f"{current_line}.{nick_start_offset}"
-                    nick_end_idx = f"{current_line}.{nick_start_offset + len(target_nick)}"
-                    self.chat_display.tag_add("gold_chat_nick", nick_start_idx, nick_end_idx)
+            self._decorate_chat_line(start_index, message)
 
-            self.chat_display.see("end")
+            if self._search_visible and self._search_last_query:
+                self._run_search(keep_position=True)
+            if not (self._search_visible and self._search_matches):
+                self.chat_display.see("end")
             self.chat_display.configure(state="disabled")
         except Exception as e:
             print(f"Ошибка логирования в чате: {e}")
@@ -2575,14 +2990,19 @@ class ChatWindow(ctk.CTkToplevel):
             if not message.startswith("👤"):
                 self.message_history.append(message)
                 self.update_msg_count()
+                self._persist_message(message, mine=False)
                 self.log(f"💬 {message}")
 
-                if ": " in message:
+                if ": " in message and not message.startswith("* "):
                     sender, text = message.split(": ", 1)
                 else:
                     sender, text = "", message
 
-                self.show_notification(text, sender)
+                if self._mentions_me(text):
+                    self.show_notification(text, sender, title="📣 Тебя позвали")
+                else:
+                    self.show_notification(text, sender)
+                self._update_personal_preview(text, mine=False)
             else:
                 self.log(f"🔔 {message}")
                 body = message.lstrip("👤 ").strip()
@@ -2618,7 +3038,7 @@ class ChatWindow(ctk.CTkToplevel):
             max_size = data.get("max", self.max_room_size)
             self.log(f"❌ Комната «{self.room}» заполнена ({max_size}/{max_size})")
             self.connected = False
-            self.after(0, lambda: messagebox.showerror(
+            self.after(0, lambda: self._mb.showerror(
                 "Комната заполнена",
                 f"В комнате «{self.room}» уже {max_size} участников — это максимум.\n"
                 f"Попробуйте другой код комнаты или подождите, пока кто-то освободит место."
@@ -2629,7 +3049,7 @@ class ChatWindow(ctk.CTkToplevel):
                 if new_username != self.username:
                     self.log(f"ℹ️ Ник «{self.username}» уже занят в комнате — вам присвоен ник «{new_username}»")
                     self.username = new_username
-                    self.after(0, lambda: messagebox.showinfo(
+                    self.after(0, lambda: self._mb.showinfo(
                         "Ник изменён",
                         f"В комнате «{self.room}» уже есть участник с таким ником.\n"
                         f"Ваш ник в этом чате: «{new_username}»"
@@ -2637,19 +3057,583 @@ class ChatWindow(ctk.CTkToplevel):
                 else:
                     self.username = new_username
                 self.send_message_raw(f"👤 {self.username} присоединился к комнате!")
+        elif msg_type == "file_offer":
+            sender = data.get("sender", "???")
+            url = data.get("url", "")
+            filename = sanitize_shared_filename(data.get("filename", "file.bin"))
+            if sender == self.username or not url:
+                return
+            self.after(0, lambda: self.prompt_file_offer(sender, url, filename))
         else:
             self.log(f"ℹ️ Служебное сообщение от релея: {message}")
 
     def send_message(self):
-        if not self.connected or self.client_socket is None:
-            self.log("⚠️ Нет подключения к чату")
-            return
         message = self.message_entry.get().strip()
         if not message:
             return
+
+        self._remember_input(message)
+
+        if message.startswith("//"):
+            # «//текст» — обычное сообщение, которое должно начинаться с «/»
+            message = message[1:]
+        elif message.startswith("/") and self.handle_chat_command(message):
+            self.message_entry.delete(0, 'end')
+            return
+
+        if not self.connected or self.client_socket is None:
+            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            return
+
+        if message.startswith("&&share-file=") or message.startswith("&&download-all-file="):
+            url = message.split("=", 1)[1].strip()
+            self.message_entry.delete(0, 'end')
+            self.offer_file_to_room(url)
+            return
+
         full_message = f"{self.username}: {message}"
         self.send_message_raw(full_message)
         self.message_entry.delete(0, 'end')
+
+    # ───────────── История ввода (↑ / ↓) ─────────────
+    @property
+    def _mb(self):
+        return _ChatMessagebox(self)
+
+    def _set_entry_text(self, value):
+        self.message_entry.delete(0, 'end')
+        self.message_entry.insert(0, value)
+
+    def _remember_input(self, value):
+        if not self._input_history or self._input_history[-1] != value:
+            self._input_history.append(value)
+            if len(self._input_history) > 50:
+                del self._input_history[0]
+        self._input_history_pos = None
+
+    def _history_prev(self, event=None):
+        if not self._input_history:
+            return "break"
+        if self._input_history_pos is None:
+            self._input_draft = self.message_entry.get()
+            self._input_history_pos = len(self._input_history) - 1
+        elif self._input_history_pos > 0:
+            self._input_history_pos -= 1
+        self._set_entry_text(self._input_history[self._input_history_pos])
+        return "break"
+
+    def _history_next(self, event=None):
+        if self._input_history_pos is None:
+            return "break"
+        if self._input_history_pos < len(self._input_history) - 1:
+            self._input_history_pos += 1
+            self._set_entry_text(self._input_history[self._input_history_pos])
+        else:
+            self._input_history_pos = None
+            self._set_entry_text(self._input_draft)
+        return "break"
+
+    # ───────────── Команды чата (/roll, /coords, ...) ─────────────
+    def _send_line(self, full_message):
+        if not self.connected or self.client_socket is None:
+            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            return False
+        self.send_message_raw(full_message)
+        return True
+
+    def _send_as_user(self, value):
+        return self._send_line(f"{self.username}: {value}")
+
+    def handle_chat_command(self, message):
+        """True — сообщение было командой (или похоже на неё) и не должно уйти
+        собеседнику как обычный текст. False — это обычный текст."""
+        m = CHAT_COMMAND_RE.match(message)
+        if not m:
+            return False
+        name = m.group(1).lower()
+        arg = (m.group(2) or "").strip()
+        action = CHAT_COMMAND_ALIASES.get(name)
+
+        if action is None:
+            play_error()
+            self.log(f"⚠️ Команды /{name} у меня нет. Всё, что умею, — в /help. "
+                     f"А если хотел просто написать текст со «/» в начале — поставь «//».")
+            return True
+
+        if action == "help":
+            self.show_chat_help()
+        elif action == "roll":
+            spec = parse_roll_spec(arg)
+            if spec is None:
+                self.log("⚠️ Не понял, что кидать. Попробуй /roll, /roll 20 или /roll 2d6 (кубиков до 20, граней до 1000)")
+                return True
+            count, sides = spec
+            rolls, total = roll_dice(count, sides)
+            if count > 1:
+                self._send_as_user(f"🎲 бросил {count}d{sides} → " + " + ".join(map(str, rolls)) + f" = {total}")
+            else:
+                self._send_as_user(f"🎲 бросил d{sides} → {total}")
+        elif action == "flip":
+            self._send_as_user(f"🪙 подбросил монетку → {random.choice(['Орёл', 'Решка'])}")
+        elif action == "choose":
+            sep = "|" if "|" in arg else ","
+            options = [o.strip() for o in arg.split(sep) if o.strip()][:20]
+            if len(options) < 2:
+                self.log("⚠️ Из чего выбирать-то? Дай хотя бы два варианта: /choose пицца | суши")
+                return True
+            self._send_as_user(f"🎯 выбрал: {random.choice(options)} (из: {', '.join(options)})")
+        elif action == "me":
+            if not arg:
+                self.log("⚠️ А что сделал-то? Например: /me пошёл за едой")
+                return True
+            self._send_line(f"* {self.username} {arg}")
+        elif action == "shrug":
+            self._send_as_user(f"{arg} ¯\\_(ツ)_/¯".strip())
+        elif action == "time":
+            offset = datetime.now().astimezone().utcoffset()
+            minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+            self._send_as_user(f"🕒 у меня сейчас {datetime.now():%H:%M} ({format_utc_offset(minutes)})")
+        elif action == "coords":
+            result = convert_coords(arg)
+            if result is None:
+                self.log("⚠️ С координатами что-то не так. Пример: /coords 100 64 -200 (в конце можно дописать «незер» или «энд»)")
+                return True
+            self._send_as_user(result)
+        elif action == "search":
+            self.open_search(arg)
+        elif action == "clear":
+            self.clear_chat()
+        elif action == "export":
+            self.export_chat()
+        elif action == "mute":
+            self.set_muted(True)
+        elif action == "unmute":
+            self.set_muted(False)
+        elif action == "copy":
+            self.copy_last_message()
+        return True
+
+    def show_chat_help(self):
+        self._append_plain_lines([
+            "📖 Что тут вообще умеет чат:",
+            "  /roll [20 | 2d6]  — кинуть кубик (без параметров — обычный d6)",
+            "  /flip  — подбросить монетку, пусть судьба решает",
+            "  /choose пицца | суши | шаурма  — выберу за вас, не вопрос",
+            "  /time  — сказать, сколько сейчас у тебя времени",
+            "  /me пошёл за едой  — выйдет «* Ник пошёл за едой»      /shrug [текст]  — ¯\\_(ツ)_/¯",
+            "  /search слово  — найти в переписке (или Ctrl+F)      /copy  — скопировать последнее сообщение",
+            "  /clear  — почистить чат      /export  — сохранить переписку в файл",
+            "  /mute и /unmute  — заглушить этот чат или вернуть уведомления",
+            "  ↑ / ↓ в поле ввода  — достать то, что уже писал",
+            "  @ник в сообщении  — человеку придёт уведомление, а строка подсветится",
+            "  Ссылки в чате кликаются, а по правой кнопке мыши можно копировать",
+            "━" * 50,
+        ])
+
+    def _append_plain_lines(self, lines):
+        """Служебные строки без метки времени (справка, разделители истории).
+        Только из главного потока."""
+        try:
+            self.chat_display.configure(state="normal")
+            for line in lines:
+                self.chat_display.insert("end", line + "\n")
+            self.chat_display.see("end")
+            self.chat_display.configure(state="disabled")
+        except Exception:
+            pass
+
+    # ───────────── История переписки на диске ─────────────
+    def _persist_message(self, message, mine):
+        if not self.personal_contact:
+            return
+        append_chat_history(self.personal_contact.get("id"), message, mine)
+
+    def _load_personal_history(self):
+        if not self.personal_contact:
+            return
+        entries = load_chat_history(self.personal_contact.get("id"))
+        if not entries:
+            return
+        self._append_plain_lines([f"── Прошлая переписка (последние {len(entries)}) ──"])
+        today = datetime.now().date()
+        for entry in entries:
+            try:
+                dt = datetime.fromtimestamp(entry["ts"])
+                stamp = dt.strftime("%H:%M:%S") if dt.date() == today else dt.strftime("%d.%m %H:%M")
+            except Exception:
+                stamp = "--:--"
+            self.log(f"{'📤' if entry['mine'] else '💬'} {entry['text']}", ts=stamp)
+            self.message_history.append(entry["text"])
+        self.update_msg_count()
+        self._append_plain_lines(["── а дальше уже новое ──", "━" * 50])
+
+    # ───────────── Упоминания и уведомления ─────────────
+    def _licensed_nicks(self):
+        """Ники лицензионных аккаунтов (для золотого цвета). Кэш на 5 секунд, чтобы
+        при загрузке истории не читать accounts.json на каждую строку."""
+        now = time.time()
+        cache = getattr(self, "_licensed_cache", None)
+        if cache is None or now - cache[0] > 5:
+            try:
+                nicks = {a.get("username") for a in load_accounts() if a.get("type") == "microsoft"}
+            except Exception:
+                nicks = set()
+            self._licensed_cache = (now, nicks)
+            return nicks
+        return cache[1]
+
+    def _mentions_me(self, value):
+        name = (self.username or "").strip().lower()
+        return bool(name) and f"@{name}" in (value or "").lower()
+
+    def toggle_mute(self):
+        self.set_muted(not self.muted)
+
+    def set_muted(self, value):
+        self.muted = bool(value)
+        if self.personal_contact:
+            try:
+                self.personal_contact["muted"] = self.muted
+                settings = getattr(self.master, "settings", None)
+                if settings is not None:
+                    cid = self.personal_contact.get("id")
+                    for c in settings.setdefault("personal_chats", []):
+                        if c.get("id") == cid:
+                            c["muted"] = self.muted
+                            break
+                    save_launcher_settings(settings)
+            except Exception:
+                pass
+        try:
+            self.mute_btn.configure(text="🔕 Без звука" if self.muted else "🔔 Уведомления")
+        except Exception:
+            pass
+        self.log("🔕 Всё, этот чат теперь молчит" if self.muted
+                 else "🔔 Ок, уведомления снова включены")
+
+    # ───────────── Ссылки и подсветка строк ─────────────
+    def _bind_chat_links(self):
+        tw = self.chat_display._textbox
+        tw.tag_bind("chat_link", "<ButtonRelease-1>", self._on_link_click)
+        tw.tag_bind("chat_link", "<Enter>", lambda e: tw.configure(cursor="hand2"))
+        tw.tag_bind("chat_link", "<Leave>", lambda e: tw.configure(cursor="xterm"))
+
+    def _decorate_chat_line(self, start_index, message):
+        """Подсвечивает ссылки и упоминания в только что вставленной строке.
+        Используется поиск самого Tk (а не смещения из Python), поэтому эмодзи
+        в начале строки не сбивают позиции."""
+        try:
+            tw = self.chat_display._textbox
+            if message.startswith("💬") and self._mentions_me(message):
+                tw.tag_add("chat_mention", f"{start_index} linestart", f"{start_index} lineend")
+
+            count_var = tk.IntVar()
+            pos = start_index
+            line_end = f"{start_index} lineend"
+            while True:
+                hit = tw.search(CHAT_URL_PATTERN, pos, stopindex=line_end,
+                                regexp=True, count=count_var)
+                length = count_var.get()
+                if not hit or length <= 0:
+                    break
+                found = tw.get(hit, f"{hit}+{length}c")
+                trimmed = len(found) - len(trim_link_tail(found))
+                end = f"{hit}+{max(1, length - trimmed)}c"
+                tw.tag_add("chat_link", hit, end)
+                pos = f"{hit}+{length}c"
+        except Exception:
+            pass
+
+    def _on_link_click(self, event):
+        tw = self.chat_display._textbox
+        try:
+            if tw.tag_ranges("sel"):
+                return  # человек выделяет текст, а не жмёт на ссылку
+            idx = tw.index(f"@{event.x},{event.y}")
+            rng = tw.tag_prevrange("chat_link", f"{idx}+1c")
+            if not rng:
+                return
+            url = tw.get(rng[0], rng[1]).strip()
+        except tk.TclError:
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            return
+        if self._mb.askyesno(
+            "🔗 Открыть ссылку?",
+            f"Открыть эту ссылку в браузере?\n\n{url}\n\n"
+            f"Что там внутри, я не проверяю — так что смотри сам."
+        ):
+            webbrowser.open(url)
+
+    # ───────────── Поиск по чату (Ctrl+F) ─────────────
+    def _on_ctrl_f(self, event=None):
+        self.open_search()
+        return "break"
+
+    def open_search(self, query=""):
+        if not self._search_visible:
+            self.search_bar.pack(fill="x", pady=(0, 6), before=self.chat_display)
+            self._search_visible = True
+        self.search_entry.focus_set()
+        if query:
+            self.search_entry.delete(0, 'end')
+            self.search_entry.insert(0, query)
+            self._run_search()
+        else:
+            try:
+                self.search_entry._entry.select_range(0, 'end')
+            except Exception:
+                pass
+
+    def close_search(self):
+        if not self._search_visible:
+            return "break"
+        try:
+            tw = self.chat_display._textbox
+            tw.tag_remove("search_hit", "1.0", "end")
+            tw.tag_remove("search_current", "1.0", "end")
+            self.search_bar.pack_forget()
+        except Exception:
+            pass
+        self._search_visible = False
+        self._search_matches = []
+        self._search_index = -1
+        self._search_last_query = None
+        self.chat_display.see("end")
+        self.message_entry.focus_set()
+        return "break"
+
+    def _on_search_key(self, event=None):
+        if self.search_entry.get() != self._search_last_query:
+            self._run_search()
+
+    def _run_search(self, keep_position=False):
+        tw = self.chat_display._textbox
+        query = self.search_entry.get()
+        prev_start = None
+        if keep_position and 0 <= self._search_index < len(self._search_matches):
+            prev_start = self._search_matches[self._search_index][0]
+        self._search_last_query = query
+        tw.tag_remove("search_hit", "1.0", "end")
+        tw.tag_remove("search_current", "1.0", "end")
+        self._search_matches = []
+        self._search_index = -1
+        if not query:
+            self.search_count_label.configure(text="")
+            return
+        count_var = tk.IntVar()
+        pos = "1.0"
+        while len(self._search_matches) < 1000:
+            hit = tw.search(query, pos, stopindex="end", nocase=True, count=count_var)
+            length = count_var.get()
+            if not hit or length <= 0:
+                break
+            end = f"{hit}+{length}c"
+            tw.tag_add("search_hit", hit, end)
+            self._search_matches.append((hit, end))
+            pos = end
+        if self._search_matches:
+            index = len(self._search_matches) - 1  # по умолчанию — самое свежее совпадение
+            if prev_start is not None:
+                for i, (start, _end) in enumerate(self._search_matches):
+                    if start == prev_start:
+                        index = i
+                        break
+            self._search_index = index
+            self._show_search_current(scroll=not keep_position)
+        else:
+            self.search_count_label.configure(text="не нашёл")
+
+    def search_step(self, direction):
+        """direction = -1 — к более старому совпадению (вверх), +1 — к более новому."""
+        if self._search_matches:
+            self._search_index = (self._search_index + direction) % len(self._search_matches)
+            self._show_search_current()
+        return "break"
+
+    def _show_search_current(self, scroll=True):
+        tw = self.chat_display._textbox
+        tw.tag_remove("search_current", "1.0", "end")
+        start, end = self._search_matches[self._search_index]
+        tw.tag_add("search_current", start, end)
+        if scroll:
+            tw.see(start)
+        self.search_count_label.configure(text=f"{self._search_index + 1}/{len(self._search_matches)}")
+
+    # ───────────── Копирование ─────────────
+    def _show_chat_menu(self, event):
+        try:
+            self._chat_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._chat_menu.grab_release()
+
+    def _copy_to_clipboard(self, value, what):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            play_click()
+            self.log(f"📋 Готово, скопировал: {what}")
+        except Exception as e:
+            play_error()
+            self.log(f"❌ Не получилось скопировать: {e}")
+
+    def copy_selection(self):
+        try:
+            value = self.chat_display._textbox.get("sel.first", "sel.last")
+        except tk.TclError:
+            value = ""
+        if not value.strip():
+            self.log("ℹ️ Сначала выдели что-нибудь в чате")
+            return
+        self._copy_to_clipboard(value, "выделенное")
+
+    def copy_all(self):
+        value = self.chat_display.get("1.0", "end").strip()
+        if value:
+            self._copy_to_clipboard(value, "весь чат")
+
+    def copy_last_message(self):
+        if not self.message_history:
+            self.log("ℹ️ Пока и копировать нечего — сообщений нет")
+            return
+        last = self.message_history[-1]
+        self._copy_to_clipboard(last.split(": ", 1)[1] if ": " in last else last, "последнее сообщение")
+
+    def offer_file_to_room(self, url):
+        """Рассылает ВСЕМ в комнате предложение скачать файл по ссылке.
+        Ничего не скачивается автоматически — у каждого получателя появится
+        диалог с подтверждением (см. prompt_file_offer)."""
+        if not self.connected or self.client_socket is None:
+            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            return
+
+        if not (url.startswith("http://") or url.startswith("https://")):
+            play_error()
+            self._mb.showwarning(
+                "Некорректная ссылка",
+                "Ссылка на файл должна начинаться с http:// или https://"
+            )
+            return
+
+        filename = sanitize_shared_filename(os.path.basename(url.split("?", 1)[0]))
+
+        if not self._mb.askyesno(
+            "📎 Поделиться файлом",
+            f"Предложить всем в комнате «{self.room}» скачать файл?\n\n"
+            f"Имя: {filename}\n"
+            f"Ссылка: {url}\n\n"
+            f"Файл никому не скачается автоматически — каждый участник увидит "
+            f"запрос и сам решит, принимать или нет."
+        ):
+            return
+
+        payload = {
+            "type": "file_offer",
+            "sender": self.username,
+            "url": url,
+            "filename": filename,
+        }
+        try:
+            self.client_socket.send(json.dumps(payload))
+            self.log(f"📤 Предложил файл «{filename}» всем в комнате ({url})")
+            self.message_history.append(f"{self.username} предложил файл: {filename}")
+            self.update_msg_count()
+            self._persist_message(f"📎 {self.username} предложил файл: {filename}", mine=True)
+            self._update_personal_preview(f"📎 Файл: {filename}", mine=True)
+            play_click()
+        except Exception as e:
+            self.log(f"❌ Не удалось отправить предложение файла: {e}")
+            self.disconnect()
+
+    def prompt_file_offer(self, sender, url, filename):
+        """Показывает получателю запрос на скачивание файла, предложенного
+        собеседником. Скачивание начинается только после явного согласия."""
+        self.log(f"📥 «{sender}» хочет поделиться файлом «{filename}»")
+        self.show_notification(f"«{sender}» хочет поделиться файлом «{filename}»", "📎 Файл от игрока")
+        self._update_personal_preview(f"📎 Файл: {filename}", mine=False)
+        self._persist_message(f"📎 {sender} предложил файл: {filename}", mine=False)
+
+        warn = ""
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in (".exe", ".msi", ".bat", ".cmd", ".scr", ".dll", ".ps1", ".vbs", ".jar", ".com"):
+            warn = (
+                "\n\n⚠️ Это исполняемый файл. Скачивайте его, только если полностью "
+                "доверяете отправителю — лаунчер не проверяет, что реально находится по ссылке."
+            )
+
+        accept = self._mb.askyesno(
+            "📎 Игрок хочет поделиться файлом",
+            f"Игрок «{sender}» хочет поделиться файлом:\n\n"
+            f"Имя: {filename}\n"
+            f"Ссылка: {url}\n\n"
+            f"Скачать его в папку download рядом с лаунчером?"
+            f"{warn}"
+        )
+        if not accept:
+            self.log(f"🚫 Отклонил файл «{filename}» от «{sender}»")
+            return
+
+        play_click()
+        self.log(f"⏳ Скачиваю «{filename}» от «{sender}»...")
+        threading.Thread(
+            target=self._download_offered_file, args=(sender, url, filename), daemon=True
+        ).start()
+
+    def _download_offered_file(self, sender, url, filename):
+        MAX_SIZE = 500 * 1024 * 1024  # 500 МБ — защита от случайного заполнения диска
+
+        try:
+            download_dir = os.path.join(get_launcher_dir(), "download")
+            os.makedirs(download_dir, exist_ok=True)
+
+            dest_path = os.path.join(download_dir, filename)
+            base, ext = os.path.splitext(dest_path)
+            counter = 1
+            while os.path.exists(dest_path):
+                dest_path = f"{base} ({counter}){ext}"
+                counter += 1
+
+            with requests.get(url, stream=True, timeout=15) as r:
+                r.raise_for_status()
+
+                content_length = r.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_SIZE:
+                    self.after(0, lambda: (play_error(), self._mb.showerror(
+                        "Файл слишком большой",
+                        f"Файл «{filename}» больше 500 МБ — скачивание отменено."
+                    )))
+                    return
+
+                downloaded = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > MAX_SIZE:
+                            f.close()
+                            try:
+                                os.remove(dest_path)
+                            except Exception:
+                                pass
+                            self.after(0, lambda: (play_error(), self._mb.showerror(
+                                "Файл слишком большой",
+                                f"Файл «{filename}» больше 500 МБ — скачивание прервано."
+                            )))
+                            return
+                        f.write(chunk)
+
+            self.log(f"✅ Файл «{filename}» от «{sender}» скачан: {dest_path}")
+            self.after(0, lambda: self.show_notification(
+                f"Файл «{filename}» от «{sender}» сохранён в папку download", "✅ Файл скачан"
+            ))
+        except Exception as e:
+            error_text = str(e)
+            self.log(f"❌ Не удалось скачать файл «{filename}»: {error_text}")
+            self.after(0, lambda: (play_error(), self._mb.showerror(
+                "Ошибка скачивания",
+                f"Не удалось скачать файл «{filename}»:\n{error_text}"
+            )))
 
     def send_message_raw(self, message):
         try:
@@ -2658,7 +3642,10 @@ class ChatWindow(ctk.CTkToplevel):
                 if not message.startswith("👤"):
                     self.message_history.append(message)
                     self.update_msg_count()
+                    self._persist_message(message, mine=True)
                     self.log(f"📤 {message}")
+                    text = message.split(": ", 1)[1] if ": " in message and not message.startswith("* ") else message
+                    self._update_personal_preview(text, mine=True)
 
         except Exception as e:
             self.log(f"❌ Ошибка отправки: {e}")
@@ -2729,7 +3716,7 @@ class ChatWindow(ctk.CTkToplevel):
         """Настоящий выход из комнаты: разрывает соединение, уведомляет
         собеседника и полностью закрывает окно чата (в отличие от
         «Закрыть чат», который просто сворачивает окно в фон)."""
-        if not messagebox.askyesno(
+        if not self._mb.askyesno(
             "Выйти из комнаты",
             f"Выйти из комнаты «{self.room}»?\n"
             f"Соединение будет разорвано, окно чата закроется."
@@ -2742,6 +3729,13 @@ class ChatWindow(ctk.CTkToplevel):
         try:
             if hasattr(self.master, 'active_chat_window') and self.master.active_chat_window is self:
                 self.master.active_chat_window = None
+        except:
+            pass
+        try:
+            if self.personal_contact and hasattr(self.master, 'active_chat_windows'):
+                cid = self.personal_contact.get("id")
+                if self.master.active_chat_windows.get(cid) is self:
+                    del self.master.active_chat_windows[cid]
         except:
             pass
         try:
@@ -2863,6 +3857,40 @@ def _make_dropdown_chevron_image(size=14, thickness=2,
         return img
 
     return ctk.CTkImage(light_image=draw(color_light), dark_image=draw(color_dark), size=(size, size))
+
+
+_AVATAR_COLORS = ["#6d92ff", "#6fce7f", "#d9622f", "#d3453f", "#a56fe0", "#e0a13f", "#4fb8c9", "#e05fa0"]
+
+
+def make_avatar_image(label_text, size=44):
+    """Рисует круглый цветной аватар с первой буквой имени/ника — используется
+    в списке личных чатов, когда у собеседника нет своей картинки профиля."""
+    label_text = (label_text or "?").strip()
+    initial = label_text[0].upper() if label_text else "?"
+    color = _AVATAR_COLORS[sum(ord(c) for c in label_text) % len(_AVATAR_COLORS)]
+
+    scale = 4
+    big = size * scale
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((0, 0, big - 1, big - 1), fill=color)
+
+    try:
+        font = ImageFont.truetype("arialbd.ttf", int(big * 0.45))
+    except Exception:
+        font = ImageFont.load_default()
+
+    try:
+        bbox = d.textbbox((0, 0), initial, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        d.text(((big - text_w) / 2 - bbox[0], (big - text_h) / 2 - bbox[1]),
+               initial, fill="#16141f", font=font)
+    except Exception:
+        pass
+
+    img = img.resize((size, size), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
 
 
 class SearchableComboBox(ctk.CTkFrame):
@@ -3102,10 +4130,14 @@ class LauncherApp(ctk.CTk):
         LauncherApp.instance = self
         LauncherApp.setup_tray_icons(self)
         self.settings = load_launcher_settings()
+        ensure_user_id(self.settings)
+        self.settings.setdefault("personal_chats", [])
         self.stats = load_stats()
         self._secret_launcher = None
         self.game_console = None
         self.active_chat_window = None
+        self.active_chat_windows = {}
+        self.chats_list_refresh_callback = None
 
         threading.Thread(target=fetch_active_relay_url, daemon=True).start()
 
@@ -3211,12 +4243,18 @@ class LauncherApp(ctk.CTk):
     @staticmethod
     def setup_tray_icons(launcher_app):
         def show_chat_only(icon, item):
-            if hasattr(launcher_app, 'active_chat_window') and launcher_app.active_chat_window:
-                launcher_app.active_chat_window.after(0, launcher_app.active_chat_window.restore_chat_only)
+            launcher_app.after(0, lambda: launcher_app.open_chat_from_tray(icon))
+
+        def show_all_chats(icon, item):
+            launcher_app.after(0, lambda: launcher_app.open_chat_from_tray(icon, show_all=True))
+
+        def hide_chats(icon, item):
+            launcher_app.after(0, launcher_app.hide_chats_from_tray)
 
         chat_menu = pystray.Menu(
             pystray.MenuItem("💬 Открыть Чат", show_chat_only, default=True),
-            pystray.MenuItem("❌ Закрыть чат", lambda icon, item: launcher_app.active_chat_window.withdraw() if launcher_app.active_chat_window else None)
+            pystray.MenuItem("📚 Показать все чаты", show_all_chats),
+            pystray.MenuItem("❌ Скрыть чаты", hide_chats)
         )
         chat_icon = pystray.Icon("67_chat", LauncherApp.create_emoji_icon("💬"), "Чат 67Launcher", chat_menu)
 
@@ -3236,6 +4274,55 @@ class LauncherApp(ctk.CTk):
 
         threading.Thread(target=chat_icon.run, daemon=True).start()
         threading.Thread(target=launcher_icon.run, daemon=True).start()
+
+    def _live_chat_windows(self):
+        """Окна чатов (и комнаты, и личные), которые ещё существуют.
+        Вызывать только из главного потока."""
+        windows, seen = [], set()
+        for w in list(self.active_chat_windows.values()) + [self.active_chat_window]:
+            if w is None or id(w) in seen:
+                continue
+            seen.add(id(w))
+            try:
+                if w.winfo_exists():
+                    windows.append(w)
+            except Exception:
+                pass
+        return windows
+
+    def open_chat_from_tray(self, icon=None, show_all=False):
+        """Клик по иконке чата в трее (в главном потоке). По умолчанию открывает тот
+        чат, где есть новые сообщения, а если таких нет — с которым работали последним."""
+        windows = self._live_chat_windows()
+        if not windows:
+            self.log("ℹ️ Нажали на иконку чата, но открытых чатов нет")
+            try:
+                if icon is not None:
+                    icon.notify("Чат сейчас не запущен. Открой его в лаунчере кнопкой «Чат».",
+                                "Чат 67Launcher")
+            except Exception:
+                pass
+            return
+        if show_all:
+            targets = windows
+        else:
+            with_unread = [w for w in windows if getattr(w, "unread_count", 0) > 0
+                           or (getattr(w, "personal_contact", None) or {}).get("unread")]
+            last = self.active_chat_window if self.active_chat_window in windows else windows[-1]
+            targets = [with_unread[0] if with_unread else last]
+        for w in targets:
+            try:
+                w.restore_chat_only()
+            except Exception as e:
+                self.log(f"❌ Чат из трея не открылся: {e}")
+
+    def hide_chats_from_tray(self):
+        for w in self._live_chat_windows():
+            try:
+                w.withdraw()
+                w.is_minimized = True
+            except Exception:
+                pass
 
     def update_combo_text_color(self, selected_username=None):
         if not selected_username:
@@ -6194,7 +7281,8 @@ class LauncherApp(ctk.CTk):
 
         def _save_setup_size_and_close():
             _save_setup_size_only()
-            dialog.destroy()
+            self.chats_list_refresh_callback = None
+            release_and_destroy(dialog)
 
         dialog.protocol("WM_DELETE_WINDOW", _save_setup_size_and_close)
 
@@ -6208,10 +7296,52 @@ class LauncherApp(ctk.CTk):
         main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(main_frame, text="💬 Настройка чата",
+        ctk.CTkLabel(main_frame, text="💬 Чат",
                      font=ctk.CTkFont(size=24, weight="bold"), text_color="#6d92ff").pack(pady=(0, 10))
 
-        relay_frame = ctk.CTkFrame(main_frame, fg_color="#100e1a", corner_radius=10)
+        switch_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        switch_frame.pack(fill="x", pady=(0, 12))
+
+        def switch_view(view, user_action=True):
+            if view == "group":
+                chats_container.pack_forget()
+                group_container.pack(fill="both", expand=True)
+                group_btn.configure(fg_color="#6d92ff", hover_color="#5a7dd8")
+                chats_btn.configure(fg_color="#2b2840", hover_color="#3d3a52")
+                self.chats_list_refresh_callback = None
+            else:
+                group_container.pack_forget()
+                chats_container.pack(fill="both", expand=True)
+                chats_btn.configure(fg_color="#6d92ff", hover_color="#5a7dd8")
+                group_btn.configure(fg_color="#2b2840", hover_color="#3d3a52")
+                self.chats_list_refresh_callback = refresh_chats_list
+                refresh_chats_list()
+            if user_action:
+                play_click()
+                # запоминаем выбранную вкладку, чтобы в следующий раз окно открылось на ней же
+                if self.settings.get("chat_setup_last_view") != view:
+                    self.settings["chat_setup_last_view"] = view
+                    save_launcher_settings(self.settings)
+
+        group_btn = make_sound_button(switch_frame, text="👥 Групповой чат",
+                                      command=lambda: switch_view("group"),
+                                      fg_color="#6d92ff", hover_color="#5a7dd8",
+                                      height=36, font=ctk.CTkFont(size=13, weight="bold"))
+        group_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        chats_btn = make_sound_button(switch_frame, text="💌 Чаты (новое!)",
+                                      command=lambda: switch_view("chats"),
+                                      fg_color="#2b2840", hover_color="#3d3a52",
+                                      height=36, font=ctk.CTkFont(size=13, weight="bold"))
+        chats_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        group_container = ctk.CTkFrame(main_frame, fg_color="transparent")
+        group_container.pack(fill="both", expand=True)
+
+        chats_container = ctk.CTkFrame(main_frame, fg_color="transparent")
+        # chats_container изначально не упакован — показывается через switch_view("chats")
+
+        relay_frame = ctk.CTkFrame(group_container, fg_color="#100e1a", corner_radius=10)
         relay_frame.pack(fill="x", pady=(0, 10))
 
         ctk.CTkLabel(relay_frame, text="🌍 ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЛЕЙ (работает через интернет, без проброса портов):",
@@ -6247,7 +7377,7 @@ class LauncherApp(ctk.CTk):
                      font=ctk.CTkFont(size=10), text_color="#8b87a3",
                      wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
 
-        instr_frame = ctk.CTkFrame(main_frame, fg_color="#201d30", corner_radius=10)
+        instr_frame = ctk.CTkFrame(group_container, fg_color="#201d30", corner_radius=10)
         instr_frame.pack(fill="x", pady=(0, 10))
 
         ctk.CTkLabel(instr_frame, text="📝 КАК ПОДКЛЮЧИТЬСЯ:",
@@ -6265,7 +7395,7 @@ class LauncherApp(ctk.CTk):
                      font=ctk.CTkFont(size=12), text_color="#e5e2f0",
                      justify="left", wraplength=520).pack(pady=5, padx=10)
 
-        mode_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        mode_frame = ctk.CTkFrame(group_container, fg_color="transparent")
         mode_frame.pack(fill="x", pady=(0, 10))
 
         ctk.CTkLabel(mode_frame, text="Кто ты в этой схеме:",
@@ -6283,7 +7413,7 @@ class LauncherApp(ctk.CTk):
                                        font=ctk.CTkFont(size=13))
         client_rb.pack(anchor="w", pady=3)
 
-        settings_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        settings_frame = ctk.CTkFrame(group_container, fg_color="transparent")
         settings_frame.pack(fill="x", pady=(0, 10))
 
         room_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
@@ -6309,7 +7439,7 @@ class LauncherApp(ctk.CTk):
                                           font=ctk.CTkFont(size=11))
         copy_room_btn.pack(side="left", padx=(5, 0))
 
-        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame = ctk.CTkFrame(group_container, fg_color="transparent")
         btn_frame.pack(fill="x", pady=(5, 0))
 
         def open_chat_and_finish(mode, room, relay_url):
@@ -6319,7 +7449,8 @@ class LauncherApp(ctk.CTk):
             except:
                 pass
             _save_setup_size_only()
-            dialog.destroy()
+            self.chats_list_refresh_callback = None
+            release_and_destroy(dialog)
             chat_window = ChatWindow(self, mode, room, relay_url=relay_url)
             self.active_chat_window = chat_window
             self.log(f"💬 Чат открыт в режиме: {mode}, комната: {room}, релей: {relay_url}")
@@ -6399,6 +7530,253 @@ class LauncherApp(ctk.CTk):
                                        fg_color="#d3453f", hover_color="#b83530", height=50,
                                        font=ctk.CTkFont(size=16, weight="bold"))
         cancel_btn.pack(side="right", fill="x", expand=True)
+
+        # ------------------------------------------------------------------
+        # Вкладка «Чаты» — личные переписки один на один, как в мессенджере.
+        # Список контактов хранится в launcher_settings и переживает
+        # перезапуск лаунчера (ничего не удаляется при закрытии).
+        # ------------------------------------------------------------------
+
+        my_user_id = ensure_user_id(self.settings)
+
+        my_id_frame = ctk.CTkFrame(chats_container, fg_color="#100e1a", corner_radius=10)
+        my_id_frame.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(my_id_frame, text="🆔 Твой личный ID — дай его другу, чтобы он тебя добавил:",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color="#6fce7f",
+                     wraplength=520, justify="center").pack(pady=(8, 4), padx=10)
+
+        my_id_row = ctk.CTkFrame(my_id_frame, fg_color="transparent")
+        my_id_row.pack(pady=(0, 8), padx=10, fill="x")
+
+        my_id_entry = ctk.CTkEntry(my_id_row, height=32, font=ctk.CTkFont(size=13, weight="bold"),
+                                   justify="center")
+        my_id_entry.insert(0, my_user_id)
+        my_id_entry.configure(state="disabled")
+        my_id_entry.pack(side="left", fill="x", expand=True)
+
+        copy_my_id_btn = make_sound_button(my_id_row, text="📋 Копировать",
+                                           command=lambda: self.copy_ip_to_clipboard(my_user_id),
+                                           width=110, height=32,
+                                           fg_color="#6d92ff", hover_color="#5a7dd8",
+                                           font=ctk.CTkFont(size=11))
+        copy_my_id_btn.pack(side="left", padx=(6, 0))
+
+        add_user_btn = make_sound_button(chats_container, text="➕ Добавить пользователя",
+                                         command=lambda: open_add_contact_dialog(),
+                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                                         font=ctk.CTkFont(size=14, weight="bold"), height=42)
+        add_user_btn.pack(fill="x", pady=(0, 10))
+
+        chats_scroll = ctk.CTkScrollableFrame(chats_container, fg_color="#100e1a", corner_radius=10)
+        chats_scroll.pack(fill="both", expand=True)
+
+        def remove_contact(contact):
+            if not messagebox.askyesno(
+                "Удалить чат",
+                f"Удалить переписку с «{contact.get('name')}»?\n\n"
+                f"История хранится только у вас локально — у собеседника его копия чата останется."
+            ):
+                return
+            contacts = self.settings.get("personal_chats", [])
+            self.settings["personal_chats"] = [c for c in contacts if c.get("id") != contact.get("id")]
+            save_launcher_settings(self.settings)
+            delete_chat_history(contact.get("id"))
+            play_click()
+            refresh_chats_list()
+
+        def open_personal_chat_and_finish(contact):
+            their_id = contact.get("id")
+
+            existing = self.active_chat_windows.get(their_id)
+            if existing:
+                try:
+                    if existing.winfo_exists():
+                        existing.restore_chat_only()
+                        self.active_chat_window = existing
+                        _save_setup_size_and_close()
+                        return
+                except:
+                    pass
+
+            room = "dm-" + "-".join(sorted([my_user_id, their_id]))
+            relay_url = relay_entry.get().strip() or RELAY_URL
+
+            def do_negotiate():
+                try:
+                    active, _count, _max_size = check_room_active(relay_url, room, timeout=5)
+                    negotiated_mode = "client" if active else "server"
+                except Exception:
+                    negotiated_mode = "server"
+
+                def after_negotiate():
+                    try:
+                        self.settings["custom_relay_url"] = relay_url if relay_url != RELAY_URL else ""
+                        save_launcher_settings(self.settings)
+                    except:
+                        pass
+                    _save_setup_size_only()
+                    self.chats_list_refresh_callback = None
+                    release_and_destroy(dialog)
+                    chat_window = ChatWindow(self, negotiated_mode, room, relay_url=relay_url,
+                                             personal_contact=contact)
+                    self.active_chat_window = chat_window
+                    self.active_chat_windows[their_id] = chat_window
+                    self.log(f"💬 Личный чат с «{contact.get('name')}» открыт (комната {room})")
+
+                try:
+                    dialog.after(0, after_negotiate)
+                except:
+                    pass
+
+            threading.Thread(target=do_negotiate, daemon=True).start()
+
+        def refresh_chats_list():
+            try:
+                for w in chats_scroll.winfo_children():
+                    w.destroy()
+            except:
+                return
+
+            contacts = self.settings.get("personal_chats", [])
+            if not contacts:
+                ctk.CTkLabel(chats_scroll,
+                             text="Здесь пока пусто.\nНажми «Добавить пользователя», чтобы начать переписку.",
+                             font=ctk.CTkFont(size=13), text_color="#8b87a3",
+                             justify="center").pack(pady=30)
+                return
+
+            contacts_sorted = sorted(contacts, key=lambda c: c.get("last_message_ts", 0), reverse=True)
+            for contact in contacts_sorted:
+                row = ctk.CTkFrame(chats_scroll, fg_color="#201d30", corner_radius=10, cursor="hand2")
+                row.pack(fill="x", pady=4, padx=4)
+
+                display_name = contact.get("name") or contact.get("id", "???")
+
+                avatar_lbl = ctk.CTkLabel(row, image=make_avatar_image(display_name), text="", cursor="hand2")
+                avatar_lbl.pack(side="left", padx=(10, 8), pady=10)
+
+                text_col = ctk.CTkFrame(row, fg_color="transparent", cursor="hand2")
+                text_col.pack(side="left", fill="both", expand=True, pady=8)
+
+                name_row = ctk.CTkFrame(text_col, fg_color="transparent", cursor="hand2")
+                name_row.pack(fill="x")
+
+                ctk.CTkLabel(name_row, text=display_name, font=ctk.CTkFont(size=14, weight="bold"),
+                            anchor="w", cursor="hand2").pack(side="left")
+
+                if contact.get("unread"):
+                    ctk.CTkLabel(name_row, text="●", text_color="#6d92ff",
+                                font=ctk.CTkFont(size=14), cursor="hand2").pack(side="left", padx=(6, 0))
+
+                ctk.CTkLabel(name_row, text=contact.get("last_message_time", ""),
+                            font=ctk.CTkFont(size=11), text_color="#8b87a3",
+                            cursor="hand2").pack(side="right")
+
+                preview_row = ctk.CTkFrame(text_col, fg_color="transparent", cursor="hand2")
+                preview_row.pack(fill="x", pady=(2, 0))
+
+                last_message = contact.get("last_message", "")
+                if last_message and contact.get("last_message_mine"):
+                    ctk.CTkLabel(preview_row, text="✓✓", font=ctk.CTkFont(size=11),
+                                text_color="#6d92ff", cursor="hand2").pack(side="left", padx=(0, 4))
+
+                preview_text = last_message[:60] if last_message else "Нажми, чтобы начать переписку"
+                ctk.CTkLabel(preview_row, text=preview_text, font=ctk.CTkFont(size=12),
+                            text_color="#8b87a3" if last_message else "#6d6785",
+                            anchor="w", cursor="hand2").pack(side="left", fill="x")
+
+                del_btn = make_sound_button(row, text="🗑️", command=lambda c=contact: remove_contact(c),
+                                            width=32, height=32, fg_color="transparent",
+                                            hover_color="#3d3a52", font=ctk.CTkFont(size=13))
+                del_btn.pack(side="right", padx=(0, 8))
+
+                def _bind_open(widget, c=contact):
+                    widget.bind("<Button-1>", lambda e: open_personal_chat_and_finish(c))
+
+                # Кликабельны сама строка, аватар и текстовый блок с его
+                # надписями — но НЕ кнопка удаления (она сидит отдельным
+                # прямым потомком row, поэтому row.winfo_children() здесь
+                # намеренно не обходится, чтобы не перехватить её клик).
+                clickable_widgets = [row, avatar_lbl, text_col, name_row, preview_row]
+                clickable_widgets += name_row.winfo_children()
+                clickable_widgets += preview_row.winfo_children()
+                for widget in clickable_widgets:
+                    _bind_open(widget)
+
+        def open_add_contact_dialog():
+            add_dialog = ctk.CTkToplevel(dialog)
+            add_dialog.title("➕ Добавить пользователя")
+            add_dialog.geometry("420x320")
+            add_dialog.resizable(False, False)
+            add_dialog.grab_set()
+            add_dialog.transient(dialog)
+
+            frame = ctk.CTkFrame(add_dialog, fg_color="transparent")
+            frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+            ctk.CTkLabel(frame, text="➕ Добавить пользователя",
+                        font=ctk.CTkFont(size=18, weight="bold"), text_color="#6d92ff").pack(pady=(0, 12))
+
+            ctk.CTkLabel(frame, text="ID пользователя (его дал тебе друг):",
+                        font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x")
+            id_entry = ctk.CTkEntry(frame, placeholder_text="u-xxxxxxxxxx", height=35)
+            id_entry.pack(fill="x", pady=(4, 12))
+
+            ctk.CTkLabel(frame, text="Как подписать этот чат:",
+                        font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x")
+            name_entry = ctk.CTkEntry(frame, placeholder_text="например, Егор", height=35)
+            name_entry.pack(fill="x", pady=(4, 12))
+            name_entry.focus_set()
+
+            def confirm_add():
+                cid = id_entry.get().strip()
+                cname = name_entry.get().strip()
+
+                if not cid:
+                    play_error()
+                    messagebox.showwarning("Ошибка", "Введи ID пользователя")
+                    return
+                if cid == my_user_id:
+                    play_error()
+                    messagebox.showwarning("Ошибка", "Это твой собственный ID")
+                    return
+
+                contacts = self.settings.setdefault("personal_chats", [])
+                if any(c.get("id") == cid for c in contacts):
+                    play_error()
+                    messagebox.showwarning("Уже есть", "Этот пользователь уже добавлен в «Чаты»")
+                    return
+                if len(contacts) >= MAX_PERSONAL_CHATS:
+                    play_error()
+                    messagebox.showwarning(
+                        "Лимит чатов",
+                        f"Больше {MAX_PERSONAL_CHATS} личных чатов не влезет.\n"
+                        f"Удали ненужный (🗑️ в списке «Чаты») — и добавишь нового."
+                    )
+                    return
+
+                contacts.append({
+                    "id": cid,
+                    "name": cname or cid,
+                    "last_message": "",
+                    "last_message_time": "",
+                    "last_message_ts": 0,
+                    "last_message_mine": False,
+                    "unread": False,
+                })
+                save_launcher_settings(self.settings)
+                play_click()
+                add_dialog.destroy()
+                refresh_chats_list()
+
+            make_sound_button(frame, text="✅ Добавить", command=confirm_add,
+                              fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                              height=40, font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", pady=(6, 0))
+
+        # Открываем на той вкладке, где были в прошлый раз (по умолчанию — групповой чат)
+        if self.settings.get("chat_setup_last_view") == "chats":
+            switch_view("chats", user_action=False)
 
     def paste_ip_to_entry(self, entry):
         try:
