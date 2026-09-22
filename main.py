@@ -93,8 +93,17 @@ def fetch_active_relay_url(timeout=5):
         return RELAY_URL, "network_error"
 
 
+def _ws_sslopt():
+    # Без явного указания cert_reqs/ca_certs websocket-client на некоторых
+    # системах (особенно собранный .exe без системного хранилища сертификатов)
+    # не может проверить сертификат wss:// и падает с SSLError, но чат при
+    # этом просто тихо остаётся в статусе "Ожидание" без понятной причины.
+    # Явно отдаём ему сертификаты certifi, чтобы подключение к wss:// работало.
+    return {"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()}
+
+
 def check_room_active(relay_url, room, timeout=5):
-    ws = ws_client.create_connection(relay_url, timeout=timeout)
+    ws = ws_client.create_connection(relay_url, timeout=timeout, sslopt=_ws_sslopt())
     try:
         ws.settimeout(timeout)
         ws.send(json.dumps({"action": "check_room", "room": room}))
@@ -767,12 +776,21 @@ def save_launcher_settings(settings):
         return False
 
 
+def generate_short_user_code():
+    """Короткий код вида «482KLM»: 3 цифры + 3 буквы. Специально без похожих
+    друг на друга символов (0/O, 1/I), чтобы код было легко продиктовать
+    другу голосом или переписать с телефона без ошибок."""
+    digits = "".join(random.choice("23456789") for _ in range(3))
+    letters = "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(3))
+    return digits + letters
+
+
 def ensure_user_id(settings):
     """Гарантирует, что у этого пользователя (этой установки лаунчера) есть
     свой персональный ID для личных чатов. Генерируется один раз и хранится
     в launcher_settings — не пересоздаётся между запусками."""
     if not settings.get("user_id"):
-        settings["user_id"] = "u-" + uuid.uuid4().hex[:10]
+        settings["user_id"] = generate_short_user_code()
         save_launcher_settings(settings)
     return settings["user_id"]
 
@@ -2204,9 +2222,14 @@ class ChatWindow(ctk.CTkToplevel):
         self.create_widgets()
         self._clear_personal_unread()
         self._load_personal_history()
-        self.log(f"🔍 Инициализация чата в режиме: {mode} (комната «{self.room}»)")
+        self._start_connection()
 
-        threading.Thread(target=self.run_diagnostics, daemon=True).start()
+    def _start_connection(self, run_diagnostics=True):
+        first_time = not getattr(self.master, "_chat_init_log_shown", False)
+        if first_time:
+            self.log(f"🔍 Инициализация чата в режиме: {self.mode} (комната «{self.room}»)")
+            if run_diagnostics:
+                threading.Thread(target=self.run_diagnostics, daemon=True).start()
         threading.Thread(target=self.run_relay, daemon=True).start()
 
     def _apply_chat_window_geometry(self):
@@ -2354,6 +2377,291 @@ class ChatWindow(ctk.CTkToplevel):
                         pass
         except Exception:
             pass
+
+    def _broadcast_dm_identity(self):
+        """Сразу после подключения к ЛИЧНОМУ чату сообщает собеседнику наш
+        настоящий персональный ID, текущий ник и то, как МЫ подписали ЕГО
+        контакт у себя. Это нужно, чтобы собеседник мог автоматически
+        добавить нас к себе в «Чаты» — без ручного копирования ID в обе
+        стороны — причём под тем же именем, каким назвали его мы
+        (см. _auto_add_contact)."""
+        if not self.personal_contact:
+            return
+        if not self.client_socket or not self.connected:
+            return
+        try:
+            my_id = ensure_user_id(self.master.settings)
+        except Exception:
+            return
+        # Имя, которое мы дали этому контакту при добавлении ("Как подписать
+        # этот чат") — именно оно должно всплыть у собеседника, а не наш
+        # сырой игровой ник вроде "Игрок".
+        contact_name = (self.personal_contact.get("name") or "").strip() or self.username
+        try:
+            self.client_socket.send(json.dumps({
+                "type": "dm_identity",
+                "user_id": my_id,
+                "username": self.username,
+                "contact_name": contact_name,
+            }))
+        except Exception:
+            pass
+
+    def _auto_add_contact(self, their_id, suggested_name):
+        """Автоматически добавляет собеседника в «Чаты» на ЭТОЙ стороне,
+        если его там ещё нет — вызывается при получении его dm_identity.
+        Так добавление контакта на одном устройстве больше не требует,
+        чтобы второй человек так же вручную вбивал ID в ответ."""
+        try:
+            settings = getattr(self.master, "settings", None)
+            if settings is None:
+                return
+            contacts = settings.setdefault("personal_chats", [])
+            for c in contacts:
+                if c.get("id") == their_id:
+                    # Уже есть — но если раньше был подписан просто ID (не было
+                    # имени), можно аккуратно подставить реальный ник.
+                    if (not c.get("name") or c.get("name") == c.get("id")) and suggested_name:
+                        c["name"] = suggested_name
+                        save_launcher_settings(settings)
+                        refresh_cb = getattr(self.master, "chats_list_refresh_callback", None)
+                        if refresh_cb:
+                            try:
+                                refresh_cb()
+                            except Exception:
+                                pass
+                    return
+
+            if len(contacts) >= MAX_PERSONAL_CHATS:
+                return
+
+            contacts.append({
+                "id": their_id,
+                "name": suggested_name or their_id,
+                "last_message": "",
+                "last_message_time": "",
+                "last_message_ts": 0,
+                "last_message_mine": False,
+                "unread": False,
+            })
+            save_launcher_settings(settings)
+            self.log(f"➕ «{suggested_name}» автоматически добавлен(а) в «Чаты» — писать можно в любое время")
+
+            try:
+                if not hasattr(self.master, "active_chat_windows"):
+                    self.master.active_chat_windows = {}
+                self.master.active_chat_windows[their_id] = self
+            except Exception:
+                pass
+
+            refresh_cb = getattr(self.master, "chats_list_refresh_callback", None)
+            if refresh_cb:
+                try:
+                    refresh_cb()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ───────────── Переключение между личными чатами стрелками ‹ › ─────────────
+    def _get_sorted_personal_chats(self):
+        try:
+            contacts = self.master.settings.get("personal_chats", [])
+        except Exception:
+            contacts = []
+        return sorted(contacts, key=lambda c: c.get("last_message_ts", 0), reverse=True)
+
+    def _go_to_sibling_chat(self, direction):
+        """Переключает ЭТО окно на соседний личный чат из списка «Чаты»:
+        direction=1 — следующий, -1 — предыдущий (порядок как в панели «Чаты»)."""
+        if not self.personal_contact or getattr(self, "_transition_running", False):
+            return
+        contacts = self._get_sorted_personal_chats()
+        if len(contacts) < 2:
+            play_error()
+            return
+        my_contact_id = self.personal_contact.get("id")
+        idx = next((i for i, c in enumerate(contacts) if c.get("id") == my_contact_id), None)
+        if idx is None:
+            idx = 0
+        new_contact = contacts[(idx + direction) % len(contacts)]
+        if new_contact.get("id") == my_contact_id:
+            return
+        play_click()
+        self._slide_transition(lambda: self._apply_contact_switch(new_contact), direction=direction)
+
+    def _apply_contact_switch(self, new_contact):
+        """Вызывается ровно в середине анимации (экран в этот момент закрыт
+        шторкой) — здесь происходит фактическая подмена собеседника: разрыв
+        старого соединения, подключение к комнате нового и перезагрузка истории."""
+        old_contact = self.personal_contact
+        try:
+            if old_contact and hasattr(self.master, "active_chat_windows"):
+                old_id = old_contact.get("id")
+                if self.master.active_chat_windows.get(old_id) is self:
+                    del self.master.active_chat_windows[old_id]
+        except Exception:
+            pass
+
+        self.running = False
+        self.disconnect()
+        self.running = True
+
+        self.personal_contact = new_contact
+        self.muted = bool(new_contact.get("muted", False))
+        try:
+            self.mute_btn.configure(text="🔕 Без звука" if self.muted else "🔔 Уведомления")
+        except Exception:
+            pass
+
+        try:
+            my_id = ensure_user_id(self.master.settings)
+        except Exception:
+            my_id = ""
+        their_id = new_contact.get("id")
+        self.room = "dm-" + "-".join(sorted([my_id, their_id]))
+
+        try:
+            if not hasattr(self.master, "active_chat_windows"):
+                self.master.active_chat_windows = {}
+            self.master.active_chat_windows[their_id] = self
+            self.master.active_chat_window = self
+        except Exception:
+            pass
+
+        try:
+            self.contact_name_lbl.configure(text=new_contact.get("name", "???"))
+            self.contact_avatar_lbl.configure(image=make_avatar_image(new_contact.get("name") or "?", size=38))
+        except Exception:
+            pass
+        self.update_title()
+
+        try:
+            self.chat_display.configure(state="normal")
+            self.chat_display.delete("1.0", "end")
+            self.chat_display.insert("1.0", "💬 Чат готов к работе... (команды — /help, поиск — Ctrl+F)\n")
+            self.chat_display.insert("end", "━" * 50 + "\n")
+            self.chat_display.configure(state="disabled")
+        except Exception:
+            pass
+
+        self.message_history = []
+        self.update_msg_count()
+        self._clear_personal_unread()
+        self._load_personal_history()
+        self.participant_count = 1
+        self.update_participant_status()
+
+        try:
+            if hasattr(self, "connection_info_label"):
+                self.connection_info_label.configure(text=f"🔗 Комната: {self.room}")
+        except Exception:
+            pass
+        try:
+            self.status_label.configure(text="🔴 Ожидание", text_color="#d3453f")
+        except Exception:
+            pass
+
+        relay_url = self.relay_url
+
+        def do_negotiate():
+            try:
+                active, _c, _m = check_room_active(relay_url, self.room, timeout=5)
+                negotiated_mode = "client" if active else "server"
+            except Exception:
+                negotiated_mode = "server"
+            self.mode = negotiated_mode
+            self.role = "streamer" if negotiated_mode == "server" else "viewer"
+            try:
+                self.after(0, lambda: self._start_connection(run_diagnostics=False))
+            except Exception:
+                pass
+
+        threading.Thread(target=do_negotiate, daemon=True).start()
+
+    def _safe_alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def _slide_transition(self, swap_callback, direction=1):
+        """Плавная «шторка», которая едет поверх области чата, полностью
+        закрывает её, в этот момент вызывает swap_callback() (там подменяется
+        контент), а затем уезжает в обратную сторону, открывая новый чат —
+        имитация плавного переключения между переписками, как в Telegram."""
+        if getattr(self, "_transition_running", False):
+            swap_callback()
+            return
+        try:
+            self.chat_display.update_idletasks()
+            parent = self.chat_display.master
+            x = self.chat_display.winfo_x()
+            y = self.chat_display.winfo_y()
+            w = self.chat_display.winfo_width()
+            h = self.chat_display.winfo_height()
+            if w <= 1 or h <= 1:
+                swap_callback()
+                return
+        except Exception:
+            swap_callback()
+            return
+
+        self._transition_running = True
+        sign = 1 if direction >= 0 else -1
+        overlay = ctk.CTkFrame(parent, fg_color="#100e1a", corner_radius=8)
+        steps = 8
+
+        def step_in(i=0):
+            if not self._safe_alive():
+                self._transition_running = False
+                return
+            frac = (i + 1) / steps
+            offset = int(w * (1 - frac)) * sign
+            try:
+                overlay.place(x=x + offset, y=y, width=w, height=h)
+            except Exception:
+                pass
+            if i + 1 < steps:
+                self.after(10, lambda: step_in(i + 1))
+            else:
+                try:
+                    overlay.place(x=x, y=y, width=w, height=h)
+                except Exception:
+                    pass
+                self.after(40, do_swap)
+
+        def do_swap():
+            try:
+                swap_callback()
+            except Exception:
+                pass
+            self.after(10, lambda: step_out(0))
+
+        def step_out(i=0):
+            if not self._safe_alive():
+                try:
+                    overlay.destroy()
+                except Exception:
+                    pass
+                self._transition_running = False
+                return
+            frac = (i + 1) / steps
+            offset = int(w * frac) * (-sign)
+            try:
+                overlay.place(x=x + offset, y=y, width=w, height=h)
+            except Exception:
+                pass
+            if i + 1 < steps:
+                self.after(10, lambda: step_out(i + 1))
+            else:
+                try:
+                    overlay.destroy()
+                except Exception:
+                    pass
+                self._transition_running = False
+
+        step_in()
 
     def show_notification(self, message, sender="", title=None, force=False):
         if threading.current_thread() is not threading.main_thread():
@@ -2592,12 +2900,35 @@ class ChatWindow(ctk.CTkToplevel):
         header_frame.pack(fill="x", pady=(0, 15))
 
         left_header = ctk.CTkFrame(header_frame, fg_color="transparent")
-        left_header.pack(side="left")
+        left_header.pack(side="left", fill="x", expand=True)
 
-        mode_text = "🖥️ Хост комнаты" if self.mode == "server" else "💻 Гость"
-        mode_color = "#6fce7f" if self.mode == "server" else "#6d92ff"
-        ctk.CTkLabel(left_header, text=f"{mode_text} - {self.username}",
-                     font=ctk.CTkFont(size=22, weight="bold"), text_color=mode_color).pack(side="left")
+        if self.personal_contact:
+            self.prev_chat_btn = make_sound_button(left_header, text="‹",
+                                                    command=lambda: self._go_to_sibling_chat(-1),
+                                                    width=34, height=34,
+                                                    fg_color="#201d30", hover_color="#3d3a52",
+                                                    font=ctk.CTkFont(size=18, weight="bold"))
+            self.prev_chat_btn.pack(side="left", padx=(0, 8))
+
+            self.contact_avatar_lbl = ctk.CTkLabel(
+                left_header, image=make_avatar_image(self.personal_contact.get("name") or "?", size=38), text="")
+            self.contact_avatar_lbl.pack(side="left", padx=(0, 10))
+
+            self.contact_name_lbl = ctk.CTkLabel(left_header, text=self.personal_contact.get("name", "???"),
+                                                 font=ctk.CTkFont(size=20, weight="bold"), text_color="#6d92ff")
+            self.contact_name_lbl.pack(side="left")
+
+            self.next_chat_btn = make_sound_button(left_header, text="›",
+                                                    command=lambda: self._go_to_sibling_chat(1),
+                                                    width=34, height=34,
+                                                    fg_color="#201d30", hover_color="#3d3a52",
+                                                    font=ctk.CTkFont(size=18, weight="bold"))
+            self.next_chat_btn.pack(side="left", padx=(8, 0))
+        else:
+            mode_text = "🖥️ Хост комнаты" if self.mode == "server" else "💻 Гость"
+            mode_color = "#6fce7f" if self.mode == "server" else "#6d92ff"
+            ctk.CTkLabel(left_header, text=f"{mode_text} - {self.username}",
+                         font=ctk.CTkFont(size=22, weight="bold"), text_color=mode_color).pack(side="left")
 
         right_header = ctk.CTkFrame(header_frame, fg_color="transparent")
         right_header.pack(side="right")
@@ -2614,47 +2945,79 @@ class ChatWindow(ctk.CTkToplevel):
 
         ctk.CTkFrame(main_frame, height=2, fg_color="#6d92ff").pack(fill="x", pady=(0, 10))
 
-        self.chat_display = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Consolas", size=14), height=350)
+        self.chat_display = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Segoe UI", size=14), height=350)
         self.chat_display.pack(fill="both", expand=True, pady=(0, 10))
         self.chat_display.insert("1.0", "💬 Чат готов к работе... (команды — /help, поиск — Ctrl+F)\n")
         self.chat_display.insert("end", "━" * 50 + "\n")
         self.chat_display.configure(state="disabled")
-        self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")
-        self.chat_display.tag_config("chat_link", foreground="#6d92ff", underline=True)
-        self.chat_display.tag_config("chat_mention", foreground="#ffb35c")
-        self.chat_display.tag_config("search_hit", background="#4a4666")
-        self.chat_display.tag_config("search_current", background="#d9622f", foreground="#16141f")
-        self.chat_display._textbox.tag_raise("search_current")
-        self._bind_chat_links()
 
-        # Панель поиска по чату (появляется по Ctrl+F, пока скрыта)
-        self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
-        self.search_entry = ctk.CTkEntry(self.search_bar, placeholder_text="Что ищем?...", height=32)
-        self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 6), pady=6)
-        self.search_entry.bind("<KeyRelease>", self._on_search_key)
-        self.search_entry.bind("<Return>", lambda e: self.search_step(-1))
-        self.search_entry.bind("<Shift-Return>", lambda e: self.search_step(1))
-        self.search_entry.bind("<Escape>", lambda e: self.close_search())
-        self.search_count_label = ctk.CTkLabel(self.search_bar, text="", width=90,
-                                               font=ctk.CTkFont(size=12), text_color="#a8a4bd")
-        self.search_count_label.pack(side="left", padx=(0, 6))
-        make_sound_button(self.search_bar, text="▲", command=lambda: self.search_step(-1),
-                          width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
-        make_sound_button(self.search_bar, text="▼", command=lambda: self.search_step(1),
-                          width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
-        make_sound_button(self.search_bar, text="✕", command=self.close_search,
-                          width=32, height=28, fg_color="#d3453f", hover_color="#b83530").pack(side="left", padx=(2, 8))
+        try:
+            tw = self.chat_display._textbox
+            tw.configure(spacing1=3, spacing3=10)
 
-        # Контекстное меню чата (правая кнопка мыши)
-        self._chat_menu = tk.Menu(self, tearoff=0, bg="#201d30", fg="#e5e2f0",
-                                  activebackground="#6d92ff", activeforeground="#16141f", bd=0)
-        self._chat_menu.add_command(label="📋 Скопировать выделенное", command=self.copy_selection)
-        self._chat_menu.add_command(label="📋 Скопировать весь чат", command=self.copy_all)
-        self._chat_menu.add_command(label="📋 Скопировать последнее сообщение", command=self.copy_last_message)
-        self._chat_menu.add_separator()
-        self._chat_menu.add_command(label="🔍 Найти в чате (Ctrl+F)", command=self.open_search)
-        self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
-        self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
+            # Как в настоящем мессенджере: свои сообщения — справа и своим
+            # цветом, чужие — слева, системные события — по центру и приглушённо.
+            self.chat_display.tag_config("msg_mine", justify="right", foreground="#bcd2ff",
+                                          lmargin1=60, lmargin2=60)
+            self.chat_display.tag_config("msg_theirs", justify="left", foreground="#e5e2f0",
+                                          rmargin=60)
+            self.chat_display.tag_config("msg_system", justify="center", foreground="#8b87a3")
+            self.chat_display.tag_config("msg_info", justify="left", foreground="#a8a4bd")
+            self.chat_display.tag_config("chat_ts", foreground="#6d6785",
+                                          font=ctk.CTkFont(family="Segoe UI", size=11))
+
+            self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")
+            self.chat_display.tag_config("chat_link", foreground="#6d92ff", underline=True)
+            self.chat_display.tag_config("chat_mention", foreground="#ffb35c")
+            self.chat_display.tag_config("search_hit", background="#4a4666")
+            self.chat_display.tag_config("search_current", background="#d9622f", foreground="#16141f")
+            # Ник/ссылка/упоминание/поиск должны перекрашивать текст поверх
+            # базового выравнивания msg_* — поднимаем их приоритет повыше.
+            for _tag in ("gold_chat_nick", "chat_link", "chat_mention", "chat_ts", "search_hit", "search_current"):
+                tw.tag_raise(_tag)
+            self._bind_chat_links()
+
+            # Панель поиска по чату (появляется по Ctrl+F, пока скрыта)
+            self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
+            self.search_entry = ctk.CTkEntry(self.search_bar, placeholder_text="Что ищем?...", height=32)
+            self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 6), pady=6)
+            self.search_entry.bind("<KeyRelease>", self._on_search_key)
+            self.search_entry.bind("<Return>", lambda e: self.search_step(-1))
+            self.search_entry.bind("<Shift-Return>", lambda e: self.search_step(1))
+            self.search_entry.bind("<Escape>", lambda e: self.close_search())
+            self.search_count_label = ctk.CTkLabel(self.search_bar, text="", width=90,
+                                                   font=ctk.CTkFont(size=12), text_color="#a8a4bd")
+            self.search_count_label.pack(side="left", padx=(0, 6))
+            make_sound_button(self.search_bar, text="▲", command=lambda: self.search_step(-1),
+                              width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
+            make_sound_button(self.search_bar, text="▼", command=lambda: self.search_step(1),
+                              width=32, height=28, fg_color="#4a4666", hover_color="#3d3a52").pack(side="left", padx=2)
+            make_sound_button(self.search_bar, text="✕", command=self.close_search,
+                              width=32, height=28, fg_color="#d3453f", hover_color="#b83530").pack(side="left", padx=(2, 8))
+
+            # Контекстное меню чата (правая кнопка мыши)
+            self._chat_menu = tk.Menu(self, tearoff=0, bg="#201d30", fg="#e5e2f0",
+                                      activebackground="#6d92ff", activeforeground="#16141f", bd=0)
+            self._chat_menu.add_command(label="📋 Скопировать выделенное", command=self.copy_selection)
+            self._chat_menu.add_command(label="📋 Скопировать весь чат", command=self.copy_all)
+            self._chat_menu.add_command(label="📋 Скопировать последнее сообщение", command=self.copy_last_message)
+            self._chat_menu.add_separator()
+            self._chat_menu.add_command(label="🔍 Найти в чате (Ctrl+F)", command=self.open_search)
+            self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
+            self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
+        except Exception as _e:
+            # ВАЖНО: раньше ошибка тут (например, из-за внутреннего атрибута
+            # CTkTextbox в другой версии customtkinter) обрывала create_widgets()
+            # и всё, что должно было появиться ниже — панель с кодом комнаты,
+            # ПОЛЕ ВВОДА СООБЩЕНИЯ и кнопка "Отправить" — просто никогда не
+            # создавалось, а окно молча оставалось пустым. Теперь такой сбой
+            # только гасится и логируется, а критичная часть интерфейса ниже
+            # строится в любом случае.
+            print(f"[chat_ui] Не удалось настроить подсветку/поиск чата: {_e}")
+            traceback.print_exc()
+            self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
+            self._chat_menu = None
+
 
         info_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         info_frame.pack(fill="x", pady=(0, 10))
@@ -2761,13 +3124,12 @@ class ChatWindow(ctk.CTkToplevel):
                                          font=ctk.CTkFont(size=12))
         settings_btn.pack(side="left", padx=(0, 10))
 
-        if self.mode == "client":
-            reconnect_btn = make_sound_button(btn_frame, text="🔄 Переподключиться",
-                                              command=self.reconnect,
-                                              fg_color="#6fce7f", hover_color="#5cb56c",
-                                              text_color="#16141f", height=35,
-                                              font=ctk.CTkFont(size=12))
-            reconnect_btn.pack(side="left", padx=(0, 10))
+        reconnect_btn = make_sound_button(btn_frame, text="🔄 Переподключиться",
+                                          command=self.reconnect,
+                                          fg_color="#6fce7f", hover_color="#5cb56c",
+                                          text_color="#16141f", height=35,
+                                          font=ctk.CTkFont(size=12))
+        reconnect_btn.pack(side="left", padx=(0, 10))
 
         leave_room_btn = make_sound_button(btn_frame, text="🚪 Выйти из комнаты",
                                            command=self.leave_room,
@@ -2878,6 +3240,20 @@ class ChatWindow(ctk.CTkToplevel):
             full_text = f"[{timestamp}] {message}\n"
             self.chat_display.insert("end", full_text)
 
+            tw = self.chat_display._textbox
+            if message.startswith("📤"):
+                align_tag = "msg_mine"
+            elif message.startswith("💬"):
+                align_tag = "msg_theirs"
+            elif message.startswith("🔔"):
+                align_tag = "msg_system"
+            else:
+                align_tag = "msg_info"
+            tw.tag_add(align_tag, f"{start_index} linestart", f"{start_index} lineend")
+
+            ts_prefix_len = len(f"[{timestamp}] ")
+            tw.tag_add("chat_ts", start_index, f"{start_index}+{ts_prefix_len}c")
+
             if is_licensed_msg and target_nick:
                 current_line = start_index.split('.')[0]
                 nick_len = tk.IntVar()
@@ -2914,19 +3290,32 @@ class ChatWindow(ctk.CTkToplevel):
 
     def run_relay(self):
         role_text = "хостом (стример)" if self.role == "streamer" else "гостем (зритель)"
+        first_time = not getattr(self.master, "_chat_init_log_shown", False)
         try:
-            self.log(f"🌐 Подключаюсь к релею {self.relay_url}...")
-            self.log(f"🚪 Комната: {self.room}, роль: {role_text}")
-            self.client_socket = ws_client.create_connection(self.relay_url, timeout=15)
+            if first_time:
+                self.log(f"🌐 Подключаюсь к релею {self.relay_url}...")
+                self.log(f"🚪 Комната: {self.room}, роль: {role_text}")
+            else:
+                self.log(f"🌐 Подключаюсь к комнате «{self.room}»...")
+            self.client_socket = ws_client.create_connection(self.relay_url, timeout=15, sslopt=_ws_sslopt())
             self.client_socket.settimeout(0.5)
             hello = json.dumps({"room": self.room, "role": self.role, "username": self.username})
             self.client_socket.send(hello)
             self.connected = True
+            self._reconnect_attempts = 0
             self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
             self.safe_update_widget(self.send_btn, state="normal")
             self.participant_count = 1
             self.update_participant_status()
-            self.log(f"✅ Подключено к релею! Комната: {self.room}")
+            if first_time:
+                self.log(f"✅ Подключено к релею! Комната: {self.room}")
+                try:
+                    self.master._chat_init_log_shown = True
+                except Exception:
+                    pass
+            else:
+                self.log(f"✅ Подключено (комната «{self.room}»)")
+            self._broadcast_dm_identity()
             threading.Thread(target=self.receive_messages_thread, daemon=True).start()
         except Exception as e:
             self.log(f"❌ Не удалось подключиться к релею: {e}")
@@ -2935,10 +3324,28 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("  2. Релей-сервер сейчас работает (не уснул на бесплатном хостинге)?")
             self.log("  3. Код комнаты совпадает у обоих игроков?")
             self.connected = False
+            self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
+            # Раньше при неудаче чат просто молча замирал в статусе "Ожидание"
+            # навсегда (для хоста вообще не было кнопки переподключения) —
+            # теперь пробуем сами, с растущей паузой, пока окно открыто.
+            self._auto_reconnect()
+
+    def _auto_reconnect(self):
+        if not self.running or not self.winfo_exists():
+            return
+        self._reconnect_attempts = getattr(self, "_reconnect_attempts", 0) + 1
+        delay = min(3 * self._reconnect_attempts, 20)
+        self.log(f"🔄 Повторная попытка через {delay} сек... (попытка {self._reconnect_attempts})")
+
+        def _retry():
+            if not self.running or not self.winfo_exists() or self.connected:
+                return
+            threading.Thread(target=self.run_relay, daemon=True).start()
+
+        self.after(delay * 1000, _retry)
 
     def reconnect(self):
-        if self.mode != "client":
-            return
+        self._reconnect_attempts = 0
         if self.connected:
             self.disconnect()
         self.log("🔄 Попытка переподключения...")
@@ -2988,15 +3395,22 @@ class ChatWindow(ctk.CTkToplevel):
     def display_message(self, message):
         try:
             if not message.startswith("👤"):
-                self.message_history.append(message)
-                self.update_msg_count()
-                self._persist_message(message, mine=False)
-                self.log(f"💬 {message}")
-
                 if ": " in message and not message.startswith("* "):
                     sender, text = message.split(": ", 1)
                 else:
                     sender, text = "", message
+
+                if sender and self.username and sender == self.username:
+                    # Это не собеседник, а эхо нашего же сообщения, которое релей
+                    # иногда рассылает обратно и отправителю. Игнорируем целиком —
+                    # не пишем в историю/лог/на диск, иначе выглядит так, будто
+                    # пишешь сам себе.
+                    return
+
+                self.message_history.append(message)
+                self.update_msg_count()
+                self._persist_message(message, mine=False)
+                self.log(f"💬 {message}")
 
                 if self._mentions_me(text):
                     self.show_notification(text, sender, title="📣 Тебя позвали")
@@ -3057,6 +3471,24 @@ class ChatWindow(ctk.CTkToplevel):
                 else:
                     self.username = new_username
                 self.send_message_raw(f"👤 {self.username} присоединился к комнате!")
+                self._broadcast_dm_identity()
+        elif msg_type == "dm_identity":
+            if not self.personal_contact:
+                return
+            their_id = data.get("user_id")
+            their_username = (data.get("username") or "").strip() or "Игрок"
+            # Имя, которым нас назвал собеседник у себя при добавлении — если
+            # оно есть, используем именно его, чтобы контакт появился у нас
+            # под тем же именем, каким назвал нас первый (добавивший) человек.
+            their_contact_name = (data.get("contact_name") or "").strip()
+            suggested_name = their_contact_name or their_username
+            try:
+                my_id = ensure_user_id(self.master.settings)
+            except Exception:
+                my_id = None
+            if not their_id or their_id == my_id:
+                return
+            self._auto_add_contact(their_id, suggested_name)
         elif msg_type == "file_offer":
             sender = data.get("sender", "???")
             url = data.get("url", "")
@@ -3371,6 +3803,8 @@ class ChatWindow(ctk.CTkToplevel):
         return "break"
 
     def open_search(self, query=""):
+        if not getattr(self, "search_entry", None):
+            return
         if not self._search_visible:
             self.search_bar.pack(fill="x", pady=(0, 6), before=self.chat_display)
             self._search_visible = True
@@ -3462,6 +3896,8 @@ class ChatWindow(ctk.CTkToplevel):
 
     # ───────────── Копирование ─────────────
     def _show_chat_menu(self, event):
+        if not getattr(self, "_chat_menu", None):
+            return
         try:
             self._chat_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -4138,6 +4574,7 @@ class LauncherApp(ctk.CTk):
         self.active_chat_window = None
         self.active_chat_windows = {}
         self.chats_list_refresh_callback = None
+        self._chat_init_log_shown = False
 
         threading.Thread(target=fetch_active_relay_url, daemon=True).start()
 
@@ -7720,7 +8157,7 @@ class LauncherApp(ctk.CTk):
 
             ctk.CTkLabel(frame, text="ID пользователя (его дал тебе друг):",
                         font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(fill="x")
-            id_entry = ctk.CTkEntry(frame, placeholder_text="u-xxxxxxxxxx", height=35)
+            id_entry = ctk.CTkEntry(frame, placeholder_text="482KLM", height=35)
             id_entry.pack(fill="x", pady=(4, 12))
 
             ctk.CTkLabel(frame, text="Как подписать этот чат:",
@@ -7730,7 +8167,7 @@ class LauncherApp(ctk.CTk):
             name_entry.focus_set()
 
             def confirm_add():
-                cid = id_entry.get().strip()
+                cid = id_entry.get().strip().upper()
                 cname = name_entry.get().strip()
 
                 if not cid:
