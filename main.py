@@ -14,6 +14,7 @@ import zipfile
 import platform
 import requests
 import threading
+import queue as _queue_module
 import webbrowser
 from pathlib import Path
 import ssl
@@ -21,7 +22,7 @@ import certifi
 from datetime import datetime
 import pickle
 import random
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageSequence
 from io import BytesIO
 import socket
 import base64
@@ -33,6 +34,17 @@ import websocket as ws_client
 from urllib.parse import unquote
 import multiprocessing
 import pystray
+
+try:
+    import mss
+except ImportError:
+    mss = None
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
+except ImportError:
+    pyautogui = None
 
 RELAY_URL_DEFAULT = "wss://screen-relay-production.up.railway.app"
 RELAY_URL_API_SOURCE = "https://api.github.com/repos/KotiPlayYT/67launcher/contents/relay.active.txt?ref=main"
@@ -94,11 +106,11 @@ def fetch_active_relay_url(timeout=5):
 
 
 def _ws_sslopt():
-    # Без явного указания cert_reqs/ca_certs websocket-client на некоторых
-    # системах (особенно собранный .exe без системного хранилища сертификатов)
-    # не может проверить сертификат wss:// и падает с SSLError, но чат при
-    # этом просто тихо остаётся в статусе "Ожидание" без понятной причины.
-    # Явно отдаём ему сертификаты certifi, чтобы подключение к wss:// работало.
+
+
+
+
+
     return {"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()}
 
 
@@ -1964,7 +1976,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
             messagebox.showerror("Ошибка", f"Не запустилось:\n{e}")
 
 
-MAX_PERSONAL_CHATS = 10  # максимум личных чатов в списке «Чаты»
+MAX_PERSONAL_CHATS = 10
 class _ChatMessagebox:
     """Обёртка над tkinter.messagebox для окна чата: диалог привязывается к окну
     чата (parent), чтобы не оказаться спрятанным за ним — иначе кажется, что весь
@@ -2000,7 +2012,7 @@ CHAT_HISTORY_MAX_LOAD = 200
 CHAT_HISTORY_MAX_KEEP = 2000
 _CHAT_HISTORY_LOCK = threading.Lock()
 
-CHAT_URL_PATTERN = "https?://[^\\s<>\"']+"  # синтаксис Tcl-regexp для Text.search
+CHAT_URL_PATTERN = "https?://[^\\s<>\"']+"
 CHAT_COMMAND_RE = re.compile(r"^/([A-Za-zА-Яа-яЁё?]+)(?:\s+(.*))?$", re.S)
 CHAT_COMMAND_ALIASES = {
     "help": "help", "помощь": "help", "команды": "help", "?": "help",
@@ -2166,6 +2178,206 @@ def trim_link_tail(url):
     return url
 
 
+SCREEN_SHARE_MAX_WIDTH = 640        # было 960 — меньше разрешение = меньше данных
+SCREEN_SHARE_JPEG_QUALITY = 25      # было 45  — ниже качество JPEG = меньше размер кадра
+SCREEN_SHARE_INTERVAL = 1 / 6      # было 1/12 — 6 fps вместо 12, вдвое меньше трафика
+SCREEN_SHARE_REQUEST_TIMEOUT = 30
+SCREEN_SHARE_MOVE_THROTTLE = 0.05  # было 0.02 — реже шлём позицию мыши
+SCREEN_SHARE_MAX_CONSECUTIVE_ERRORS = 8  # было 4 — больше терпимость к ошибкам
+
+_TK_TO_PYAUTOGUI_KEYS = {
+    "Return": "enter", "KP_Enter": "enter", "Escape": "esc", "BackSpace": "backspace",
+    "Tab": "tab", "space": "space", "Delete": "delete", "Insert": "insert",
+    "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+    "Home": "home", "End": "end", "Prior": "pageup", "Next": "pagedown",
+    "Shift_L": "shiftleft", "Shift_R": "shiftright",
+    "Control_L": "ctrlleft", "Control_R": "ctrlright",
+    "Alt_L": "altleft", "Alt_R": "altright",
+    "Super_L": "winleft", "Super_R": "winright",
+    "Caps_Lock": "capslock", "Num_Lock": "numlock",
+    "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4", "F5": "f5", "F6": "f6",
+    "F7": "f7", "F8": "f8", "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
+    "minus": "-", "equal": "=", "comma": ",", "period": ".", "slash": "/",
+    "backslash": "\\", "bracketleft": "[", "bracketright": "]",
+    "semicolon": ";", "apostrophe": "'", "grave": "`",
+}
+
+
+def _map_tk_keysym_to_pyautogui(keysym):
+    """Переводит tkinter keysym (например 'Return', 'a', 'F5') в имя клавиши,
+    которое понимает pyautogui.keyDown/keyUp. Возвращает None, если клавишу
+    не удалось однозначно определить (лучше пропустить нажатие, чем нажать
+    не то)."""
+    if not keysym:
+        return None
+    if keysym in _TK_TO_PYAUTOGUI_KEYS:
+        return _TK_TO_PYAUTOGUI_KEYS[keysym]
+    if len(keysym) == 1:
+        return keysym if keysym.isalpha() or keysym.isdigit() else keysym
+    return None
+
+
+class _ScreenShareHostBanner(ctk.CTkToplevel):
+    """Плавающая плашка на стороне того, чей экран транслируется — всегда
+    видно, что трансляция идёт и кому, и можно остановить её одним кликом,
+    не копаясь в чате."""
+
+    def __init__(self, chat_window, viewer_username):
+        super().__init__(chat_window)
+        self.chat_window = chat_window
+        try:
+            self.overrideredirect(True)
+        except Exception:
+            pass
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            self.attributes("-alpha", 0.94)
+        except Exception:
+            pass
+        self.configure(fg_color="#8b2f2f")
+        width, height = 380, 46
+        try:
+            sw = self.winfo_screenwidth()
+        except Exception:
+            sw = width
+        self.geometry(f"{width}x{height}+{max(0, (sw - width) // 2)}+12")
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="both", expand=True, padx=8, pady=6)
+        ctk.CTkLabel(
+            row,
+            text=f"🔴 Твой экран и управление транслируются «{viewer_username}»",
+            text_color="white",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left", padx=(4, 8))
+        ctk.CTkButton(
+            row, text="⏹ Стоп", width=70, fg_color="#5a1c1c", hover_color="#712323",
+            command=self._stop,
+        ).pack(side="right")
+
+    def _stop(self):
+        self.chat_window.stop_screen_share()
+
+
+class RemoteScreenWindow(ctk.CTkToplevel):
+    """Окно просмотра и управления чужим экраном (сторона того, кто смотрит).
+    Каждое движение/клик мыши и нажатие клавиши пересчитывается в координаты
+    РЕАЛЬНОГО экрана собеседника (по последним полученным orig_w/orig_h), так
+    что клик по картинке точно попадает туда же на экране хоста."""
+
+    def __init__(self, chat_window, peer_username, request_id):
+        super().__init__(chat_window)
+        self.chat_window = chat_window
+        self.peer_username = peer_username
+        self.request_id = request_id
+
+        self.title(f"🖥️ Экран «{peer_username}»")
+        self.geometry("1040x660")
+        self.minsize(480, 320)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.configure(fg_color="#0c0c0c")
+
+        self._orig_w = 1920
+        self._orig_h = 1080
+        self._img_w = 0
+        self._img_h = 0
+        self._photo = None
+        self._last_move_ts = 0.0
+
+        top = ctk.CTkFrame(self, fg_color="#161616", height=34)
+        top.pack(side="top", fill="x")
+        ctk.CTkLabel(
+            top,
+            text=f"🖥️ Управляешь экраном «{peer_username}» — мышь и клавиатура передаются в реальном времени",
+            text_color="#8fd18f",
+            font=ctk.CTkFont(size=12),
+        ).pack(side="left", padx=10, pady=6)
+        ctk.CTkButton(
+            top, text="⏹ Остановить", width=120, fg_color="#8b2f2f", hover_color="#a53a3a",
+            command=self._on_close,
+        ).pack(side="right", padx=8, pady=4)
+
+        self.canvas = tk.Label(self, bg="black", anchor="nw")
+        self.canvas.pack(fill="both", expand=True)
+
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<ButtonPress-1>", lambda e: self._on_button(e, "left", True))
+        self.canvas.bind("<ButtonRelease-1>", lambda e: self._on_button(e, "left", False))
+        self.canvas.bind("<ButtonPress-3>", lambda e: self._on_button(e, "right", True))
+        self.canvas.bind("<ButtonRelease-3>", lambda e: self._on_button(e, "right", False))
+        self.canvas.bind("<ButtonPress-2>", lambda e: self._on_button(e, "middle", True))
+        self.canvas.bind("<ButtonRelease-2>", lambda e: self._on_button(e, "middle", False))
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Button-4>", lambda e: self._send_input({"action": "scroll", "dy": 60}))
+        self.canvas.bind("<Button-5>", lambda e: self._send_input({"action": "scroll", "dy": -60}))
+
+        self.canvas.bind("<KeyPress>", self._on_key_press, add=True)
+        self.canvas.bind("<KeyRelease>", self._on_key_release, add=True)
+        self.bind("<FocusIn>", lambda e: self.canvas.focus_set())
+        self.canvas.focus_set()
+
+    def update_frame(self, img, orig_w, orig_h):
+        self._orig_w = max(1, orig_w)
+        self._orig_h = max(1, orig_h)
+        self._img_w = img.width
+        self._img_h = img.height
+        self._photo = ImageTk.PhotoImage(img)
+        try:
+            self.canvas.configure(image=self._photo)
+        except Exception:
+            pass
+
+    def _scale(self, x, y):
+        if not self._img_w or not self._img_h:
+            return None
+        x = max(0, min(x, self._img_w - 1))
+        y = max(0, min(y, self._img_h - 1))
+        rx = int(x * self._orig_w / self._img_w)
+        ry = int(y * self._orig_h / self._img_h)
+        return rx, ry
+
+    def _send_input(self, extra):
+        self.chat_window.send_remote_input(self.peer_username, self.request_id, extra)
+
+    def _on_motion(self, event):
+        now = time.time()
+        if now - self._last_move_ts < SCREEN_SHARE_MOVE_THROTTLE:
+            return
+        self._last_move_ts = now
+        pt = self._scale(event.x, event.y)
+        if pt:
+            self._send_input({"action": "move", "x": pt[0], "y": pt[1]})
+
+    def _on_button(self, event, button, pressed):
+        self.canvas.focus_set()
+        pt = self._scale(event.x, event.y)
+        if not pt:
+            return
+        self._send_input({"action": "down" if pressed else "up", "x": pt[0], "y": pt[1], "button": button})
+
+    def _on_double_click(self, event):
+        pt = self._scale(event.x, event.y)
+        if pt:
+            self._send_input({"action": "double_click", "x": pt[0], "y": pt[1], "button": "left"})
+
+    def _on_wheel(self, event):
+        delta = event.delta if getattr(event, "delta", 0) else 0
+        self._send_input({"action": "scroll", "dy": delta})
+
+    def _on_key_press(self, event):
+        self._send_input({"action": "key_down", "key": event.keysym})
+
+    def _on_key_release(self, event):
+        self._send_input({"action": "key_up", "key": event.keysym})
+
+    def _on_close(self):
+        self.chat_window.stop_screen_share()
+
+
 class ChatWindow(ctk.CTkToplevel):
     def __init__(self, master, mode="server", room="", relay_url=None, personal_contact=None):
         super().__init__(master)
@@ -2184,6 +2396,20 @@ class ChatWindow(ctk.CTkToplevel):
         self.unread_count = 0
         self.participant_count = 1
         self.max_room_size = 20
+
+
+
+
+
+        self._socket_lock = threading.Lock()
+
+
+
+
+        self._screen_share = {}
+        self._screen_share_streaming = False
+        self._remote_screen_window = None
+        self._screen_share_banner = None
 
         self.muted = bool(personal_contact.get("muted", False)) if personal_contact else False
         self._input_history = []
@@ -2266,8 +2492,8 @@ class ChatWindow(ctk.CTkToplevel):
         self.deiconify()
         self.lift()
         try:
-            # Windows не любит, когда фоновое окно выдёргивают наверх — на мгновение
-            # делаем его «поверх всех», иначе чат может остаться за чужими окнами.
+
+
             self.attributes("-topmost", True)
 
             def _drop_topmost():
@@ -2290,7 +2516,7 @@ class ChatWindow(ctk.CTkToplevel):
 
     def on_minimize(self, event):
         if event.widget is not self:
-            return  # <Unmap> прилетает и от дочерних виджетов (например, панели поиска)
+            return
         self.is_minimized = True
 
     def on_restore(self, event):
@@ -2393,12 +2619,12 @@ class ChatWindow(ctk.CTkToplevel):
             my_id = ensure_user_id(self.master.settings)
         except Exception:
             return
-        # Имя, которое мы дали этому контакту при добавлении ("Как подписать
-        # этот чат") — именно оно должно всплыть у собеседника, а не наш
-        # сырой игровой ник вроде "Игрок".
+
+
+
         contact_name = (self.personal_contact.get("name") or "").strip() or self.username
         try:
-            self.client_socket.send(json.dumps({
+            self._socket_send(json.dumps({
                 "type": "dm_identity",
                 "user_id": my_id,
                 "username": self.username,
@@ -2419,8 +2645,8 @@ class ChatWindow(ctk.CTkToplevel):
             contacts = settings.setdefault("personal_chats", [])
             for c in contacts:
                 if c.get("id") == their_id:
-                    # Уже есть — но если раньше был подписан просто ID (не было
-                    # имени), можно аккуратно подставить реальный ник.
+
+
                     if (not c.get("name") or c.get("name") == c.get("id")) and suggested_name:
                         c["name"] = suggested_name
                         save_launcher_settings(settings)
@@ -2463,7 +2689,7 @@ class ChatWindow(ctk.CTkToplevel):
         except Exception:
             pass
 
-    # ───────────── Переключение между личными чатами стрелками ‹ › ─────────────
+
     def _get_sorted_personal_chats(self):
         try:
             contacts = self.master.settings.get("personal_chats", [])
@@ -2718,7 +2944,7 @@ class ChatWindow(ctk.CTkToplevel):
 
             frame.bind("<Button-1>", on_notif_click)
 
-            # Маленькая подпись сверху: откуда пришло — из группового или из личного чата
+
             if self.personal_contact:
                 kind_text, kind_color = "личные", "#ffb35c"
             else:
@@ -2955,29 +3181,33 @@ class ChatWindow(ctk.CTkToplevel):
             tw = self.chat_display._textbox
             tw.configure(spacing1=3, spacing3=10)
 
-            # Как в настоящем мессенджере: свои сообщения — справа и своим
-            # цветом, чужие — слева, системные события — по центру и приглушённо.
-            self.chat_display.tag_config("msg_mine", justify="right", foreground="#bcd2ff",
-                                          lmargin1=60, lmargin2=60)
-            self.chat_display.tag_config("msg_theirs", justify="left", foreground="#e5e2f0",
+
+
+            self.chat_display.tag_config("msg_mine", justify="left", foreground="#bcd2ff",
                                           rmargin=60)
+            self.chat_display.tag_config("msg_theirs", justify="right", foreground="#e5e2f0",
+                                          lmargin1=60, lmargin2=60)
             self.chat_display.tag_config("msg_system", justify="center", foreground="#8b87a3")
             self.chat_display.tag_config("msg_info", justify="left", foreground="#a8a4bd")
-            self.chat_display.tag_config("chat_ts", foreground="#6d6785",
-                                          font=ctk.CTkFont(family="Segoe UI", size=11))
+
+
+
+
+            tw.tag_config("chat_ts", foreground="#6d6785",
+                          font=("Segoe UI", 11))
 
             self.chat_display.tag_config("gold_chat_nick", foreground="#FFD700")
             self.chat_display.tag_config("chat_link", foreground="#6d92ff", underline=True)
             self.chat_display.tag_config("chat_mention", foreground="#ffb35c")
             self.chat_display.tag_config("search_hit", background="#4a4666")
             self.chat_display.tag_config("search_current", background="#d9622f", foreground="#16141f")
-            # Ник/ссылка/упоминание/поиск должны перекрашивать текст поверх
-            # базового выравнивания msg_* — поднимаем их приоритет повыше.
+
+
             for _tag in ("gold_chat_nick", "chat_link", "chat_mention", "chat_ts", "search_hit", "search_current"):
                 tw.tag_raise(_tag)
             self._bind_chat_links()
 
-            # Панель поиска по чату (появляется по Ctrl+F, пока скрыта)
+
             self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
             self.search_entry = ctk.CTkEntry(self.search_bar, placeholder_text="Что ищем?...", height=32)
             self.search_entry.pack(side="left", fill="x", expand=True, padx=(8, 6), pady=6)
@@ -2995,7 +3225,7 @@ class ChatWindow(ctk.CTkToplevel):
             make_sound_button(self.search_bar, text="✕", command=self.close_search,
                               width=32, height=28, fg_color="#d3453f", hover_color="#b83530").pack(side="left", padx=(2, 8))
 
-            # Контекстное меню чата (правая кнопка мыши)
+
             self._chat_menu = tk.Menu(self, tearoff=0, bg="#201d30", fg="#e5e2f0",
                                       activebackground="#6d92ff", activeforeground="#16141f", bd=0)
             self._chat_menu.add_command(label="📋 Скопировать выделенное", command=self.copy_selection)
@@ -3006,13 +3236,13 @@ class ChatWindow(ctk.CTkToplevel):
             self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
             self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
         except Exception as _e:
-            # ВАЖНО: раньше ошибка тут (например, из-за внутреннего атрибута
-            # CTkTextbox в другой версии customtkinter) обрывала create_widgets()
-            # и всё, что должно было появиться ниже — панель с кодом комнаты,
-            # ПОЛЕ ВВОДА СООБЩЕНИЯ и кнопка "Отправить" — просто никогда не
-            # создавалось, а окно молча оставалось пустым. Теперь такой сбой
-            # только гасится и логируется, а критичная часть интерфейса ниже
-            # строится в любом случае.
+
+
+
+
+
+
+
             print(f"[chat_ui] Не удалось настроить подсветку/поиск чата: {_e}")
             traceback.print_exc()
             self.search_bar = ctk.CTkFrame(main_frame, fg_color="#201d30")
@@ -3289,6 +3519,22 @@ class ChatWindow(ctk.CTkToplevel):
         return False
 
     def run_relay(self):
+
+
+
+
+
+
+
+        if getattr(self, "_connecting", False) or self.connected:
+            return
+        self._connecting = True
+        try:
+            self._run_relay_inner()
+        finally:
+            self._connecting = False
+
+    def _run_relay_inner(self):
         role_text = "хостом (стример)" if self.role == "streamer" else "гостем (зритель)"
         first_time = not getattr(self.master, "_chat_init_log_shown", False)
         try:
@@ -3298,9 +3544,20 @@ class ChatWindow(ctk.CTkToplevel):
             else:
                 self.log(f"🌐 Подключаюсь к комнате «{self.room}»...")
             self.client_socket = ws_client.create_connection(self.relay_url, timeout=15, sslopt=_ws_sslopt())
+            if not self.running:
+
+
+
+
+                try:
+                    self.client_socket.close()
+                except Exception:
+                    pass
+                self.client_socket = None
+                return
             self.client_socket.settimeout(0.5)
             hello = json.dumps({"room": self.room, "role": self.role, "username": self.username})
-            self.client_socket.send(hello)
+            self._socket_send(hello)
             self.connected = True
             self._reconnect_attempts = 0
             self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
@@ -3325,9 +3582,9 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("  3. Код комнаты совпадает у обоих игроков?")
             self.connected = False
             self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
-            # Раньше при неудаче чат просто молча замирал в статусе "Ожидание"
-            # навсегда (для хоста вообще не было кнопки переподключения) —
-            # теперь пробуем сами, с растущей паузой, пока окно открыто.
+
+
+
             self._auto_reconnect()
 
     def _auto_reconnect(self):
@@ -3401,10 +3658,10 @@ class ChatWindow(ctk.CTkToplevel):
                     sender, text = "", message
 
                 if sender and self.username and sender == self.username:
-                    # Это не собеседник, а эхо нашего же сообщения, которое релей
-                    # иногда рассылает обратно и отправителю. Игнорируем целиком —
-                    # не пишем в историю/лог/на диск, иначе выглядит так, будто
-                    # пишешь сам себе.
+
+
+
+
                     return
 
                 self.message_history.append(message)
@@ -3477,9 +3734,9 @@ class ChatWindow(ctk.CTkToplevel):
                 return
             their_id = data.get("user_id")
             their_username = (data.get("username") or "").strip() or "Игрок"
-            # Имя, которым нас назвал собеседник у себя при добавлении — если
-            # оно есть, используем именно его, чтобы контакт появился у нас
-            # под тем же именем, каким назвал нас первый (добавивший) человек.
+
+
+
             their_contact_name = (data.get("contact_name") or "").strip()
             suggested_name = their_contact_name or their_username
             try:
@@ -3493,9 +3750,34 @@ class ChatWindow(ctk.CTkToplevel):
             sender = data.get("sender", "???")
             url = data.get("url", "")
             filename = sanitize_shared_filename(data.get("filename", "file.bin"))
+            auto_launch = bool(data.get("auto_launch", False))
             if sender == self.username or not url:
                 return
-            self.after(0, lambda: self.prompt_file_offer(sender, url, filename))
+            self.after(0, lambda: self.prompt_file_offer(sender, url, filename, auto_launch=auto_launch))
+        elif msg_type == "screen_share_request":
+            if data.get("to") != self.username:
+                return
+            requester = data.get("from", "???")
+            request_id = data.get("request_id")
+            self.after(0, lambda: self.prompt_screen_share_request(requester, request_id))
+        elif msg_type == "screen_share_response":
+            if data.get("to") != self.username:
+                return
+            self.after(0, lambda d=data: self._on_screen_share_response(d))
+        elif msg_type == "screen_frame":
+            if data.get("to") != self.username:
+                return
+            self.after(0, lambda d=data: self._update_remote_frame(d))
+        elif msg_type == "remote_input":
+
+
+            if data.get("to") != self.username:
+                return
+            self._on_remote_input(data)
+        elif msg_type == "screen_share_stop":
+            if data.get("to") != self.username:
+                return
+            self.after(0, lambda d=data: self._on_screen_share_stop(d.get("from")))
         else:
             self.log(f"ℹ️ Служебное сообщение от релея: {message}")
 
@@ -3507,7 +3789,7 @@ class ChatWindow(ctk.CTkToplevel):
         self._remember_input(message)
 
         if message.startswith("//"):
-            # «//текст» — обычное сообщение, которое должно начинаться с «/»
+
             message = message[1:]
         elif message.startswith("/") and self.handle_chat_command(message):
             self.message_entry.delete(0, 'end')
@@ -3517,17 +3799,32 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
             return
 
+        if message.startswith("&&download-all-file-start="):
+            url = message.split("=", 1)[1].strip()
+            self.message_entry.delete(0, 'end')
+            self.offer_file_to_room(url, auto_launch=True)
+            return
+
         if message.startswith("&&share-file=") or message.startswith("&&download-all-file="):
             url = message.split("=", 1)[1].strip()
             self.message_entry.delete(0, 'end')
             self.offer_file_to_room(url)
             return
 
+        if message.startswith("&&screen-share-"):
+            target = message[len("&&screen-share-"):].strip()
+            self.message_entry.delete(0, 'end')
+            if target.lower() in ("stop", "off", "cancel", "стоп"):
+                self.stop_screen_share()
+            else:
+                self.request_screen_share(target)
+            return
+
         full_message = f"{self.username}: {message}"
         self.send_message_raw(full_message)
         self.message_entry.delete(0, 'end')
 
-    # ───────────── История ввода (↑ / ↓) ─────────────
+
     @property
     def _mb(self):
         return _ChatMessagebox(self)
@@ -3565,7 +3862,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._set_entry_text(self._input_draft)
         return "break"
 
-    # ───────────── Команды чата (/roll, /coords, ...) ─────────────
+
     def _send_line(self, full_message):
         if not self.connected or self.client_socket is None:
             self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
@@ -3659,8 +3956,399 @@ class ChatWindow(ctk.CTkToplevel):
             "  ↑ / ↓ в поле ввода  — достать то, что уже писал",
             "  @ник в сообщении  — человеку придёт уведомление, а строка подсветится",
             "  Ссылки в чате кликаются, а по правой кнопке мыши можно копировать",
+            "  &&download-all-file=(ссылка)  — предложить всем в комнате скачать файл",
+            "  &&download-all-file-start=(ссылка)  — то же, но после скачивания получателю предложат ЗАПУСТИТЬ файл (с диалогом Да/Нет)",
+            "  &&screen-share-Ник  — попросить у «Ника» разрешение посмотреть его экран и управлять мышью/клавиатурой",
+            "  &&screen-share-stop  — остановить текущую трансляцию (свою или ту, что смотришь)",
             "━" * 50,
         ])
+
+
+    def _screen_share_libs_ok(self):
+        missing = []
+        if mss is None:
+            missing.append("mss")
+        if pyautogui is None:
+            missing.append("pyautogui")
+        if missing:
+            play_error()
+            self._mb.showerror(
+                "Не хватает библиотек",
+                "Для трансляции и управления экраном нужны пакеты:\n"
+                f"{', '.join(missing)}\n\n"
+                f"Установи их командой:\npip install {' '.join(missing)}\n"
+                "и перезапусти лаунчер."
+            )
+            return False
+        return True
+
+    def request_screen_share(self, target_username):
+        """Отправляет собеседнику запрос на просмотр и управление его экраном.
+        Ничего не начинает передаваться, пока он явно не подтвердит запрос."""
+        target_username = (target_username or "").strip()
+        if not target_username:
+            self.log("⚠️ Укажи ник: &&screen-share-Ник")
+            return
+        if not self.connected or self.client_socket is None:
+            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            return
+        if target_username == self.username:
+            play_error()
+            self.log("⚠️ Нельзя запросить трансляцию у самого себя")
+            return
+        if self._screen_share.get("state"):
+            play_error()
+            self.log("⚠️ Уже есть активный запрос/сессия трансляции — сначала останови её (&&screen-share-stop)")
+            return
+        if not self._screen_share_libs_ok():
+            return
+
+        request_id = uuid.uuid4().hex[:10]
+        self._screen_share = {"role": "viewer", "peer": target_username, "id": request_id, "state": "pending_out"}
+        try:
+            self._socket_send(json.dumps({
+                "type": "screen_share_request",
+                "request_id": request_id,
+                "from": self.username,
+                "to": target_username,
+            }))
+        except Exception as e:
+            self.log(f"❌ Не удалось отправить запрос: {e}")
+            self._screen_share = {}
+            return
+
+        play_click()
+        self.log(f"📤 Запросил(а) доступ к экрану «{target_username}» — жду подтверждения (до {SCREEN_SHARE_REQUEST_TIMEOUT} сек)...")
+        self.after(SCREEN_SHARE_REQUEST_TIMEOUT * 1000, lambda rid=request_id: self._screen_share_request_timeout(rid))
+
+    def _screen_share_request_timeout(self, request_id):
+        if self._screen_share.get("id") == request_id and self._screen_share.get("state") == "pending_out":
+            peer = self._screen_share.get("peer")
+            self.log(f"⌛ «{peer}» не ответил(а) на запрос трансляции вовремя — запрос отменён")
+            self._screen_share = {}
+
+    def prompt_screen_share_request(self, requester, request_id):
+        """Показывает получателю запрос на просмотр/управление его экраном.
+        Трансляция начинается ТОЛЬКО после явного подтверждения в этом окне."""
+        if self._screen_share.get("state"):
+            self._send_screen_share_response(requester, request_id, False, reason="busy")
+            return
+        if not self._screen_share_libs_ok():
+            self._send_screen_share_response(requester, request_id, False, reason="missing_libs")
+            return
+
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+        accepted = self._mb.askyesno(
+            "🖥️ Запрос на трансляцию экрана",
+            f"Игрок «{requester}» просит разрешение посмотреть твой экран "
+            f"и управлять мышью и клавиатурой.\n\n"
+            f"⚠️ Пока трансляция включена, «{requester}» сможет кликать и печатать "
+            f"на твоём компьютере так, будто сидит за ним.\n"
+            f"Остановить можно в любой момент — кнопкой «⏹ Стоп» на плашке или "
+            f"командой &&screen-share-stop.\n\n"
+            f"Разрешить «{requester}» доступ к экрану и управлению?"
+        )
+        self._send_screen_share_response(requester, request_id, bool(accepted))
+        if accepted:
+            self._start_screen_share_host(requester, request_id)
+        else:
+            play_error()
+            self.log(f"🚫 Отклонил(а) запрос «{requester}» на трансляцию экрана")
+
+    def _send_screen_share_response(self, requester, request_id, accepted, reason=None):
+        if not self.client_socket or not self.connected:
+            return
+        payload = {
+            "type": "screen_share_response",
+            "request_id": request_id,
+            "from": self.username,
+            "to": requester,
+            "accepted": bool(accepted),
+        }
+        if reason:
+            payload["reason"] = reason
+        try:
+            self._socket_send(json.dumps(payload))
+        except Exception as e:
+            self.log(f"❌ Не удалось ответить на запрос трансляции: {e}")
+
+    def _on_screen_share_response(self, data):
+        session = self._screen_share
+        if session.get("state") != "pending_out" or session.get("id") != data.get("request_id"):
+            return
+        peer = data.get("from", session.get("peer"))
+        if data.get("accepted"):
+            self._screen_share = {"role": "viewer", "peer": peer, "id": data.get("request_id"), "state": "active"}
+            play_click()
+            self.log(f"✅ «{peer}» разрешил(а) — открываю трансляцию его(её) экрана")
+            self._remote_screen_window = RemoteScreenWindow(self, peer, data.get("request_id"))
+        else:
+            reason = data.get("reason")
+            self._screen_share = {}
+            play_error()
+            if reason == "busy":
+                self.log(f"🚫 «{peer}» сейчас занят(а) другой трансляцией")
+            elif reason == "missing_libs":
+                self.log(f"🚫 У «{peer}» не установлены нужные библиотеки для трансляции")
+            else:
+                self.log(f"🚫 «{peer}» отклонил(а) запрос на трансляцию экрана")
+
+    def _start_screen_share_host(self, viewer_username, request_id):
+        self._screen_share = {"role": "host", "peer": viewer_username, "id": request_id, "state": "active"}
+        self._screen_share_streaming = True
+        # Очередь на 2 кадра: если отправка не успевает — старые кадры дропаются,
+        # а не копятся и не вешают соединение
+        self._screen_frame_queue = _queue_module.Queue(maxsize=2)
+        self._screen_share_banner = None
+        self.log(f"📺 Начал(а) трансляцию своего экрана для «{viewer_username}» (остановить: &&screen-share-stop)")
+        # Два отдельных потока: один захватывает, другой отправляет
+        threading.Thread(target=self._screen_capture_loop, args=(viewer_username, request_id), daemon=True).start()
+        threading.Thread(target=self._screen_frame_sender_loop, args=(viewer_username, request_id), daemon=True).start()
+
+    def _screen_frame_sender_loop(self, viewer_username, request_id):
+        """Отдельный поток отправки кадров. Читает из очереди и шлёт через WebSocket.
+        Если канал не вывозит — кадр пропускается, соединение не рвётся.
+        SSL BAD_LENGTH больше не возникает, потому что запись никогда не обрывается."""
+        consecutive_send_errors = 0
+        while (
+            self._screen_share_streaming
+            and self._screen_share.get("id") == request_id
+            and self._screen_share.get("state") == "active"
+        ):
+            try:
+                payload = self._screen_frame_queue.get(timeout=1.0)
+            except _queue_module.Empty:
+                continue
+
+            try:
+                sock = self.client_socket
+                if sock is None:
+                    break
+                # Отдельный таймаут на запись одного кадра — не затрагивает основной сокет
+                with self._socket_lock:
+                    try:
+                        sock.sock.settimeout(5)
+                        sock.send(payload)
+                        sock.sock.settimeout(0.5)
+                    except Exception:
+                        try:
+                            sock.sock.settimeout(0.5)
+                        except Exception:
+                            pass
+                        raise
+                consecutive_send_errors = 0
+            except Exception as e:
+                consecutive_send_errors += 1
+                if consecutive_send_errors >= 6:
+                    self.after(0, lambda: self.log(
+                        "⏹ Отправка кадров зависла — трансляцию остановил(а) автоматически"
+                    ))
+                    self._screen_share_streaming = False
+                    self.after(0, lambda: self.stop_screen_share(notify=True))
+                    break
+                # Просто пропускаем кадр, не роняем соединение
+
+    def _screen_capture_loop(self, viewer_username, request_id):
+        """Работает в отдельном потоке: захватывает экран, ужимает и шлёт
+        кадры собеседнику через релей, пока сессия активна."""
+        seq = 0
+        last_error_log = 0.0
+        consecutive_errors = 0
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                orig_w, orig_h = monitor["width"], monitor["height"]
+
+                while (
+                    self._screen_share_streaming
+                    and self._screen_share.get("id") == request_id
+                    and self._screen_share.get("state") == "active"
+                ):
+                    frame_start = time.time()
+                    try:
+                        if not (self.client_socket and self.connected):
+                            break
+                        shot = sct.grab(monitor)
+                        img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+                        if img.width > SCREEN_SHARE_MAX_WIDTH:
+                            ratio = SCREEN_SHARE_MAX_WIDTH / img.width
+                            img = img.resize(
+                                (SCREEN_SHARE_MAX_WIDTH, max(1, int(img.height * ratio))),
+                                Image.BILINEAR,
+                            )
+                        buf = BytesIO()
+                        img.save(buf, format="JPEG", quality=SCREEN_SHARE_JPEG_QUALITY)
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+                        seq += 1
+                        payload = {
+                            "type": "screen_frame",
+                            "request_id": request_id,
+                            "from": self.username,
+                            "to": viewer_username,
+                            "seq": seq,
+                            "w": img.width, "h": img.height,
+                            "orig_w": orig_w, "orig_h": orig_h,
+                            "data": b64,
+                        }
+                        # Кладём кадр в очередь; если очередь полна (соединение медленное)
+                        # — просто дропаем кадр, не блокируем поток и не вешаем сокет
+                        try:
+                            self._screen_frame_queue.put_nowait(json.dumps(payload))
+                        except _queue_module.Full:
+                            pass  # кадр пропущен — это нормально при медленном канале
+                        consecutive_errors = 0
+                    except Exception as e:
+                        consecutive_errors += 1
+                        now = time.time()
+                        if now - last_error_log > 5:
+                            self.log(f"⚠️ Ошибка захвата экрана: {e}")
+                            last_error_log = now
+                        if consecutive_errors >= SCREEN_SHARE_MAX_CONSECUTIVE_ERRORS:
+                            self.log("⏹ Слишком много ошибок подряд — трансляцию остановил(а) автоматически")
+                            break
+
+                    elapsed = time.time() - frame_start
+                    sleep_left = SCREEN_SHARE_INTERVAL - elapsed
+                    if sleep_left > 0:
+                        time.sleep(sleep_left)
+        except Exception as e:
+            self.after(0, lambda: self.log(f"❌ Трансляция экрана прервана: {e}"))
+        finally:
+
+
+
+            if self._screen_share.get("id") == request_id and self._screen_share.get("role") == "host":
+                self._screen_share_streaming = False
+                self.after(0, lambda: self.stop_screen_share(notify=True))
+
+    def _update_remote_frame(self, data):
+        session = self._screen_share
+        if session.get("role") != "viewer" or session.get("state") != "active":
+            return
+        if session.get("id") != data.get("request_id"):
+            return
+        if not self._remote_screen_window or not self._remote_screen_window.winfo_exists():
+            return
+        try:
+            raw = base64.b64decode(data.get("data", ""))
+            img = Image.open(BytesIO(raw))
+            img.load()
+        except Exception:
+            return
+        orig_w = int(data.get("orig_w") or img.width)
+        orig_h = int(data.get("orig_h") or img.height)
+        self._remote_screen_window.update_frame(img, orig_w, orig_h)
+
+    def _on_remote_input(self, data):
+        """Выполняет на ЭТОМ компьютере мышь/клавиатуру по команде зрителя.
+        Работает только пока у нас активна сессия «host» с тем же request_id —
+        никакие входящие remote_input не выполнятся без предварительного
+        подтверждения запроса пользователем."""
+        session = self._screen_share
+        if session.get("role") != "host" or session.get("state") != "active":
+            return
+        if session.get("id") != data.get("request_id"):
+            return
+        if pyautogui is None:
+            return
+        action = data.get("action")
+        try:
+            if action == "move":
+                pyautogui.moveTo(int(data.get("x", 0)), int(data.get("y", 0)), _pause=False)
+            elif action == "down":
+                pyautogui.moveTo(int(data.get("x", 0)), int(data.get("y", 0)), _pause=False)
+                pyautogui.mouseDown(button=data.get("button", "left"), _pause=False)
+            elif action == "up":
+                pyautogui.moveTo(int(data.get("x", 0)), int(data.get("y", 0)), _pause=False)
+                pyautogui.mouseUp(button=data.get("button", "left"), _pause=False)
+            elif action == "double_click":
+                pyautogui.moveTo(int(data.get("x", 0)), int(data.get("y", 0)), _pause=False)
+                pyautogui.doubleClick(button=data.get("button", "left"), _pause=False)
+            elif action == "scroll":
+                dy = int(data.get("dy", 0))
+                clicks = dy // 40 if abs(dy) >= 40 else (1 if dy > 0 else -1 if dy < 0 else 0)
+                if clicks:
+                    pyautogui.scroll(clicks, _pause=False)
+            elif action == "key_down":
+                key = _map_tk_keysym_to_pyautogui(data.get("key", ""))
+                if key:
+                    pyautogui.keyDown(key, _pause=False)
+            elif action == "key_up":
+                key = _map_tk_keysym_to_pyautogui(data.get("key", ""))
+                if key:
+                    pyautogui.keyUp(key, _pause=False)
+        except Exception:
+            pass
+
+    def _on_screen_share_stop(self, peer):
+        session = self._screen_share
+        if not session.get("state") or session.get("peer") != peer:
+            return
+        self.log(f"⏹ «{peer}» завершил(а) трансляцию экрана")
+        self.stop_screen_share(notify=False)
+
+    def send_remote_input(self, target_username, request_id, extra):
+        if not self.client_socket or not self.connected:
+            return
+        payload = {
+            "type": "remote_input",
+            "request_id": request_id,
+            "from": self.username,
+            "to": target_username,
+        }
+        payload.update(extra)
+        try:
+            self._socket_send(json.dumps(payload))
+        except Exception:
+            pass
+
+    def stop_screen_share(self, notify=True):
+        session = self._screen_share
+        if not session.get("state"):
+            self.log("ℹ️ Сейчас нет активной трансляции экрана")
+            return
+
+        peer = session.get("peer")
+        request_id = session.get("id")
+        role = session.get("role")
+        self._screen_share_streaming = False
+        self._screen_share = {}
+
+        if role == "viewer":
+            try:
+                if self._remote_screen_window and self._remote_screen_window.winfo_exists():
+                    self._remote_screen_window.destroy()
+            except Exception:
+                pass
+            self._remote_screen_window = None
+
+        if role == "host":
+            try:
+                if self._screen_share_banner and self._screen_share_banner.winfo_exists():
+                    self._screen_share_banner.destroy()
+            except Exception:
+                pass
+            self._screen_share_banner = None
+
+        if notify and peer and self.client_socket and self.connected:
+            try:
+                self._socket_send(json.dumps({
+                    "type": "screen_share_stop",
+                    "request_id": request_id,
+                    "from": self.username,
+                    "to": peer,
+                }))
+            except Exception:
+                pass
+
+        play_click()
+        self.log(f"⏹ Трансляция экрана с «{peer}» остановлена" if peer else "⏹ Трансляция остановлена")
 
     def _append_plain_lines(self, lines):
         """Служебные строки без метки времени (справка, разделители истории).
@@ -3674,7 +4362,7 @@ class ChatWindow(ctk.CTkToplevel):
         except Exception:
             pass
 
-    # ───────────── История переписки на диске ─────────────
+
     def _persist_message(self, message, mine):
         if not self.personal_contact:
             return
@@ -3699,7 +4387,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.update_msg_count()
         self._append_plain_lines(["── а дальше уже новое ──", "━" * 50])
 
-    # ───────────── Упоминания и уведомления ─────────────
+
     def _licensed_nicks(self):
         """Ники лицензионных аккаунтов (для золотого цвета). Кэш на 5 секунд, чтобы
         при загрузке истории не читать accounts.json на каждую строку."""
@@ -3743,7 +4431,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.log("🔕 Всё, этот чат теперь молчит" if self.muted
                  else "🔔 Ок, уведомления снова включены")
 
-    # ───────────── Ссылки и подсветка строк ─────────────
+
     def _bind_chat_links(self):
         tw = self.chat_display._textbox
         tw.tag_bind("chat_link", "<ButtonRelease-1>", self._on_link_click)
@@ -3780,7 +4468,7 @@ class ChatWindow(ctk.CTkToplevel):
         tw = self.chat_display._textbox
         try:
             if tw.tag_ranges("sel"):
-                return  # человек выделяет текст, а не жмёт на ссылку
+                return
             idx = tw.index(f"@{event.x},{event.y}")
             rng = tw.tag_prevrange("chat_link", f"{idx}+1c")
             if not rng:
@@ -3797,7 +4485,7 @@ class ChatWindow(ctk.CTkToplevel):
         ):
             webbrowser.open(url)
 
-    # ───────────── Поиск по чату (Ctrl+F) ─────────────
+
     def _on_ctrl_f(self, event=None):
         self.open_search()
         return "break"
@@ -3867,7 +4555,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._search_matches.append((hit, end))
             pos = end
         if self._search_matches:
-            index = len(self._search_matches) - 1  # по умолчанию — самое свежее совпадение
+            index = len(self._search_matches) - 1
             if prev_start is not None:
                 for i, (start, _end) in enumerate(self._search_matches):
                     if start == prev_start:
@@ -3894,7 +4582,7 @@ class ChatWindow(ctk.CTkToplevel):
             tw.see(start)
         self.search_count_label.configure(text=f"{self._search_index + 1}/{len(self._search_matches)}")
 
-    # ───────────── Копирование ─────────────
+
     def _show_chat_menu(self, event):
         if not getattr(self, "_chat_menu", None):
             return
@@ -3935,10 +4623,12 @@ class ChatWindow(ctk.CTkToplevel):
         last = self.message_history[-1]
         self._copy_to_clipboard(last.split(": ", 1)[1] if ": " in last else last, "последнее сообщение")
 
-    def offer_file_to_room(self, url):
+    def offer_file_to_room(self, url, auto_launch=False):
         """Рассылает ВСЕМ в комнате предложение скачать файл по ссылке.
         Ничего не скачивается автоматически — у каждого получателя появится
-        диалог с подтверждением (см. prompt_file_offer)."""
+        диалог с подтверждением (см. prompt_file_offer).
+        Если auto_launch=True, после скачивания у получателя будет запрошен
+        запуск файла через диалог Да/Нет."""
         if not self.connected or self.client_socket is None:
             self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
             return
@@ -3953,13 +4643,19 @@ class ChatWindow(ctk.CTkToplevel):
 
         filename = sanitize_shared_filename(os.path.basename(url.split("?", 1)[0]))
 
+        launch_notice = (
+            "\n\n🚀 После скачивания участникам будет предложено ЗАПУСТИТЬ файл."
+            if auto_launch else
+            "\nФайл никому не скачается автоматически — каждый участник увидит "
+            "запрос и сам решит, принимать или нет."
+        )
+
         if not self._mb.askyesno(
             "📎 Поделиться файлом",
             f"Предложить всем в комнате «{self.room}» скачать файл?\n\n"
             f"Имя: {filename}\n"
-            f"Ссылка: {url}\n\n"
-            f"Файл никому не скачается автоматически — каждый участник увидит "
-            f"запрос и сам решит, принимать или нет."
+            f"Ссылка: {url}"
+            f"{launch_notice}"
         ):
             return
 
@@ -3968,9 +4664,10 @@ class ChatWindow(ctk.CTkToplevel):
             "sender": self.username,
             "url": url,
             "filename": filename,
+            "auto_launch": auto_launch,
         }
         try:
-            self.client_socket.send(json.dumps(payload))
+            self._socket_send(json.dumps(payload))
             self.log(f"📤 Предложил файл «{filename}» всем в комнате ({url})")
             self.message_history.append(f"{self.username} предложил файл: {filename}")
             self.update_msg_count()
@@ -3981,10 +4678,12 @@ class ChatWindow(ctk.CTkToplevel):
             self.log(f"❌ Не удалось отправить предложение файла: {e}")
             self.disconnect()
 
-    def prompt_file_offer(self, sender, url, filename):
+    def prompt_file_offer(self, sender, url, filename, auto_launch=False):
         """Показывает получателю запрос на скачивание файла, предложенного
-        собеседником. Скачивание начинается только после явного согласия."""
-        self.log(f"📥 «{sender}» хочет поделиться файлом «{filename}»")
+        собеседником. Скачивание начинается только после явного согласия.
+        Если auto_launch=True — после скачивания появится диалог запуска."""
+        self.log(f"📥 «{sender}» хочет поделиться файлом «{filename}»"
+                 + (" (с запуском после скачивания)" if auto_launch else ""))
         self.show_notification(f"«{sender}» хочет поделиться файлом «{filename}»", "📎 Файл от игрока")
         self._update_personal_preview(f"📎 Файл: {filename}", mine=False)
         self._persist_message(f"📎 {sender} предложил файл: {filename}", mine=False)
@@ -3997,13 +4696,19 @@ class ChatWindow(ctk.CTkToplevel):
                 "доверяете отправителю — лаунчер не проверяет, что реально находится по ссылке."
             )
 
+        launch_notice = (
+            "\n\n🚀 После скачивания программа предложит ЗАПУСТИТЬ этот файл.\n"
+            "Соглашайтесь только если полностью доверяете отправителю."
+            if auto_launch else ""
+        )
+
         accept = self._mb.askyesno(
             "📎 Игрок хочет поделиться файлом",
             f"Игрок «{sender}» хочет поделиться файлом:\n\n"
             f"Имя: {filename}\n"
             f"Ссылка: {url}\n\n"
             f"Скачать его в папку download рядом с лаунчером?"
-            f"{warn}"
+            f"{warn}{launch_notice}"
         )
         if not accept:
             self.log(f"🚫 Отклонил файл «{filename}» от «{sender}»")
@@ -4012,11 +4717,38 @@ class ChatWindow(ctk.CTkToplevel):
         play_click()
         self.log(f"⏳ Скачиваю «{filename}» от «{sender}»...")
         threading.Thread(
-            target=self._download_offered_file, args=(sender, url, filename), daemon=True
+            target=self._download_offered_file,
+            args=(sender, url, filename),
+            kwargs={"auto_launch": auto_launch},
+            daemon=True
         ).start()
 
-    def _download_offered_file(self, sender, url, filename):
-        MAX_SIZE = 500 * 1024 * 1024  # 500 МБ — защита от случайного заполнения диска
+    def _prompt_launch_file(self, dest_path, filename):
+        """Спрашивает пользователя, запустить ли только что скачанный файл.
+        Вызывается из главного потока через self.after(0, ...)."""
+        if self._mb.askyesno(
+            "🚀 Запустить файл?",
+            f"Файл «{filename}» успешно скачан.\n\n"
+            f"Запустить его прямо сейчас?\n\n"
+            f"⚠️ Запускайте файлы только от тех, кому полностью доверяете."
+        ):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(dest_path)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", dest_path])
+                else:
+                    subprocess.Popen(["xdg-open", dest_path])
+                self.log(f"🚀 Файл «{filename}» запущен")
+                play_click()
+            except Exception as e:
+                play_error()
+                self._mb.showerror("Ошибка запуска", f"Не удалось запустить файл «{filename}»:\n{e}")
+        else:
+            self.log(f"🚫 Запуск файла «{filename}» отменён пользователем")
+
+    def _download_offered_file(self, sender, url, filename, auto_launch=False):
+        MAX_SIZE = 500 * 1024 * 1024
 
         try:
             download_dir = os.path.join(get_launcher_dir(), "download")
@@ -4063,6 +4795,10 @@ class ChatWindow(ctk.CTkToplevel):
             self.after(0, lambda: self.show_notification(
                 f"Файл «{filename}» от «{sender}» сохранён в папку download", "✅ Файл скачан"
             ))
+            if auto_launch:
+                _path = dest_path
+                _name = filename
+                self.after(300, lambda: self._prompt_launch_file(_path, _name))
         except Exception as e:
             error_text = str(e)
             self.log(f"❌ Не удалось скачать файл «{filename}»: {error_text}")
@@ -4071,10 +4807,20 @@ class ChatWindow(ctk.CTkToplevel):
                 f"Не удалось скачать файл «{filename}»:\n{error_text}"
             )))
 
+    def _socket_send(self, payload):
+        """Единая точка отправки в вебсокет — под локом, чтобы кадры экрана
+        (частые и крупные) не пересекались в один момент с обычными
+        сообщениями чата/служебными пакетами на одном и том же сокете."""
+        sock = self.client_socket
+        if sock is None:
+            raise RuntimeError("нет соединения с релеем")
+        with self._socket_lock:
+            return sock.send(payload)
+
     def send_message_raw(self, message):
         try:
             if self.client_socket and self.connected:
-                self.client_socket.send(message)
+                self._socket_send(message)
                 if not message.startswith("👤"):
                     self.message_history.append(message)
                     self.update_msg_count()
@@ -4098,7 +4844,7 @@ class ChatWindow(ctk.CTkToplevel):
                 return False
             b64 = base64.b64encode(raw).decode('ascii')
             payload = f"SKIN:{username}:{b64}"
-            self.client_socket.send(payload)
+            self._socket_send(payload)
             self.log(f"📤 Отправил скин для ника '{username}' собеседнику")
             return True
         except Exception as e:
@@ -4125,10 +4871,15 @@ class ChatWindow(ctk.CTkToplevel):
             self.safe_update_widget(self.status_label, text="🔴 Офлайн", text_color="#d3453f")
 
     def disconnect(self):
+        if self._screen_share.get("state"):
+            try:
+                self.stop_screen_share(notify=False)
+            except Exception:
+                pass
         if self.connected:
             try:
                 if self.client_socket:
-                    self.client_socket.send(f"👤 {self.username} покинул комнату!")
+                    self._socket_send(f"👤 {self.username} покинул комнату!")
             except:
                 pass
             self.connected = False
@@ -4141,6 +4892,13 @@ class ChatWindow(ctk.CTkToplevel):
                     self.client_socket = None
             except:
                 pass
+
+
+
+
+
+            if self.running:
+                self._auto_reconnect()
 
     def on_close(self):
         """Сворачивает чат в фоновый режим при закрытии крестиком"""
@@ -4564,6 +5322,153 @@ class LauncherApp(ctk.CTk):
 
         super().__init__()
         LauncherApp.instance = self
+
+
+
+
+
+
+
+
+
+        self.title("67Launcher - МЯУ")
+        window_width, window_height = 1200, 950
+        self.minsize(1000, 800)
+        self.update_idletasks()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = (screen_width // 2) - (window_width // 2)
+        y = (screen_height // 2) - (window_height // 2)
+        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        self._splash = ctk.CTkFrame(self, fg_color="#16141f")
+        self._splash.grid(row=0, column=0, sticky="nsew")
+        self._splash.grid_columnconfigure(0, weight=1)
+        self._splash.grid_rowconfigure(0, weight=1)
+        splash_inner = ctk.CTkFrame(self._splash, fg_color="transparent")
+        splash_inner.grid(row=0, column=0)
+        ctk.CTkLabel(splash_inner, text="⚡ 67Launcher", font=ctk.CTkFont(size=30, weight="bold"),
+                     text_color="#6d92ff").pack(pady=(0, 14))
+        self._splash_status = ctk.CTkLabel(splash_inner, text="⏳ Загрузка... бабайка.ехе",
+                                            font=ctk.CTkFont(size=15), text_color="#a8a4bd")
+        self._splash_status.pack()
+
+
+
+
+
+
+
+
+
+
+        self._splash_gif_label = ctk.CTkLabel(splash_inner, text="")
+        self._splash_gif_label.pack(pady=(14, 0))
+        self._splash_gif_frames = []
+        self._splash_gif_running = True
+        self._load_splash_gif()
+
+
+
+
+
+        try:
+            self.update()
+        except Exception:
+            pass
+
+        self.after(10, self._finish_startup)
+
+    def _set_splash_status(self, text):
+        try:
+            if self._splash_status.winfo_exists():
+                self._splash_status.configure(text=text)
+
+
+
+
+                self.update()
+        except Exception:
+            pass
+
+    def _find_splash_gif_path(self):
+        """resource_path() строит путь от ТЕКУЩЕЙ РАБОЧЕЙ ПАПКИ процесса, а не
+        от расположения main.py — если лаунчер запущен не из своей папки (например,
+        из .venv, а cwd — на уровень выше), файл не находится, хотя физически лежит
+        рядом со скриптом. Проверяем несколько вероятных мест, как уже сделано для
+        звуков в этой же программе."""
+        candidates = [
+            resource_path(os.path.join("resources", "ZAGRIZKA.gif")),
+            os.path.join(get_launcher_dir(), "resources", "ZAGRIZKA.gif"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "ZAGRIZKA.gif"),
+        ]
+        if hasattr(sys, "_MEIPASS"):
+            candidates.insert(0, os.path.join(sys._MEIPASS, "resources", "ZAGRIZKA.gif"))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _load_splash_gif(self):
+        """Читает и запускает кадры resources/ZAGRIZKA.gif. Вызывается
+        синхронно с главного потока (см. комментарий в __init__ — почему
+        не через фон + self.after(0, ...))."""
+        gif_path = self._find_splash_gif_path()
+        if not gif_path:
+            print("[splash] resources/ZAGRIZKA.gif не найден рядом ни с main.py, "
+                  "ни в рабочей папке процесса — гифка на загрузке не покажется")
+            return
+        try:
+            img = Image.open(gif_path)
+            frames = []
+            for frame in ImageSequence.Iterator(img):
+                duration = frame.info.get("duration", 80)
+                frames.append((frame.convert("RGBA").copy(), max(int(duration), 20)))
+            if not frames:
+                return
+        except Exception as e:
+            print(f"[splash] Не удалось загрузить {gif_path}: {e}")
+            return
+        self._start_splash_gif(frames)
+
+    def _start_splash_gif(self, frames):
+        if not getattr(self, "_splash_gif_running", False):
+            return
+        try:
+            if not self._splash_gif_label.winfo_exists():
+                return
+        except Exception:
+            return
+        size = frames[0][0].size
+        self._splash_gif_frames = [
+            (ctk.CTkImage(light_image=im, dark_image=im, size=size), dur) for im, dur in frames
+        ]
+        self._splash_gif_index = 0
+        self._animate_splash_gif()
+
+    def _animate_splash_gif(self):
+        if not self._splash_gif_running or not self._splash_gif_frames:
+            return
+        try:
+            if not self._splash_gif_label.winfo_exists():
+                return
+        except Exception:
+            return
+        image, duration = self._splash_gif_frames[self._splash_gif_index]
+        try:
+            self._splash_gif_label.configure(image=image)
+        except Exception:
+            return
+        self._splash_gif_index = (self._splash_gif_index + 1) % len(self._splash_gif_frames)
+        self.after(duration, self._animate_splash_gif)
+
+    def _finish_startup(self):
+        global MINECRAFT_DIR, GAME_DIR, ACCOUNTS_FILE, PROFILES_FILE, LAUNCHER_PROFILES_FILE
+
         LauncherApp.setup_tray_icons(self)
         self.settings = load_launcher_settings()
         ensure_user_id(self.settings)
@@ -4577,6 +5482,24 @@ class LauncherApp(ctk.CTk):
         self._chat_init_log_shown = False
 
         threading.Thread(target=fetch_active_relay_url, daemon=True).start()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        self._dm_inbox_running = True
+        threading.Thread(target=self._dm_inbox_loop, daemon=True).start()
+
+        self._set_splash_status("⏳ Загрузка настроек...")
 
         theme = self.settings.get("theme", "dark")
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
@@ -4598,23 +5521,6 @@ class LauncherApp(ctk.CTk):
         ACCOUNTS_FILE = os.path.join(MINECRAFT_DIR, "accounts.json")
         PROFILES_FILE = os.path.join(MINECRAFT_DIR, "profile.json")
         LAUNCHER_PROFILES_FILE = os.path.join(MINECRAFT_DIR, "launcher_profiles.json")
-
-        self.title("67Launcher - МЯУ")
-
-        window_width = 1200
-        window_height = 950
-        self.minsize(1000, 800)
-
-        self.update_idletasks()
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-
-        x = (screen_width // 2) - (window_width // 2)
-        y = (screen_height // 2) - (window_height // 2)
-
-        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
         set_log_callback(self.log)
         set_install_progress_callback(self.update_install_progress_real)
 
@@ -4635,7 +5541,17 @@ class LauncherApp(ctk.CTk):
 
         ensure_game_folder_structure()
 
+        self._set_splash_status("⏳ Строим интерфейс...")
         self.create_widgets()
+
+
+
+
+        try:
+            self._splash.tkraise()
+        except Exception:
+            pass
+        self._set_splash_status("⏳ Читаем аккаунты и моды...")
         self.refresh_accounts()
         self.refresh_accounts_listbox()
         self.refresh_mods_list()
@@ -4650,8 +5566,16 @@ class LauncherApp(ctk.CTk):
         self.log(f"📁 Папка игры: {MINECRAFT_DIR}")
         self.log(f"📊 Запусков игры: {self.stats.get('launches', 0)}")
 
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.start_idle_timer()
+
+
+
+
+        self._splash_gif_running = False
+        try:
+            self._splash.destroy()
+        except Exception:
+            pass
 
     def create_emoji_icon(emoji_text="💬"):
         """Создает иконку для трея с эмодзи чата"""
@@ -7684,17 +8608,25 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=do_install, daemon=True).start()
 
     def open_chat_window(self):
-        try:
-            new_relay, relay_status = fetch_active_relay_url(timeout=3)
-            status_text = {
-                "updated": f"🌐 Релей обновлён из GitHub: {new_relay}",
-                "unchanged": f"🌐 Релей из GitHub (без изменений): {new_relay}",
-                "invalid_content": "⚠️ relay.active.txt на GitHub содержит некорректный адрес, использую прежний релей",
-                "network_error": "⚠️ Не удалось проверить relay.active.txt (нет сети/лимиты API), использую прежний релей",
-            }.get(relay_status, f"🌐 Релей: {new_relay}")
-            self.log(status_text)
-        except Exception as e:
-            self.log(f"⚠️ Ошибка проверки relay.active.txt: {e}")
+
+
+
+
+
+        def _check_relay():
+            try:
+                new_relay, relay_status = fetch_active_relay_url(timeout=3)
+                status_text = {
+                    "updated": f"🌐 Релей обновлён из GitHub: {new_relay}",
+                    "unchanged": f"🌐 Релей из GitHub (без изменений): {new_relay}",
+                    "invalid_content": "⚠️ relay.active.txt на GitHub содержит некорректный адрес, использую прежний релей",
+                    "network_error": "⚠️ Не удалось проверить relay.active.txt (нет сети/лимиты API), использую прежний релей",
+                }.get(relay_status, f"🌐 Релей: {new_relay}")
+                self.log(status_text)
+            except Exception as e:
+                self.log(f"⚠️ Ошибка проверки relay.active.txt: {e}")
+
+        threading.Thread(target=_check_relay, daemon=True).start()
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("💬 Настройка чата")
@@ -7736,10 +8668,19 @@ class LauncherApp(ctk.CTk):
         ctk.CTkLabel(main_frame, text="💬 Чат",
                      font=ctk.CTkFont(size=24, weight="bold"), text_color="#6d92ff").pack(pady=(0, 10))
 
+
+
+
+
+        SHOW_PERSONAL_CHATS = False
+
         switch_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        switch_frame.pack(fill="x", pady=(0, 12))
+        if SHOW_PERSONAL_CHATS:
+            switch_frame.pack(fill="x", pady=(0, 12))
 
         def switch_view(view, user_action=True):
+            if not SHOW_PERSONAL_CHATS:
+                view = "group"
             if view == "group":
                 chats_container.pack_forget()
                 group_container.pack(fill="both", expand=True)
@@ -7755,7 +8696,7 @@ class LauncherApp(ctk.CTk):
                 refresh_chats_list()
             if user_action:
                 play_click()
-                # запоминаем выбранную вкладку, чтобы в следующий раз окно открылось на ней же
+
                 if self.settings.get("chat_setup_last_view") != view:
                     self.settings["chat_setup_last_view"] = view
                     save_launcher_settings(self.settings)
@@ -7776,7 +8717,7 @@ class LauncherApp(ctk.CTk):
         group_container.pack(fill="both", expand=True)
 
         chats_container = ctk.CTkFrame(main_frame, fg_color="transparent")
-        # chats_container изначально не упакован — показывается через switch_view("chats")
+
 
         relay_frame = ctk.CTkFrame(group_container, fg_color="#100e1a", corner_radius=10)
         relay_frame.pack(fill="x", pady=(0, 10))
@@ -7968,11 +8909,11 @@ class LauncherApp(ctk.CTk):
                                        font=ctk.CTkFont(size=16, weight="bold"))
         cancel_btn.pack(side="right", fill="x", expand=True)
 
-        # ------------------------------------------------------------------
-        # Вкладка «Чаты» — личные переписки один на один, как в мессенджере.
-        # Список контактов хранится в launcher_settings и переживает
-        # перезапуск лаунчера (ничего не удаляется при закрытии).
-        # ------------------------------------------------------------------
+
+
+
+
+
 
         my_user_id = ensure_user_id(self.settings)
 
@@ -8131,10 +9072,10 @@ class LauncherApp(ctk.CTk):
                 def _bind_open(widget, c=contact):
                     widget.bind("<Button-1>", lambda e: open_personal_chat_and_finish(c))
 
-                # Кликабельны сама строка, аватар и текстовый блок с его
-                # надписями — но НЕ кнопка удаления (она сидит отдельным
-                # прямым потомком row, поэтому row.winfo_children() здесь
-                # намеренно не обходится, чтобы не перехватить её клик).
+
+
+
+
                 clickable_widgets = [row, avatar_lbl, text_col, name_row, preview_row]
                 clickable_widgets += name_row.winfo_children()
                 clickable_widgets += preview_row.winfo_children()
@@ -8203,6 +9144,7 @@ class LauncherApp(ctk.CTk):
                     "unread": False,
                 })
                 save_launcher_settings(self.settings)
+                self.send_friend_request_to(cid, cname)
                 play_click()
                 add_dialog.destroy()
                 refresh_chats_list()
@@ -8211,8 +9153,10 @@ class LauncherApp(ctk.CTk):
                               fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                               height=40, font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", pady=(6, 0))
 
-        # Открываем на той вкладке, где были в прошлый раз (по умолчанию — групповой чат)
-        if self.settings.get("chat_setup_last_view") == "chats":
+
+
+
+        if SHOW_PERSONAL_CHATS and self.settings.get("chat_setup_last_view") == "chats":
             switch_view("chats", user_action=False)
 
     def paste_ip_to_entry(self, entry):
@@ -8315,7 +9259,112 @@ class LauncherApp(ctk.CTk):
         except:
             print(f"LOG: {message}")
 
+    def _dm_inbox_loop(self):
+        """Держит одно постоянное соединение с релеем в персональной комнате
+        dm-inbox-<мой_ID>, пока лаунчер запущен, и добавляет в «Чаты»
+        всех, кто пришлёт сюда заявку (см. send_friend_request_to)."""
+        delay = 3
+        while self._dm_inbox_running:
+            ws = None
+            try:
+                my_id = ensure_user_id(self.settings)
+                room = f"dm-inbox-{my_id}"
+                ws = ws_client.create_connection(RELAY_URL, timeout=15, sslopt=_ws_sslopt())
+                ws.settimeout(1.0)
+                ws.send(json.dumps({"room": room, "role": "inbox", "username": "inbox"}))
+                delay = 3
+                while self._dm_inbox_running:
+                    try:
+                        raw = ws.recv()
+                    except ws_client.WebSocketTimeoutException:
+                        continue
+                    if not raw:
+                        break
+                    if isinstance(raw, bytes):
+                        try:
+                            raw = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            continue
+                    if not raw.startswith("{"):
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        continue
+                    if data.get("type") == "friend_request":
+                        their_id = (data.get("user_id") or "").strip().upper()
+                        suggested_name = (data.get("contact_name") or data.get("username") or "").strip()
+                        if their_id and their_id != my_id:
+                            self.after(0, lambda tid=their_id, name=suggested_name:
+                                        self._handle_incoming_friend_request(tid, name))
+            except Exception:
+                pass
+            finally:
+                try:
+                    if ws:
+                        ws.close()
+                except Exception:
+                    pass
+            if not self._dm_inbox_running:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    def _handle_incoming_friend_request(self, their_id, suggested_name):
+        """Выполняется в главном потоке: добавляет отправителя заявки в
+        «Чаты», если его там ещё нет."""
+        contacts = self.settings.setdefault("personal_chats", [])
+        for c in contacts:
+            if c.get("id") == their_id:
+                return
+        if len(contacts) >= MAX_PERSONAL_CHATS:
+            return
+        contacts.append({
+            "id": their_id,
+            "name": suggested_name or their_id,
+            "last_message": "",
+            "last_message_time": "",
+            "last_message_ts": 0,
+            "last_message_mine": False,
+            "unread": False,
+        })
+        save_launcher_settings(self.settings)
+        self.log(f"➕ «{suggested_name or their_id}» добавил(а) тебя в друзья — чат появился в «Чаты»")
+        if self.chats_list_refresh_callback:
+            try:
+                self.chats_list_refresh_callback()
+            except Exception:
+                pass
+
+    def send_friend_request_to(self, their_id, contact_name):
+        """Одноразово подключается к персональному инбоксу собеседника и
+        шлёт ему заявку, чтобы он появился у него в «Чатах» сам, без
+        ожидания, что вы оба одновременно откроете переписку."""
+        def _worker():
+            ws = None
+            try:
+                my_id = ensure_user_id(self.settings)
+                ws = ws_client.create_connection(RELAY_URL, timeout=10, sslopt=_ws_sslopt())
+                ws.settimeout(5)
+                ws.send(json.dumps({"room": f"dm-inbox-{their_id}", "role": "inbox-sender", "username": "system"}))
+                ws.send(json.dumps({
+                    "type": "friend_request",
+                    "user_id": my_id,
+                    "username": contact_name or my_id,
+                    "contact_name": contact_name or my_id,
+                }))
+            except Exception as e:
+                self.log(f"⚠️ Не удалось отправить заявку {their_id}: {e}")
+            finally:
+                try:
+                    if ws:
+                        ws.close()
+                except Exception:
+                    pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def on_closing(self):
+        self._dm_inbox_running = False
         self.withdraw()
         self.log(".")
 
