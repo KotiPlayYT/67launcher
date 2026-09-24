@@ -1,1 +1,1 @@
-wss://screenrelay2-cd90u8fu.b4a.run
+wss://screen-relay-bibb.onrender.com
