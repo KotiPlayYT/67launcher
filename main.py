@@ -103,8 +103,10 @@ def _extract_relay_candidate(text):
     return text.splitlines()[0].strip() if text else ""
 
 
-def fetch_active_relay_url(timeout=5):
-    global RELAY_URL
+def _probe_relay_candidate(timeout=5):
+    """Скачивает relay.active.txt и возвращает (кандидат, источник).
+    НИЧЕГО не меняет: глобальный RELAY_URL не трогает.
+    Нужен монитору смены релея, который обязан спросить юзера ДО применения."""
     candidate = ""
     source_used = None
 
@@ -138,7 +140,18 @@ def fetch_active_relay_url(timeout=5):
         except Exception as e:
             print(f"[relay] raw.githubusercontent.com недоступен: {e}")
 
-    if candidate and (candidate.startswith("ws://") or candidate.startswith("wss://")):
+    return candidate, source_used
+
+
+def _is_valid_relay_url(url):
+    return bool(url) and (url.startswith("ws://") or url.startswith("wss://"))
+
+
+def fetch_active_relay_url(timeout=5):
+    global RELAY_URL
+    candidate, source_used = _probe_relay_candidate(timeout)
+
+    if _is_valid_relay_url(candidate):
         changed = candidate != RELAY_URL
         RELAY_URL = candidate
         print(f"[relay] Релей ({source_used}): {RELAY_URL}")
@@ -170,6 +183,21 @@ def _notify_relay_changed(url, source_used=None):
         app.after(0, _show)
     except Exception:
         pass
+
+
+RELAY_MONITOR_INTERVAL = 60      # секунд между проверками, не чаще
+RELAY_MONITOR_TIMEOUT = 5        # таймаут одного HTTP-запроса
+
+
+def _start_relay_monitor(app):
+    """Запускает фоновый мониторинг смены релея. Реально работает
+    LauncherApp._relay_monitor_loop; здесь только страховка от повторного
+    запуска на одном экземпляре."""
+    if getattr(app, "_relay_monitor_started", False):
+        return False
+    app._relay_monitor_started = True
+    threading.Thread(target=app._relay_monitor_loop, daemon=True).start()
+    return True
 
 
 def _ws_sslopt():
@@ -3420,8 +3448,9 @@ class ChatWindow(ctk.CTkToplevel):
         ip_frame.pack(fill="x", pady=(5, 10))
 
         room_text = f"🚪 Код комнаты: {self.room}   |   🌐 Релей: {self.relay_url}"
-        ctk.CTkLabel(ip_frame, text=room_text,
-                     font=ctk.CTkFont(size=12), text_color="#d9622f").pack(side="left")
+        self.room_relay_label = ctk.CTkLabel(ip_frame, text=room_text,
+                                            font=ctk.CTkFont(size=12), text_color="#d9622f")
+        self.room_relay_label.pack(side="left")
         copy_btn = make_sound_button(ip_frame, text="📋 Копировать код",
                                      command=lambda: self.copy_ip_to_clipboard(self.room),
                                      width=150, height=30,
@@ -3744,6 +3773,27 @@ class ChatWindow(ctk.CTkToplevel):
             threading.Thread(target=self.run_relay, daemon=True).start()
 
         self.after(delay * 1000, _retry)
+
+    def set_relay_url(self, new_url):
+        """Меняет адрес релея этого окна. Вызывается из главного потока, когда
+        юзер согласился на смену релея — до reconnect(), иначе окно
+        переподключится к старому адресу."""
+        new_url = (new_url or "").strip()
+        if not _is_valid_relay_url(new_url):
+            return False
+        old = self.relay_url
+        if old == new_url:
+            return False
+        self.relay_url = new_url
+        self.log(f"🌐 Релей этого чата изменён: {old} → {new_url}")
+        # Шапка с кодом комнаты тоже показывает релей — обновляем её
+        try:
+            self.room_relay_label.configure(
+                text=f"🚪 Код комнаты: {self.room}   |   🌐 Релей: {self.relay_url}"
+            )
+        except Exception:
+            pass
+        return True
 
     def reconnect(self):
         self._reconnect_attempts = 0
@@ -5797,7 +5847,15 @@ class LauncherApp(ctk.CTk):
         self.chats_list_refresh_callback = None
         self._chat_init_log_shown = False
 
+        # Мониторинг смены релея: флаг диалога + гейт, чтобы не сыпать вопросами
+        self._relay_monitor_started = False
+        self._relay_prompt_active = False
+        self._relay_monitor_gate = threading.Event()
+        self._relay_monitor_gate.set()
+        self._relay_dismissed_relay = None
+
         threading.Thread(target=fetch_active_relay_url, daemon=True).start()
+        _start_relay_monitor(self)
 
 
         self._dm_inbox_running = True
@@ -6057,6 +6115,127 @@ class LauncherApp(ctk.CTk):
             messagebox.showinfo("Готово", "Правило удалено")
         else:
             messagebox.showerror("Не удалось", "Не получилось удалить правило. Проверь права и попробуй вручную.")
+
+    # ---------------- мониторинг смены релея ----------------
+
+    def relay_monitor_enabled(self):
+        return bool(self.settings.get("relay_monitor_enabled", True))
+
+    def set_relay_monitor(self, enabled=None):
+        """Тумблер в настройках чата. Выключен -> проверки не выполняются
+        вовсе (поток живёт, но не ходит в сеть), включён -> проверка возобновляется."""
+        if enabled is None:
+            switch = getattr(self, "relay_monitor_switch", None)
+            enabled = bool(switch.get()) if switch is not None else not self.relay_monitor_enabled()
+        enabled = bool(enabled)
+        self.settings["relay_monitor_enabled"] = enabled
+        save_launcher_settings(self.settings)
+        play_click()
+        self.log(f"🌐 Проверка смены релея: {'включена' if enabled else 'выключена'} (раз в {RELAY_MONITOR_INTERVAL} сек)")
+        return enabled
+
+    def _relay_monitor_loop(self):
+        """Фоновый поток: раз в RELAY_MONITOR_INTERVAL секунд спрашивает у GitHub
+        relay.active.txt. Ничего не применяет молча: при расхождении показывает
+        диалог и ждёт явного «Да». В состоянии, когда диалог показать нельзя,
+        новый адрес НЕ применяется."""
+        # Небольшая задержка, чтобы стартовый fetch_active_relay_url успел отработать
+        time.sleep(5)
+        while True:
+            try:
+                if not self.relay_monitor_enabled():
+                    time.sleep(RELAY_MONITOR_INTERVAL)
+                    continue
+
+                # Гасим гейт ДО проверки: иначе wait() вернётся мгновенно
+                # и получится бесконечный цикл без пауз.
+                self._relay_monitor_gate.clear()
+
+                candidate, source_used = _probe_relay_candidate(timeout=RELAY_MONITOR_TIMEOUT)
+                if _is_valid_relay_url(candidate) and candidate != RELAY_URL:
+                    if candidate == self._relay_dismissed_relay:
+                        # Юзер уже отказался от этого адреса — не достаём повторно,
+                        # ждём появления ДРУГОГО адреса
+                        pass
+                    else:
+                        print(f"[relay] Монитор: релей предлагает {candidate} (сейчас {RELAY_URL})")
+                        # Диалог только из главного потока; фоновый поток лишь просит
+                        self.after(0, lambda c=candidate, s=source_used: self._prompt_relay_change(c, s))
+
+                # Ждём ответа на диалог, чтобы не сыпать вопросами
+                self._relay_monitor_gate.wait(timeout=RELAY_MONITOR_INTERVAL)
+            except Exception as e:
+                print(f"[relay] Монитор: сбой проверки ({e})")
+                time.sleep(RELAY_MONITOR_INTERVAL)
+
+    def _prompt_relay_change(self, new_url, source_used=None):
+        """Главный поток. Показываем вопрос и применяем ТОЛЬКО при явном «Да»."""
+        if not self.relay_monitor_enabled():
+            return
+        if self._relay_prompt_active:
+            return  # предыдущий вопрос ещё не закрыт — не ставим второй
+        if not _is_valid_relay_url(new_url) or new_url == RELAY_URL:
+            self._relay_monitor_gate.set()
+            return
+
+        self._relay_prompt_active = True
+        old_url = RELAY_URL
+        src = f"\n\nИсточник: relay.active.txt на GitHub{f' ({source_used})' if source_used else ''}"
+        try:
+            try:
+                self.deiconify()
+                self.lift()
+            except Exception:
+                pass
+            answer = messagebox.askyesno(
+                "Релей изменился",
+                f"Адрес релея чата изменился:\n\n"
+                f"  старый: {old_url}\n"
+                f"  новый:  {new_url}{src}\n\n"
+                f"Все сообщения чата идут через этот адрес.\n"
+                f"Подключиться к новому?"
+            )
+        except Exception as e:
+            print(f"[relay] Не удалось показать диалог смены релея: {e}")
+            answer = False
+        finally:
+            self._relay_prompt_active = False
+            self._relay_monitor_gate.set()
+
+        if not answer:
+            # Нет / закрыли крестиком / диалог не показался — оставляем старый адрес.
+            # Этот адрес запоминаем, чтобы не спрашивать про него снова на каждом
+            # цикле: вернёмся к вопросу, только если сервер предложит ДРУГОЙ адрес.
+            self._relay_dismissed_relay = new_url
+            self.log(f"🌐 Смена релея на {new_url} отклонена, работаем на {old_url}")
+            return
+
+        self._relay_dismissed_relay = None
+        self._apply_relay_change(new_url, old_url)
+
+    def _apply_relay_change(self, new_url, old_url):
+        global RELAY_URL
+        RELAY_URL = new_url
+        self.log(f"🌐 Релей изменён по твоему согласию: {old_url} → {new_url}")
+
+        switched, skipped = 0, 0
+        for w in self._live_chat_windows():
+            try:
+                # Окна на СВОЁМ релее (юзер вписал вручную) не трогаем:
+                # смена адреса из GitHub их не касается
+                if getattr(w, "relay_url", None) != old_url:
+                    skipped += 1
+                    continue
+                if w.set_relay_url(new_url):
+                    w.reconnect()
+                    switched += 1
+            except Exception as e:
+                print(f"[relay] Не удалось переподключить окно чата: {e}")
+
+        if switched:
+            self.log(f"🔄 Переподключено окон чата: {switched}")
+        if skipped:
+            self.log(f"ℹ️ Окон на своём релее (не трогал): {skipped}")
 
     def get_theme_colors(self):
         if self.settings.get("theme", "dark") == "light":
@@ -9136,6 +9315,23 @@ class LauncherApp(ctk.CTk):
         reset_relay_btn.pack(side="left", padx=(6, 0))
 
         ctk.CTkLabel(relay_frame, text="Можно вписать свой адрес релея (wss://...), если не хотите использовать релей по умолчанию",
+                     font=ctk.CTkFont(size=10), text_color="#8b87a3",
+                     wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
+
+        self.relay_monitor_switch = ctk.CTkSwitch(
+            relay_frame,
+            text=f"Проверять смену релея (раз в {RELAY_MONITOR_INTERVAL} сек)",
+            command=self.set_relay_monitor,
+            font=ctk.CTkFont(size=11)
+        )
+        if self.relay_monitor_enabled():
+            self.relay_monitor_switch.select()
+        else:
+            self.relay_monitor_switch.deselect()
+        self.relay_monitor_switch.pack(anchor="w", padx=10, pady=(0, 4))
+
+        ctk.CTkLabel(relay_frame,
+                     text="Если адрес на сервере сменится, лаунчер спросит и подключит только с твоего согласия.",
                      font=ctk.CTkFont(size=10), text_color="#8b87a3",
                      wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
 
