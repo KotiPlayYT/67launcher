@@ -142,6 +142,10 @@ def fetch_active_relay_url(timeout=5):
         changed = candidate != RELAY_URL
         RELAY_URL = candidate
         print(f"[relay] Релей ({source_used}): {RELAY_URL}")
+        if changed:
+            # Релей приезжает с чужого сервера (GitHub) — показываем юзеру в UI,
+            # куда именно уходят его сообщения, чтобы смена не была молчаливой
+            _notify_relay_changed(RELAY_URL, source_used)
         return RELAY_URL, ("updated" if changed else "unchanged")
     elif candidate:
         print(f"[relay] relay.active.txt содержит не wss:// адрес ('{candidate}'), использую прежний: {RELAY_URL}")
@@ -149,6 +153,23 @@ def fetch_active_relay_url(timeout=5):
     else:
         print(f"[relay] Не удалось получить relay.active.txt ни через API, ни через raw, использую прежний: {RELAY_URL}")
         return RELAY_URL, "network_error"
+
+
+def _notify_relay_changed(url, source_used=None):
+    """Релей приходит со стороны (файл relay.active.txt в чужом репозитории),
+    поэтому его смена показывается в логе лаунчера, а не только в консоли."""
+    try:
+        app = LauncherApp.instance
+        if app is None:
+            return
+        src = f" (источник: {source_used})" if source_used else ""
+
+        def _show():
+            app.log(f"⚠️ Релей ИЗМЕНЁН на {url}{src} — если не ожидал, открой Настройки чата и впиши свой.")
+
+        app.after(0, _show)
+    except Exception:
+        pass
 
 
 def _ws_sslopt():
@@ -283,28 +304,97 @@ def sanitize_shared_filename(name):
     return name[:150]
 
 
+FIREWALL_RULE_NAMES = ("67Launcher Chat", "67Launcher Chat All")
+
+
 def add_firewall_rule():
+    """Добавляет правило фаервола для чата, но ТОЛЬКО после явного согласия юзера.
+    Нужно лишь для прямого P2P-соединения; при работе через релей (по умолчанию)
+    правило не требуется."""
     if sys.platform != "win32":
-        return True
+        return False
 
     try:
-        import subprocess
-        check_cmd = 'netsh advfirewall firewall show rule name="67Launcher Chat"'
-        result = subprocess.run(check_cmd, capture_output=True, text=True, shell=True, encoding='cp866')
-
-        if "No rules match" in result.stdout or "Не найдено" in result.stdout:
-            add_cmd = 'netsh advfirewall firewall add rule name="67Launcher Chat" dir=in action=allow protocol=TCP localport=25565'
-            subprocess.run(add_cmd, capture_output=True, text=True, shell=True, encoding='cp866')
-            add_cmd2 = 'netsh advfirewall firewall add rule name="67Launcher Chat All" dir=in action=allow protocol=TCP localport=25560-25570'
-            subprocess.run(add_cmd2, capture_output=True, text=True, shell=True, encoding='cp866')
-            print("✅ Правило брандмауэра добавлено")
-            return True
-        else:
+        result = subprocess.run(
+            'netsh advfirewall firewall show rule name="67Launcher Chat"',
+            capture_output=True, text=True, shell=True, encoding='cp866'
+        )
+        stdout = result.stdout or ""
+        if "No rules match" not in stdout and "Не найдено" not in stdout:
             print("✅ Правило брандмауэра уже существует")
             return True
     except Exception as e:
+        print(f"⚠️ Не удалось проверить правило брандмауэра: {e}")
+        return False
+
+    answer = messagebox.askyesno(
+        "🔒 Добавить правило фаервола?",
+        "Чат 67Launcher хочет открыть входящие TCP-порты 25565 и 25560–25570.\n\n"
+        "Это нужно только для прямого P2P-соединения. Если ты используешь\n"
+        "чат через релей (по умолчанию) — правило НЕ требуется.\n\n"
+        "Добавить правило сейчас?\n"
+        "(Позже можно удалить в Настройках → Безопасность)"
+    )
+    if not answer:
+        print("ℹ️ Правило брандмауэра не добавлялось — отказ пользователя")
+        return False
+
+    try:
+        for name, port in (
+            ("67Launcher Chat", "25565"),
+            ("67Launcher Chat All", "25560-25570"),
+        ):
+            subprocess.run(
+                f'netsh advfirewall firewall add rule name="{name}" '
+                f'dir=in action=allow protocol=TCP localport={port}',
+                capture_output=True, text=True, shell=True, encoding='cp866'
+            )
+        print("✅ Правило брандмауэра добавлено (после согласия пользователя)")
+        return True
+    except Exception as e:
         print(f"⚠️ Не удалось добавить правило брандмауэра: {e}")
         return False
+
+
+def remove_firewall_rule():
+    """Удаляет правила 67Launcher из фаервола (для кнопки в настройках)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        for name in FIREWALL_RULE_NAMES:
+            subprocess.run(
+                f'netsh advfirewall firewall delete rule name="{name}"',
+                capture_output=True, text=True, shell=True, encoding='cp866'
+            )
+        print("🗑️ Правила брандмауэра 67Launcher удалены")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось удалить правило брандмауэра: {e}")
+        return False
+
+
+def _url_domain(url):
+    """Домен из ссылки для показа в диалоге подтверждения — чтобы юзер видел,
+    КУДА он собирается перейти, а не только длинный адрес."""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").strip().lower()
+        return host or "неизвестно"
+    except Exception:
+        return "неизвестно"
+
+
+def _file_sha256(path, chunk_size=1 << 20):
+    """SHA-256 файла блоками, чтобы не читать 500 МБ целиком в память.
+    Возвращает None, если файл не удалось прочитать."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
 
 
 def get_sound_path(sound_name):
@@ -2409,6 +2499,7 @@ class ChatWindow(ctk.CTkToplevel):
         self._screen_share_streaming = False
         self._remote_screen_window = None
         self._screen_share_banner = None
+        self._screen_share_prompt_active = False
 
         self.muted = bool(personal_contact.get("muted", False)) if personal_contact else False
         self._input_history = []
@@ -4074,6 +4165,23 @@ class ChatWindow(ctk.CTkToplevel):
             self._screen_share = {}
 
     def prompt_screen_share_request(self, requester, request_id):
+        """Показывает получателю запрос на просмотр/управление его экраном.
+        Это НЕ просто просмотр: собеседник получает полный контроль над мышью
+        и клавиатурой. Поэтому требуется ДВА подтверждения — явное «Да/Нет»
+        с объяснением последствий, а затем галка о полном осознании риска.
+        Трансляция начинается ТОЛЬКО после обоих."""
+        # Safe mode — отказ без диалога
+        if getattr(self.master, "safe_mode", False):
+            self._send_screen_share_response(requester, request_id, False, reason="safe_mode")
+            self.log(f"🔒 Safe mode: отклонил запрос трансляции от «{requester}»")
+            return
+
+        # Пока открыт диалог подтверждения, второй запрос не должен вклиниться
+        # в него ещё одним модальным окном: wait_window крутит вложенный цикл
+        # событий, и внутри него продолжают приходить after-колбэки
+        if self._screen_share_prompt_active:
+            self._send_screen_share_response(requester, request_id, False, reason="busy")
+            return
         if self._screen_share.get("state"):
             self._send_screen_share_response(requester, request_id, False, reason="busy")
             return
@@ -4087,22 +4195,114 @@ class ChatWindow(ctk.CTkToplevel):
         except Exception:
             pass
 
-        accepted = self._mb.askyesno(
-            "🖥️ Запрос на трансляцию экрана",
-            f"Игрок «{requester}» просит разрешение посмотреть твой экран "
-            f"и управлять мышью и клавиатурой.\n\n"
-            f"⚠️ Пока трансляция включена, «{requester}» сможет кликать и печатать "
-            f"на твоём компьютере так, будто сидит за ним.\n"
-            f"Остановить можно в любой момент — кнопкой «⏹ Стоп» на плашке или "
-            f"командой &&screen-share-stop.\n\n"
-            f"Разрешить «{requester}» доступ к экрану и управлению?"
-        )
-        self._send_screen_share_response(requester, request_id, bool(accepted))
+        self._screen_share_prompt_active = True
+        try:
+            accepted = self._run_screen_share_confirm(requester)
+        finally:
+            self._screen_share_prompt_active = False
+
+        self._send_screen_share_response(requester, request_id, accepted)
         if accepted:
             self._start_screen_share_host(requester, request_id)
+            # Громкое уведомление: сразу после согласия напоминаем, чем жертвуем
+            self.show_notification(
+                f"«{requester}» УПРАВЛЯЕТ ТВОИМ ПК. Останови: &&screen-share-stop",
+                title="🔴 АКТИВНО УПРАВЛЕНИЕ",
+                force=True
+            )
         else:
             play_error()
             self.log(f"🚫 Отклонил(а) запрос «{requester}» на трансляцию экрана")
+
+    def _run_screen_share_confirm(self, requester):
+        """Два подтверждения подряд: объяснение последствий, затем галка
+        о полном осознании риска. True — только если юзер прошёл оба шага."""
+        # === Первый диалог: общее предупреждение ===
+        first = self._mb.askyesno(
+            "🖥️ ЗАПРОС ПОЛНОГО ДОСТУПА К ПК",
+            f"⚠️⚠️⚠️ ВНИМАНИЕ ⚠️⚠️⚠️\n\n"
+            f"Игрок «{requester}» просит ПОЛНЫЙ ДОСТУП к твоему компьютеру:\n\n"
+            f"  • видеть всё, что происходит на экране\n"
+            f"  • двигать твою мышь\n"
+            f"  • кликать и нажимать клавиши ОТ ТВОЕГО ИМЕНИ\n"
+            f"  • выполнять любые действия, пока окно открыто\n\n"
+            f"Это НЕ просто просмотр экрана — это удалённое управление, как\n"
+            f"будто «{requester}» сел за твой компьютер.\n\n"
+            f"🔴 Разрешай ТОЛЬКО тем, кому доверяешь на 100%.\n"
+            f"🔴 Не разрешай незнакомцам — даже если пишут «мне просто посмотреть».\n\n"
+            f"Продолжить (показать второй диалог подтверждения)?"
+        )
+        if not first:
+            return False
+
+        # === Второй диалог: чекбокс осознания ===
+        confirm_dialog = ctk.CTkToplevel(self)
+        confirm_dialog.title("⚠️ Подтверждение доступа")
+        confirm_dialog.geometry("480x340")
+        confirm_dialog.resizable(False, False)
+        confirm_dialog.grab_set()
+        confirm_dialog.transient(self)
+
+        ctk.CTkLabel(
+            confirm_dialog,
+            text="⚠️ ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="#d3453f"
+        ).pack(pady=(20, 10))
+
+        ctk.CTkLabel(
+            confirm_dialog,
+            text=f"«{requester}» получит полный контроль над твоей мышью и клавиатурой.",
+            font=ctk.CTkFont(size=13),
+            wraplength=420,
+            justify="center"
+        ).pack(pady=(0, 15))
+
+        agree_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            confirm_dialog,
+            text="Я понимаю, что даю полный удалённый доступ\nи что собеседник сможет делать что угодно на моём ПК",
+            variable=agree_var,
+            font=ctk.CTkFont(size=12)
+        ).pack(pady=(0, 15))
+
+        result = {"value": False}
+
+        def on_yes():
+            if not agree_var.get():
+                play_error()
+                messagebox.showwarning("Подтверждение", "Сначала поставь галочку", parent=self)
+                return
+            result["value"] = True
+            release_and_destroy(confirm_dialog)
+
+        def on_no():
+            result["value"] = False
+            release_and_destroy(confirm_dialog)
+
+        confirm_dialog.protocol("WM_DELETE_WINDOW", on_no)
+
+        btn_row = ctk.CTkFrame(confirm_dialog, fg_color="transparent")
+        btn_row.pack(pady=(0, 20))
+
+        make_sound_button(
+            btn_row, text="✅ РАЗРЕШИТЬ ДОСТУП",
+            command=on_yes,
+            fg_color="#d3453f", hover_color="#b83530",
+            height=44, width=200,
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left", padx=8)
+
+        make_sound_button(
+            btn_row, text="❌ ОТМЕНА",
+            command=on_no,
+            fg_color="#4a4666", hover_color="#3d3a52",
+            height=44, width=140,
+            font=ctk.CTkFont(size=14)
+        ).pack(side="left", padx=8)
+
+        self.wait_window(confirm_dialog)
+        return bool(result["value"])
 
     def _send_screen_share_response(self, requester, request_id, accepted, reason=None):
         if not self.client_socket or not self.connected:
@@ -4139,6 +4339,8 @@ class ChatWindow(ctk.CTkToplevel):
                 self.log(f"🚫 «{peer}» сейчас занят(а) другой трансляцией")
             elif reason == "missing_libs":
                 self.log(f"🚫 У «{peer}» не установлены нужные библиотеки для трансляции")
+            elif reason == "safe_mode":
+                self.log(f"🔒 У «{peer}» включён Safe mode — удалённое управление отключено")
             else:
                 self.log(f"🚫 «{peer}» отклонил(а) запрос на трансляцию экрана")
 
@@ -4148,9 +4350,16 @@ class ChatWindow(ctk.CTkToplevel):
         
         
         self._screen_frame_queue = _queue_module.Queue(maxsize=2)
-        self._screen_share_banner = None
-        self.log(f"📺 Начал(а) трансляцию своего экрана для «{viewer_username}» (остановить: &&screen-share-stop)")
-        
+        # Плашка поверх всего: пока идёт трансляция, видно, что она идёт и кому,
+        # и её можно остановить одним кликом (иначе _screen_share_banner остаётся
+        # None и stop_screen_share нечего закрывать)
+        try:
+            self._screen_share_banner = _ScreenShareHostBanner(self, viewer_username)
+        except Exception as e:
+            self._screen_share_banner = None
+            self.log(f"⚠️ Не удалось показать плашку трансляции: {e}")
+        self.log(f"📺 ТРАНСЛЯЦИЯ ЭКРАНА + УПРАВЛЕНИЕ для «{viewer_username}» (стоп: &&screen-share-stop)")
+        # Два отдельных потока: один захватывает, другой отправляет
         threading.Thread(target=self._screen_capture_loop, args=(viewer_username, request_id), daemon=True).start()
         threading.Thread(target=self._screen_frame_sender_loop, args=(viewer_username, request_id), daemon=True).start()
 
@@ -4284,6 +4493,12 @@ class ChatWindow(ctk.CTkToplevel):
         self._remote_screen_window.update_frame(img, orig_w, orig_h)
 
     def _on_remote_input(self, data):
+        """Выполняет на ЭТОМ компьютере мышь/клавиатуру по команде зрителя.
+        Работает только пока у нас активна сессия «host» с тем же request_id —
+        никакие входящие remote_input не выполнятся без предварительного
+        подтверждения запроса пользователем. В Safe mode не выполняется ничего."""
+        if getattr(self.master, "safe_mode", False):
+            return
         session = self._screen_share
         if session.get("role") != "host" or session.get("state") != "active":
             return
@@ -4291,7 +4506,16 @@ class ChatWindow(ctk.CTkToplevel):
             return
         if pyautogui is None:
             return
+
+        # Лог того, что делает удалённый юзер (только значимые действия, чтобы
+        # по логу было видно, если кто-то начнёт водить мышью без спроса)
         action = data.get("action")
+        peer = session.get("peer", "?")
+        if action in ("down", "double_click"):
+            self.log(f"🖱️ «{peer}»: клик {data.get('button', 'left')} в ({data.get('x')},{data.get('y')})")
+        elif action == "key_down":
+            self.log(f"⌨️ «{peer}»: нажатие {data.get('key')}")
+
         try:
             if action == "move":
                 pyautogui.moveTo(int(data.get("x", 0)), int(data.get("y", 0)), _pause=False)
@@ -4508,6 +4732,7 @@ class ChatWindow(ctk.CTkToplevel):
         if self._mb.askyesno(
             "🔗 Открыть ссылку?",
             f"Открыть эту ссылку в браузере?\n\n{url}\n\n"
+            f"🌐 Домен: {_url_domain(url)}\n\n"
             f"Что там внутри, я не проверяю — так что смотри сам."
         ):
             webbrowser.open(url)
@@ -4654,6 +4879,16 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
             return
 
+        if auto_launch and getattr(self.master, "safe_mode", False):
+            play_error()
+            self._mb.showwarning(
+                "Safe mode",
+                "В Safe mode запуск файлов отключён.\n\n"
+                "Файл можно разослать без автозапуска — получатели всё равно "
+                "увидят диалог и решат сами. Команда с автозапуском отменена."
+            )
+            auto_launch = False
+
         if not (url.startswith("http://") or url.startswith("https://")):
             play_error()
             self._mb.showwarning(
@@ -4742,26 +4977,98 @@ class ChatWindow(ctk.CTkToplevel):
         ).start()
 
     def _prompt_launch_file(self, dest_path, filename):
-        if self._mb.askyesno(
-            "🚀 Запустить файл?",
-            f"Файл «{filename}» успешно скачан.\n\n"
-            f"Запустить его прямо сейчас?\n\n"
-            f"⚠️ Запускайте файлы только от тех, кому полностью доверяете."
-        ):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(dest_path)
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", dest_path])
-                else:
-                    subprocess.Popen(["xdg-open", dest_path])
-                self.log(f"🚀 Файл «{filename}» запущен")
-                play_click()
-            except Exception as e:
-                play_error()
-                self._mb.showerror("Ошибка запуска", f"Не удалось запустить файл «{filename}»:\n{e}")
+        """Спрашивает пользователя, запустить ли только что скачанный файл.
+        Для исполняемых файлов одного «Да/Нет» мало — там нужно осознанно
+        вписать слово ЗАПУСТИТЬ, чтобы нельзя было запустить .exe случайно.
+        Вызывается из главного потока через self.after(0, ...)."""
+        if getattr(self.master, "safe_mode", False):
+            self.log(f"🔒 Safe mode: запуск «{filename}» заблокирован")
+            self._mb.showinfo(
+                "Safe mode",
+                f"Запуск файлов отключён в Safe mode.\n\n"
+                f"Файл «{filename}» скачан в папку download, но не запущен."
+            )
+            return
+
+        ext = os.path.splitext(filename)[1].lower()
+        is_executable = ext in (".exe", ".msi", ".bat", ".cmd", ".scr", ".dll",
+                                ".ps1", ".vbs", ".jar", ".com")
+
+        if is_executable:
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("⚠️ Запуск исполняемого файла")
+            dialog.geometry("480x320")
+            dialog.resizable(False, False)
+            dialog.grab_set()
+            dialog.transient(self)
+
+            ctk.CTkLabel(
+                dialog, text="⚠️ ОПАСНО: ИСПОЛНЯЕМЫЙ ФАЙЛ",
+                font=ctk.CTkFont(size=18, weight="bold"), text_color="#d3453f"
+            ).pack(pady=(20, 10))
+
+            ctk.CTkLabel(
+                dialog,
+                text=f"Файл: {filename}\n"
+                     f"Путь: {dest_path}\n\n"
+                     f"Это исполняемый файл. После запуска он сможет делать на твоём ПК\n"
+                     f"что угодно: воровать пароли, шифровать файлы, устанавливать вирусы.\n\n"
+                     f"Запускай ТОЛЬКО если на 100% доверяешь отправителю.",
+                font=ctk.CTkFont(size=12), wraplength=440, justify="left"
+            ).pack(padx=20, pady=(0, 15))
+
+            ctk.CTkLabel(
+                dialog, text="Для подтверждения впиши слово ЗАПУСТИТЬ:",
+                font=ctk.CTkFont(size=12, weight="bold")
+            ).pack(pady=(0, 5))
+
+            entry = ctk.CTkEntry(dialog, width=200, height=35)
+            entry.pack(pady=(0, 15))
+            entry.focus_set()
+
+            def confirm():
+                if entry.get().strip().upper() != "ЗАПУСТИТЬ":
+                    play_error()
+                    messagebox.showwarning("Неверно", "Впиши слово ЗАПУСТИТЬ заглавными буквами", parent=self)
+                    return
+                release_and_destroy(dialog)
+                self._execute_file(dest_path, filename)
+
+            def cancel():
+                release_and_destroy(dialog)
+                self.log(f"🚫 Запуск «{filename}» отменён")
+
+            dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+            btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+            btn_row.pack()
+            make_sound_button(btn_row, text="✅ Запустить", command=confirm,
+                              fg_color="#d3453f", hover_color="#b83530", width=140, height=40).pack(side="left", padx=5)
+            make_sound_button(btn_row, text="❌ Отмена", command=cancel,
+                              fg_color="#4a4666", hover_color="#3d3a52", width=140, height=40).pack(side="left", padx=5)
         else:
-            self.log(f"🚫 Запуск файла «{filename}» отменён пользователем")
+            # не исполняемый — обычный диалог
+            if self._mb.askyesno(
+                "Открыть файл?",
+                f"Открыть «{filename}»?\n\nПуть: {dest_path}"
+            ):
+                self._execute_file(dest_path, filename)
+            else:
+                self.log(f"🚫 Открытие «{filename}» отменено")
+
+    def _execute_file(self, dest_path, filename):
+        try:
+            if sys.platform == "win32":
+                os.startfile(dest_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", dest_path])
+            else:
+                subprocess.Popen(["xdg-open", dest_path])
+            self.log(f"🚀 Файл «{filename}» запущен")
+            play_click()
+        except Exception as e:
+            play_error()
+            self._mb.showerror("Ошибка запуска", f"Не удалось запустить «{filename}»:\n{e}")
 
     def _download_offered_file(self, sender, url, filename, auto_launch=False):
         MAX_SIZE = 500 * 1024 * 1024
@@ -4811,6 +5118,16 @@ class ChatWindow(ctk.CTkToplevel):
             self.after(0, lambda: self.show_notification(
                 f"Файл «{filename}» от «{sender}» сохранён в папку download", "✅ Файл скачан"
             ))
+            # SHA-256, чтобы юзер мог сверить файл с тем, что реально прислал
+            # отправитель (лаунчер не проверяет содержимое по ссылке)
+            digest = _file_sha256(dest_path)
+            if digest:
+                self.log(f"🔐 SHA-256 файла: {digest}")
+                self.after(0, lambda d=digest, n=filename: self._mb.showinfo(
+                    "Файл скачан",
+                    f"«{n}» сохранён в папку download.\n\nSHA-256:\n{d}\n\n"
+                    f"Можешь сверить с отправителем, если он прислал свой хеш."
+                ))
             if auto_launch:
                 _path = dest_path
                 _name = filename
@@ -4872,8 +5189,12 @@ class ChatWindow(ctk.CTkToplevel):
             skin_path = os.path.join(skins_local_path, f"{username}.png")
             with open(skin_path, 'wb') as f:
                 f.write(raw)
-            self.log(f"🎨 Получил скин для ника '{username}' — сохранил локально")
-            self.show_notification(f"Прислал(а) скин для ника «{username}»", "🎨 Скин")
+            size_kb = len(raw) / 1024.0
+            self.log(f"🎨 Получил скин для ника '{username}' ({size_kb:.1f} КБ) "
+                     f"— сохранил локально: {skin_path}")
+            self.show_notification(
+                f"Прислал(а) скин для ника «{username}» ({size_kb:.1f} КБ)", "🎨 Скин"
+            )
         except Exception as e:
             self.log(f"❌ Не удалось сохранить присланный скин: {e}")
 
@@ -5465,6 +5786,9 @@ class LauncherApp(ctk.CTk):
         self.settings = load_launcher_settings()
         ensure_user_id(self.settings)
         self.settings.setdefault("personal_chats", [])
+        # Safe mode: глобальный тумблер «выключить всё опасное разом»
+        # (удалённое управление, трансляция экрана, запуск файлов)
+        self.safe_mode = bool(self.settings.get("safe_mode", False))
         self.stats = load_stats()
         self._secret_launcher = None
         self.game_console = None
@@ -5695,6 +6019,44 @@ class LauncherApp(ctk.CTk):
         play_click()
         self.update_combo_text_color()
         self.log(f"🔶 Золотая тема лицензионных аккаунтов: {'включена' if enabled else 'выключена'} (сохранено)")
+
+    def toggle_safe_mode(self):
+        """Глобальный выключатель опасного: удалённый ввод, трансляция экрана
+        и запуск файлов. Чат, комнаты, моды и игры продолжают работать."""
+        switch = getattr(self, "safe_mode_switch", None)
+        self.safe_mode = bool(switch.get()) if switch is not None else not self.safe_mode
+        self.settings["safe_mode"] = self.safe_mode
+        save_launcher_settings(self.settings)
+        if self.safe_mode:
+            # На всякий случай глушим всё, что могло остаться активным
+            for w in self._live_chat_windows():
+                try:
+                    if w._screen_share.get("role") == "host":
+                        w.stop_screen_share(notify=True)
+                except Exception:
+                    pass
+            play_click()
+            messagebox.showinfo(
+                "Safe mode включён",
+                "Удалённое управление, трансляция экрана и запуск файлов отключены.\n"
+                "Чат, моды и игры работают как обычно."
+            )
+        else:
+            play_click()
+        self.log(f"🔒 Safe mode: {'включён' if self.safe_mode else 'выключен'}")
+
+    def remove_firewall_rules_from_settings(self):
+        """Кнопка в Настройки → Безопасность: снимает правила 67Launcher с фаервола."""
+        if not messagebox.askyesno(
+            "Удалить правило фаервола?",
+            "Удалить правила брандмауэра «67Launcher Chat» и «67Launcher Chat All»?\n\n"
+            "Прямое P2P-соединение перестанет работать (через релей — работает как обычно)."
+        ):
+            return
+        if remove_firewall_rule():
+            messagebox.showinfo("Готово", "Правило удалено")
+        else:
+            messagebox.showerror("Не удалось", "Не получилось удалить правило. Проверь права и попробуй вручную.")
 
     def get_theme_colors(self):
         if self.settings.get("theme", "dark") == "light":
@@ -7767,12 +8129,50 @@ class LauncherApp(ctk.CTk):
                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
         save_ms_btn.grid(row=4, column=0, sticky="w")
 
-        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=9,
-                                                                                                          column=0,
-                                                                                                          sticky="w",
-                                                                                                          pady=(15, 10))
+        ctk.CTkLabel(main_frame, text="🔒 Безопасность", font=ctk.CTkFont(size=14, weight="bold")).grid(row=9,
+                                                                                                            column=0,
+                                                                                                            sticky="w",
+                                                                                                            pady=(15, 5))
+        sec_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        sec_frame.grid(row=10, column=0, sticky="ew")
+        sec_frame.grid_columnconfigure(0, weight=1)
+
+        self.safe_mode_switch = ctk.CTkSwitch(
+            sec_frame,
+            text="Safe mode — отключить всё удалённое управление и запуск файлов",
+            command=self.toggle_safe_mode,
+            font=ctk.CTkFont(size=13)
+        )
+        if self.safe_mode:
+            self.safe_mode_switch.select()
+        else:
+            self.safe_mode_switch.deselect()
+        self.safe_mode_switch.grid(row=0, column=0, sticky="w", pady=2)
+
+        ctk.CTkLabel(
+            sec_frame,
+            text=("В safe mode чат, моды и игры работают как обычно, но чужие игроки "
+                  "не смогут смотреть твой экран, водить мышью и запускать присланные файлы. "
+                  "Запросы на трансляцию будут отклоняться автоматически."),
+            font=ctk.CTkFont(size=11), text_color="#a8a4bd",
+            wraplength=640, justify="left"
+        ).grid(row=1, column=0, sticky="w", pady=(2, 8))
+
+        ctk.CTkLabel(sec_frame, text="Фаервол (нужен только для прямого P2P, через релей — не нужен):",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color="#a8a4bd").grid(
+            row=2, column=0, sticky="w", pady=(4, 4))
+        ctk.CTkButton(
+            sec_frame, text="🗑️ Удалить правило фаервола 67Launcher",
+            command=self.remove_firewall_rules_from_settings,
+            fg_color="#d3453f", hover_color="#b83530"
+        ).grid(row=3, column=0, sticky="w", pady=(0, 15))
+
+        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=11,
+                                                                                                           column=0,
+                                                                                                           sticky="w",
+                                                                                                           pady=(15, 10))
         links_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        links_frame.grid(row=10, column=0, sticky="w", pady=(0, 15))
+        links_frame.grid(row=12, column=0, sticky="w", pady=(0, 15))
 
         github_btn = make_sound_button(links_frame, text="⭐ GitHub",
                                        command=lambda: webbrowser.open("https://github.com/KotiPlayYT/67launcher/"),
@@ -8703,6 +9103,20 @@ class LauncherApp(ctk.CTk):
         relay_entry.pack(side="left", fill="x", expand=True)
         relay_entry.insert(0, custom_relay_url or RELAY_URL)
 
+        # Куда реально уходят сообщения — показываем явно и цветом
+        ctk.CTkLabel(
+            relay_frame,
+            text=f"📡 Сейчас чат подключается к: {RELAY_URL}",
+            font=ctk.CTkFont(size=11, weight="bold"), text_color="#6fce7f",
+            wraplength=520, justify="center"
+        ).pack(pady=(0, 4), padx=10)
+        ctk.CTkLabel(
+            relay_frame,
+            text="⚠️ Адрес подгружается автоматически с GitHub. Если он не совпадает с тем, что ты ожидал — сообщения идут чужому серверу. Впиши свой wss:// ниже.",
+            font=ctk.CTkFont(size=10), text_color="#d9622f",
+            wraplength=520, justify="center"
+        ).pack(pady=(0, 4), padx=10)
+
         def reset_relay():
             relay_entry.delete(0, 'end')
             relay_entry.insert(0, RELAY_URL)
@@ -9214,6 +9628,10 @@ class LauncherApp(ctk.CTk):
             print(f"LOG: {message}")
 
     def _dm_inbox_loop(self):
+        """Держит одно постоянное соединение с релеем в персональной комнате
+        dm-inbox-<мой_ID>, пока лаунчер запущен, и присылает в «Чаты» заявки
+        в друзья (см. send_friend_request_to). Заявка попадает в список только
+        после явного подтверждения пользователя."""
         delay = 3
         while self._dm_inbox_running:
             ws = None
@@ -9262,11 +9680,28 @@ class LauncherApp(ctk.CTk):
             delay = min(delay * 2, 30)
 
     def _handle_incoming_friend_request(self, their_id, suggested_name):
+        """Выполняется в главном потоке: спрашивает разрешение и только потом
+        добавляет отправителя заявки в «Чаты» — раньше любой, кто прислал
+        friend_request, появлялся в списке молча."""
         contacts = self.settings.setdefault("personal_chats", [])
         for c in contacts:
             if c.get("id") == their_id:
                 return
         if len(contacts) >= MAX_PERSONAL_CHATS:
+            return
+        if self.safe_mode:
+            messagebox.showinfo(
+                "Safe mode",
+                f"В Safe mode заявки в «Чаты» автоматически не принимаются.\n\n"
+                f"Игрок «{suggested_name or their_id}» (ID: {their_id}) хочет добавить тебя."
+            )
+            return
+        if not messagebox.askyesno(
+            "Заявка в друзья",
+            f"Игрок «{suggested_name or their_id}» (ID: {their_id}) добавляет тебя в «Чаты».\n\n"
+            f"Принять?"
+        ):
+            self.log(f"🚫 Заявка от «{suggested_name or their_id}» отклонена")
             return
         contacts.append({
             "id": their_id,
@@ -9278,7 +9713,7 @@ class LauncherApp(ctk.CTk):
             "unread": False,
         })
         save_launcher_settings(self.settings)
-        self.log(f"➕ «{suggested_name or their_id}» добавил(а) тебя в друзья — чат появился в «Чаты»")
+        self.log(f"➕ Заявка от «{suggested_name or their_id}» принята — чат появился в «Чаты»")
         if self.chats_list_refresh_callback:
             try:
                 self.chats_list_refresh_callback()
