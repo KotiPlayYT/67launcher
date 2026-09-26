@@ -1,7 +1,48 @@
-import customtkinter as ctk
 import tkinter as tk
+
+
+_boot_root = tk.Tk()
+_boot_root.title("67Launcher")
+_boot_root.configure(bg="#16141f")
+try:
+    _boot_root.overrideredirect(True)
+except Exception:
+    pass
+
+tk.Label(_boot_root, text="⚡ 67Launcher", font=("Segoe UI", 20, "bold"),
+         bg="#16141f", fg="#6d92ff").pack(pady=(24, 8), padx=40)
+_boot_status_label = tk.Label(_boot_root, text="⏳ Загрузка...", font=("Segoe UI", 13),
+                               bg="#16141f", fg="#a8a4bd")
+_boot_status_label.pack(pady=(0, 24))
+
+_boot_root.update_idletasks()
+_bw = _boot_root.winfo_reqwidth() or 320
+_bh = _boot_root.winfo_reqheight() or 120
+_bsw = _boot_root.winfo_screenwidth()
+_bsh = _boot_root.winfo_screenheight()
+_boot_root.geometry(f"{_bw}x{_bh}+{(_bsw - _bw) // 2}+{(_bsh - _bh) // 2}")
+_boot_root.update()
+
+
+def _boot_tick(status=None):
+    if status:
+        try:
+            _boot_status_label.configure(text=f"⏳ {status}")
+        except Exception:
+            pass
+    try:
+        _boot_root.update()
+    except Exception:
+        pass
+
+
+_boot_tick("Запуск...")
+
+
+import customtkinter as ctk
 from tkinter import messagebox, filedialog
 import minecraft_launcher_lib as mll
+_boot_tick("Загрузка интерфейса...")
 import subprocess
 import os
 import sys
@@ -13,6 +54,8 @@ import urllib.request
 import zipfile
 import platform
 import requests
+import random
+_boot_tick("Загрузка сетевых модулей...")
 import threading
 import queue as _queue_module
 import webbrowser
@@ -21,7 +64,7 @@ import ssl
 import certifi
 from datetime import datetime
 import pickle
-import random
+_boot_tick("Загрузка изображений...")
 from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageSequence
 from io import BytesIO
 import socket
@@ -30,10 +73,13 @@ import re
 import traceback
 import hashlib
 import uuid
+_boot_tick("Загрузка чата и трея...")
 import websocket as ws_client
 from urllib.parse import unquote
 import multiprocessing
 import pystray
+_boot_tick("Почти готово...")
+
 
 try:
     import mss
@@ -106,9 +152,6 @@ def fetch_active_relay_url(timeout=5):
 
 
 def _ws_sslopt():
-
-
-
 
 
     return {"cert_reqs": ssl.CERT_REQUIRED, "ca_certs": certifi.where()}
@@ -226,17 +269,12 @@ def resource_path(relative_path):
 
 
 def get_launcher_dir():
-    """Папка, в которой лежит сам 67launcher (exe при сборке через PyInstaller,
-    либо папка со скриптом при запуске из исходников). Используется как база
-    для папки download с файлами, которыми поделились в чате."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def sanitize_shared_filename(name):
-    """Убирает путь/спецсимволы из присланного имени файла, чтобы нельзя было
-    выйти за пределы папки download (../../..) или подсунуть кривое имя."""
     name = unquote(name or "")
     name = os.path.basename(name.replace("\\", "/"))
     name = re.sub(r'[\\/:*?"<>|]', "_", name).strip().strip(".")
@@ -789,18 +827,12 @@ def save_launcher_settings(settings):
 
 
 def generate_short_user_code():
-    """Короткий код вида «482KLM»: 3 цифры + 3 буквы. Специально без похожих
-    друг на друга символов (0/O, 1/I), чтобы код было легко продиктовать
-    другу голосом или переписать с телефона без ошибок."""
     digits = "".join(random.choice("23456789") for _ in range(3))
     letters = "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(3))
     return digits + letters
 
 
 def ensure_user_id(settings):
-    """Гарантирует, что у этого пользователя (этой установки лаунчера) есть
-    свой персональный ID для личных чатов. Генерируется один раз и хранится
-    в launcher_settings — не пересоздаётся между запусками."""
     if not settings.get("user_id"):
         settings["user_id"] = generate_short_user_code()
         save_launcher_settings(settings)
@@ -1978,10 +2010,6 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
 
 MAX_PERSONAL_CHATS = 10
 class _ChatMessagebox:
-    """Обёртка над tkinter.messagebox для окна чата: диалог привязывается к окну
-    чата (parent), чтобы не оказаться спрятанным за ним — иначе кажется, что весь
-    лаунчер завис, ведь окно сообщения модальное. Если окно чата скрыто в фон,
-    parent не передаётся."""
 
     def __init__(self, window):
         self._window = window
@@ -2000,7 +2028,6 @@ class _ChatMessagebox:
 
 
 def release_and_destroy(window):
-    """Закрывает диалог и заодно гарантированно снимает с него захват ввода (grab)."""
     try:
         window.grab_release()
     except Exception:
@@ -2032,9 +2059,6 @@ CHAT_COMMAND_ALIASES = {
 
 
 def chat_history_path(contact_id):
-    """Файл с сохранённой перепиской для личного чата. ID собеседника вводится
-    руками, поэтому имя файла очищается от спецсимволов (защита от «../») и
-    дополняется хэшем, чтобы разные ID не склеивались в один файл."""
     cid = str(contact_id or "")
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", cid)[:48] or "unknown"
     digest = hashlib.sha1(cid.encode("utf-8")).hexdigest()[:8]
@@ -2054,8 +2078,6 @@ def append_chat_history(contact_id, text, mine):
 
 
 def load_chat_history(contact_id, limit=CHAT_HISTORY_MAX_LOAD):
-    """Возвращает последние `limit` сообщений [{ts, text, mine}]. Битые строки
-    пропускаются; если файл разросся больше CHAT_HISTORY_MAX_KEEP — старое обрезается."""
     path = chat_history_path(contact_id)
     entries = []
     try:
@@ -2097,8 +2119,6 @@ def delete_chat_history(contact_id):
 
 
 def parse_roll_spec(arg):
-    """'' -> (1, 6); '20' / 'd20' -> (1, 20); '2d6' / '2к6' -> (2, 6).
-    Возвращает (кубиков, граней) или None, если формат неверный."""
     spec = (arg or "").strip().lower().replace("к", "d").replace("д", "d")
     if not spec:
         return 1, 6
@@ -2120,8 +2140,6 @@ def roll_dice(count, sides):
 
 
 def convert_coords(arg):
-    """'/coords 100 64 -200 [незер|энд|верхний]' (или только X Z) -> готовый текст
-    сообщения с пересчётом Верхний мир ⇄ Незер (÷8 / ×8). None — неверный формат."""
     tokens = (arg or "").replace(",", " ").split()
     world = "overworld"
     if tokens and re.fullmatch(r"[A-Za-zА-Яа-яЁё]+", tokens[-1]):
@@ -2164,9 +2182,6 @@ def format_utc_offset(minutes):
 
 
 def trim_link_tail(url):
-    """Срезает с конца ссылки знаки, которые к ней не относятся (точка в конце
-    предложения, скобка вокруг ссылки). Закрывающая «)» остаётся, если внутри
-    ссылки есть парная «(» — как в ссылках на Википедию."""
     while url:
         last = url[-1]
         if last in ".,;:!?»]}":
@@ -2178,12 +2193,12 @@ def trim_link_tail(url):
     return url
 
 
-SCREEN_SHARE_MAX_WIDTH = 640        # было 960 — меньше разрешение = меньше данных
-SCREEN_SHARE_JPEG_QUALITY = 25      # было 45  — ниже качество JPEG = меньше размер кадра
-SCREEN_SHARE_INTERVAL = 1 / 6      # было 1/12 — 6 fps вместо 12, вдвое меньше трафика
+SCREEN_SHARE_MAX_WIDTH = 640        
+SCREEN_SHARE_JPEG_QUALITY = 25      
+SCREEN_SHARE_INTERVAL = 1 / 6      
 SCREEN_SHARE_REQUEST_TIMEOUT = 30
-SCREEN_SHARE_MOVE_THROTTLE = 0.05  # было 0.02 — реже шлём позицию мыши
-SCREEN_SHARE_MAX_CONSECUTIVE_ERRORS = 8  # было 4 — больше терпимость к ошибкам
+SCREEN_SHARE_MOVE_THROTTLE = 0.05  
+SCREEN_SHARE_MAX_CONSECUTIVE_ERRORS = 8  
 
 _TK_TO_PYAUTOGUI_KEYS = {
     "Return": "enter", "KP_Enter": "enter", "Escape": "esc", "BackSpace": "backspace",
@@ -2204,10 +2219,6 @@ _TK_TO_PYAUTOGUI_KEYS = {
 
 
 def _map_tk_keysym_to_pyautogui(keysym):
-    """Переводит tkinter keysym (например 'Return', 'a', 'F5') в имя клавиши,
-    которое понимает pyautogui.keyDown/keyUp. Возвращает None, если клавишу
-    не удалось однозначно определить (лучше пропустить нажатие, чем нажать
-    не то)."""
     if not keysym:
         return None
     if keysym in _TK_TO_PYAUTOGUI_KEYS:
@@ -2218,9 +2229,6 @@ def _map_tk_keysym_to_pyautogui(keysym):
 
 
 class _ScreenShareHostBanner(ctk.CTkToplevel):
-    """Плавающая плашка на стороне того, чей экран транслируется — всегда
-    видно, что трансляция идёт и кому, и можно остановить её одним кликом,
-    не копаясь в чате."""
 
     def __init__(self, chat_window, viewer_username):
         super().__init__(chat_window)
@@ -2263,10 +2271,6 @@ class _ScreenShareHostBanner(ctk.CTkToplevel):
 
 
 class RemoteScreenWindow(ctk.CTkToplevel):
-    """Окно просмотра и управления чужим экраном (сторона того, кто смотрит).
-    Каждое движение/клик мыши и нажатие клавиши пересчитывается в координаты
-    РЕАЛЬНОГО экрана собеседника (по последним полученным orig_w/orig_h), так
-    что клик по картинке точно попадает туда же на экране хоста."""
 
     def __init__(self, chat_window, peer_username, request_id):
         super().__init__(chat_window)
@@ -2398,12 +2402,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.max_room_size = 20
 
 
-
-
-
         self._socket_lock = threading.Lock()
-
-
 
 
         self._screen_share = {}
@@ -2448,7 +2447,102 @@ class ChatWindow(ctk.CTkToplevel):
         self.create_widgets()
         self._clear_personal_unread()
         self._load_personal_history()
+        self._show_chat_loading_overlay()
         self._start_connection()
+
+    def _find_chat_loading_gif_path(self):
+        candidates = [
+            resource_path(os.path.join("resources", "zagruzkachat.gif")),
+            os.path.join(get_launcher_dir(), "resources", "zagruzkachat.gif"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "zagruzkachat.gif"),
+        ]
+        if hasattr(sys, "_MEIPASS"):
+            candidates.insert(0, os.path.join(sys._MEIPASS, "resources", "zagruzkachat.gif"))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _show_chat_loading_overlay(self):
+        if getattr(self, "_chat_loading_overlay", None) is not None:
+            return
+        try:
+            self._chat_loading_overlay = ctk.CTkFrame(self, fg_color="#16141f")
+            self._chat_loading_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            inner = ctk.CTkFrame(self._chat_loading_overlay, fg_color="transparent")
+            inner.place(relx=0.5, rely=0.5, anchor="center")
+            self._chat_loading_gif_label = ctk.CTkLabel(inner, text="")
+            self._chat_loading_gif_label.pack()
+            ctk.CTkLabel(inner, text="⏳ Подключение к чату...",
+                         font=ctk.CTkFont(size=15, weight="bold"),
+                         text_color="#a8a4bd").pack(pady=(12, 0))
+        except Exception as e:
+            print(f"[chat_loading] Не удалось создать оверлей загрузки: {e}")
+            self._chat_loading_overlay = None
+            return
+        self._chat_loading_gif_running = True
+        self._chat_loading_gif_frames = []
+        self._load_chat_loading_gif()
+
+    def _hide_chat_loading_overlay(self):
+        self._chat_loading_gif_running = False
+        overlay = getattr(self, "_chat_loading_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.destroy()
+            except Exception:
+                pass
+            self._chat_loading_overlay = None
+
+    def _load_chat_loading_gif(self):
+        gif_path = self._find_chat_loading_gif_path()
+        if not gif_path:
+            print("[chat_loading] resources/zagruzkachat.gif не найден рядом ни с main.py, "
+                  "ни в рабочей папке процесса — гифка загрузки чата не покажется")
+            return
+        try:
+            img = Image.open(gif_path)
+            frames = []
+            for frame in ImageSequence.Iterator(img):
+                duration = frame.info.get("duration", 80)
+                frames.append((frame.convert("RGBA").copy(), max(int(duration), 20)))
+            if not frames:
+                return
+        except Exception as e:
+            print(f"[chat_loading] Не удалось загрузить {gif_path}: {e}")
+            return
+        self._start_chat_loading_gif(frames)
+
+    def _start_chat_loading_gif(self, frames):
+        if not getattr(self, "_chat_loading_gif_running", False):
+            return
+        try:
+            if not self._chat_loading_gif_label.winfo_exists():
+                return
+        except Exception:
+            return
+        size = frames[0][0].size
+        self._chat_loading_gif_frames = [
+            (ctk.CTkImage(light_image=im, dark_image=im, size=size), dur) for im, dur in frames
+        ]
+        self._chat_loading_gif_index = 0
+        self._animate_chat_loading_gif()
+
+    def _animate_chat_loading_gif(self):
+        if not self._chat_loading_gif_running or not self._chat_loading_gif_frames:
+            return
+        try:
+            if not self._chat_loading_gif_label.winfo_exists():
+                return
+        except Exception:
+            return
+        image, duration = self._chat_loading_gif_frames[self._chat_loading_gif_index]
+        try:
+            self._chat_loading_gif_label.configure(image=image)
+        except Exception:
+            return
+        self._chat_loading_gif_index = (self._chat_loading_gif_index + 1) % len(self._chat_loading_gif_frames)
+        self.after(duration, self._animate_chat_loading_gif)
 
     def _start_connection(self, run_diagnostics=True):
         first_time = not getattr(self.master, "_chat_init_log_shown", False)
@@ -2488,7 +2582,6 @@ class ChatWindow(ctk.CTkToplevel):
         self.log("━" * 50)
 
     def restore_chat_only(self, event=None):
-        """Открывает и разворачивает ТОЛЬКО ЧАТ без разворачивания лаунчера"""
         self.deiconify()
         self.lift()
         try:
@@ -2538,9 +2631,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.title(base)
 
     def _update_personal_preview(self, text, mine):
-        """Обновляет превью последнего сообщения в списке «Чаты» (личных
-        переписок) и сохраняет его в launcher_settings, чтобы список не
-        сбрасывался при перезапуске лаунчера."""
         if threading.current_thread() is not threading.main_thread():
             try:
                 self.after(0, lambda: self._update_personal_preview(text, mine))
@@ -2577,8 +2667,6 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
     def _clear_personal_unread(self):
-        """Сбрасывает пометку «непрочитано» у этого собеседника — вызывается,
-        когда окно личного чата открыто/развёрнуто."""
         if not self.personal_contact:
             return
         try:
@@ -2605,12 +2693,6 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
     def _broadcast_dm_identity(self):
-        """Сразу после подключения к ЛИЧНОМУ чату сообщает собеседнику наш
-        настоящий персональный ID, текущий ник и то, как МЫ подписали ЕГО
-        контакт у себя. Это нужно, чтобы собеседник мог автоматически
-        добавить нас к себе в «Чаты» — без ручного копирования ID в обе
-        стороны — причём под тем же именем, каким назвали его мы
-        (см. _auto_add_contact)."""
         if not self.personal_contact:
             return
         if not self.client_socket or not self.connected:
@@ -2619,7 +2701,6 @@ class ChatWindow(ctk.CTkToplevel):
             my_id = ensure_user_id(self.master.settings)
         except Exception:
             return
-
 
 
         contact_name = (self.personal_contact.get("name") or "").strip() or self.username
@@ -2634,10 +2715,6 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
     def _auto_add_contact(self, their_id, suggested_name):
-        """Автоматически добавляет собеседника в «Чаты» на ЭТОЙ стороне,
-        если его там ещё нет — вызывается при получении его dm_identity.
-        Так добавление контакта на одном устройстве больше не требует,
-        чтобы второй человек так же вручную вбивал ID в ответ."""
         try:
             settings = getattr(self.master, "settings", None)
             if settings is None:
@@ -2698,8 +2775,6 @@ class ChatWindow(ctk.CTkToplevel):
         return sorted(contacts, key=lambda c: c.get("last_message_ts", 0), reverse=True)
 
     def _go_to_sibling_chat(self, direction):
-        """Переключает ЭТО окно на соседний личный чат из списка «Чаты»:
-        direction=1 — следующий, -1 — предыдущий (порядок как в панели «Чаты»)."""
         if not self.personal_contact or getattr(self, "_transition_running", False):
             return
         contacts = self._get_sorted_personal_chats()
@@ -2717,9 +2792,6 @@ class ChatWindow(ctk.CTkToplevel):
         self._slide_transition(lambda: self._apply_contact_switch(new_contact), direction=direction)
 
     def _apply_contact_switch(self, new_contact):
-        """Вызывается ровно в середине анимации (экран в этот момент закрыт
-        шторкой) — здесь происходит фактическая подмена собеседника: разрыв
-        старого соединения, подключение к комнате нового и перезагрузка истории."""
         old_contact = self.personal_contact
         try:
             if old_contact and hasattr(self.master, "active_chat_windows"):
@@ -2812,10 +2884,6 @@ class ChatWindow(ctk.CTkToplevel):
             return False
 
     def _slide_transition(self, swap_callback, direction=1):
-        """Плавная «шторка», которая едет поверх области чата, полностью
-        закрывает её, в этот момент вызывает swap_callback() (там подменяется
-        контент), а затем уезжает в обратную сторону, открывая новый чат —
-        имитация плавного переключения между переписками, как в Telegram."""
         if getattr(self, "_transition_running", False):
             swap_callback()
             return
@@ -3182,15 +3250,12 @@ class ChatWindow(ctk.CTkToplevel):
             tw.configure(spacing1=3, spacing3=10)
 
 
-
             self.chat_display.tag_config("msg_mine", justify="left", foreground="#bcd2ff",
                                           rmargin=60)
             self.chat_display.tag_config("msg_theirs", justify="right", foreground="#e5e2f0",
                                           lmargin1=60, lmargin2=60)
             self.chat_display.tag_config("msg_system", justify="center", foreground="#8b87a3")
             self.chat_display.tag_config("msg_info", justify="left", foreground="#a8a4bd")
-
-
 
 
             tw.tag_config("chat_ts", foreground="#6d6785",
@@ -3236,11 +3301,6 @@ class ChatWindow(ctk.CTkToplevel):
             self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
             self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
         except Exception as _e:
-
-
-
-
-
 
 
             print(f"[chat_ui] Не удалось настроить подсветку/поиск чата: {_e}")
@@ -3521,11 +3581,6 @@ class ChatWindow(ctk.CTkToplevel):
     def run_relay(self):
 
 
-
-
-
-
-
         if getattr(self, "_connecting", False) or self.connected:
             return
         self._connecting = True
@@ -3547,8 +3602,6 @@ class ChatWindow(ctk.CTkToplevel):
             if not self.running:
 
 
-
-
                 try:
                     self.client_socket.close()
                 except Exception:
@@ -3560,6 +3613,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._socket_send(hello)
             self.connected = True
             self._reconnect_attempts = 0
+            self.after(0, self._hide_chat_loading_overlay)
             self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
             self.safe_update_widget(self.send_btn, state="normal")
             self.participant_count = 1
@@ -3582,7 +3636,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("  3. Код комнаты совпадает у обоих игроков?")
             self.connected = False
             self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
-
 
 
             self._auto_reconnect()
@@ -3660,8 +3713,6 @@ class ChatWindow(ctk.CTkToplevel):
                 if sender and self.username and sender == self.username:
 
 
-
-
                     return
 
                 self.message_history.append(message)
@@ -3734,7 +3785,6 @@ class ChatWindow(ctk.CTkToplevel):
                 return
             their_id = data.get("user_id")
             their_username = (data.get("username") or "").strip() or "Игрок"
-
 
 
             their_contact_name = (data.get("contact_name") or "").strip()
@@ -3874,8 +3924,6 @@ class ChatWindow(ctk.CTkToplevel):
         return self._send_line(f"{self.username}: {value}")
 
     def handle_chat_command(self, message):
-        """True — сообщение было командой (или похоже на неё) и не должно уйти
-        собеседнику как обычный текст. False — это обычный текст."""
         m = CHAT_COMMAND_RE.match(message)
         if not m:
             return False
@@ -3983,8 +4031,6 @@ class ChatWindow(ctk.CTkToplevel):
         return True
 
     def request_screen_share(self, target_username):
-        """Отправляет собеседнику запрос на просмотр и управление его экраном.
-        Ничего не начинает передаваться, пока он явно не подтвердит запрос."""
         target_username = (target_username or "").strip()
         if not target_username:
             self.log("⚠️ Укажи ник: &&screen-share-Ник")
@@ -4028,8 +4074,6 @@ class ChatWindow(ctk.CTkToplevel):
             self._screen_share = {}
 
     def prompt_screen_share_request(self, requester, request_id):
-        """Показывает получателю запрос на просмотр/управление его экраном.
-        Трансляция начинается ТОЛЬКО после явного подтверждения в этом окне."""
         if self._screen_share.get("state"):
             self._send_screen_share_response(requester, request_id, False, reason="busy")
             return
@@ -4101,19 +4145,16 @@ class ChatWindow(ctk.CTkToplevel):
     def _start_screen_share_host(self, viewer_username, request_id):
         self._screen_share = {"role": "host", "peer": viewer_username, "id": request_id, "state": "active"}
         self._screen_share_streaming = True
-        # Очередь на 2 кадра: если отправка не успевает — старые кадры дропаются,
-        # а не копятся и не вешают соединение
+        
+        
         self._screen_frame_queue = _queue_module.Queue(maxsize=2)
         self._screen_share_banner = None
         self.log(f"📺 Начал(а) трансляцию своего экрана для «{viewer_username}» (остановить: &&screen-share-stop)")
-        # Два отдельных потока: один захватывает, другой отправляет
+        
         threading.Thread(target=self._screen_capture_loop, args=(viewer_username, request_id), daemon=True).start()
         threading.Thread(target=self._screen_frame_sender_loop, args=(viewer_username, request_id), daemon=True).start()
 
     def _screen_frame_sender_loop(self, viewer_username, request_id):
-        """Отдельный поток отправки кадров. Читает из очереди и шлёт через WebSocket.
-        Если канал не вывозит — кадр пропускается, соединение не рвётся.
-        SSL BAD_LENGTH больше не возникает, потому что запись никогда не обрывается."""
         consecutive_send_errors = 0
         while (
             self._screen_share_streaming
@@ -4129,7 +4170,7 @@ class ChatWindow(ctk.CTkToplevel):
                 sock = self.client_socket
                 if sock is None:
                     break
-                # Отдельный таймаут на запись одного кадра — не затрагивает основной сокет
+                
                 with self._socket_lock:
                     try:
                         sock.sock.settimeout(5)
@@ -4151,11 +4192,9 @@ class ChatWindow(ctk.CTkToplevel):
                     self._screen_share_streaming = False
                     self.after(0, lambda: self.stop_screen_share(notify=True))
                     break
-                # Просто пропускаем кадр, не роняем соединение
+                
 
     def _screen_capture_loop(self, viewer_username, request_id):
-        """Работает в отдельном потоке: захватывает экран, ужимает и шлёт
-        кадры собеседнику через релей, пока сессия активна."""
         seq = 0
         last_error_log = 0.0
         consecutive_errors = 0
@@ -4196,12 +4235,12 @@ class ChatWindow(ctk.CTkToplevel):
                             "orig_w": orig_w, "orig_h": orig_h,
                             "data": b64,
                         }
-                        # Кладём кадр в очередь; если очередь полна (соединение медленное)
-                        # — просто дропаем кадр, не блокируем поток и не вешаем сокет
+                        
+                        
                         try:
                             self._screen_frame_queue.put_nowait(json.dumps(payload))
                         except _queue_module.Full:
-                            pass  # кадр пропущен — это нормально при медленном канале
+                            pass  
                         consecutive_errors = 0
                     except Exception as e:
                         consecutive_errors += 1
@@ -4220,7 +4259,6 @@ class ChatWindow(ctk.CTkToplevel):
         except Exception as e:
             self.after(0, lambda: self.log(f"❌ Трансляция экрана прервана: {e}"))
         finally:
-
 
 
             if self._screen_share.get("id") == request_id and self._screen_share.get("role") == "host":
@@ -4246,10 +4284,6 @@ class ChatWindow(ctk.CTkToplevel):
         self._remote_screen_window.update_frame(img, orig_w, orig_h)
 
     def _on_remote_input(self, data):
-        """Выполняет на ЭТОМ компьютере мышь/клавиатуру по команде зрителя.
-        Работает только пока у нас активна сессия «host» с тем же request_id —
-        никакие входящие remote_input не выполнятся без предварительного
-        подтверждения запроса пользователем."""
         session = self._screen_share
         if session.get("role") != "host" or session.get("state") != "active":
             return
@@ -4351,8 +4385,6 @@ class ChatWindow(ctk.CTkToplevel):
         self.log(f"⏹ Трансляция экрана с «{peer}» остановлена" if peer else "⏹ Трансляция остановлена")
 
     def _append_plain_lines(self, lines):
-        """Служебные строки без метки времени (справка, разделители истории).
-        Только из главного потока."""
         try:
             self.chat_display.configure(state="normal")
             for line in lines:
@@ -4389,8 +4421,6 @@ class ChatWindow(ctk.CTkToplevel):
 
 
     def _licensed_nicks(self):
-        """Ники лицензионных аккаунтов (для золотого цвета). Кэш на 5 секунд, чтобы
-        при загрузке истории не читать accounts.json на каждую строку."""
         now = time.time()
         cache = getattr(self, "_licensed_cache", None)
         if cache is None or now - cache[0] > 5:
@@ -4439,9 +4469,6 @@ class ChatWindow(ctk.CTkToplevel):
         tw.tag_bind("chat_link", "<Leave>", lambda e: tw.configure(cursor="xterm"))
 
     def _decorate_chat_line(self, start_index, message):
-        """Подсвечивает ссылки и упоминания в только что вставленной строке.
-        Используется поиск самого Tk (а не смещения из Python), поэтому эмодзи
-        в начале строки не сбивают позиции."""
         try:
             tw = self.chat_display._textbox
             if message.startswith("💬") and self._mentions_me(message):
@@ -4567,7 +4594,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.search_count_label.configure(text="не нашёл")
 
     def search_step(self, direction):
-        """direction = -1 — к более старому совпадению (вверх), +1 — к более новому."""
         if self._search_matches:
             self._search_index = (self._search_index + direction) % len(self._search_matches)
             self._show_search_current()
@@ -4624,11 +4650,6 @@ class ChatWindow(ctk.CTkToplevel):
         self._copy_to_clipboard(last.split(": ", 1)[1] if ": " in last else last, "последнее сообщение")
 
     def offer_file_to_room(self, url, auto_launch=False):
-        """Рассылает ВСЕМ в комнате предложение скачать файл по ссылке.
-        Ничего не скачивается автоматически — у каждого получателя появится
-        диалог с подтверждением (см. prompt_file_offer).
-        Если auto_launch=True, после скачивания у получателя будет запрошен
-        запуск файла через диалог Да/Нет."""
         if not self.connected or self.client_socket is None:
             self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
             return
@@ -4679,9 +4700,6 @@ class ChatWindow(ctk.CTkToplevel):
             self.disconnect()
 
     def prompt_file_offer(self, sender, url, filename, auto_launch=False):
-        """Показывает получателю запрос на скачивание файла, предложенного
-        собеседником. Скачивание начинается только после явного согласия.
-        Если auto_launch=True — после скачивания появится диалог запуска."""
         self.log(f"📥 «{sender}» хочет поделиться файлом «{filename}»"
                  + (" (с запуском после скачивания)" if auto_launch else ""))
         self.show_notification(f"«{sender}» хочет поделиться файлом «{filename}»", "📎 Файл от игрока")
@@ -4724,8 +4742,6 @@ class ChatWindow(ctk.CTkToplevel):
         ).start()
 
     def _prompt_launch_file(self, dest_path, filename):
-        """Спрашивает пользователя, запустить ли только что скачанный файл.
-        Вызывается из главного потока через self.after(0, ...)."""
         if self._mb.askyesno(
             "🚀 Запустить файл?",
             f"Файл «{filename}» успешно скачан.\n\n"
@@ -4808,9 +4824,6 @@ class ChatWindow(ctk.CTkToplevel):
             )))
 
     def _socket_send(self, payload):
-        """Единая точка отправки в вебсокет — под локом, чтобы кадры экрана
-        (частые и крупные) не пересекались в один момент с обычными
-        сообщениями чата/служебными пакетами на одном и том же сокете."""
         sock = self.client_socket
         if sock is None:
             raise RuntimeError("нет соединения с релеем")
@@ -4894,22 +4907,15 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
 
 
-
-
-
             if self.running:
                 self._auto_reconnect()
 
     def on_close(self):
-        """Сворачивает чат в фоновый режим при закрытии крестиком"""
         self.withdraw()
         self.is_minimized = True
         play_click()
 
     def leave_room(self):
-        """Настоящий выход из комнаты: разрывает соединение, уведомляет
-        собеседника и полностью закрывает окно чата (в отличие от
-        «Закрыть чат», который просто сворачивает окно в фон)."""
         if not self._mb.askyesno(
             "Выйти из комнаты",
             f"Выйти из комнаты «{self.room}»?\n"
@@ -5034,11 +5040,6 @@ class GameConsoleWindow(ctk.CTkToplevel):
 
 def _make_dropdown_chevron_image(size=14, thickness=2,
                                   color_light="#221f30", color_dark="#e5e2f0"):
-    """
-    Рисует ровный шеврон-стрелочку вниз через PIL (а не текстовым символом),
-    чтобы она выглядела так же аккуратно и одинаково, как встроенная
-    стрелочка у CTkComboBox, независимо от шрифтов на компьютере пользователя.
-    """
     def draw(color):
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
@@ -5057,8 +5058,6 @@ _AVATAR_COLORS = ["#6d92ff", "#6fce7f", "#d9622f", "#d3453f", "#a56fe0", "#e0a13
 
 
 def make_avatar_image(label_text, size=44):
-    """Рисует круглый цветной аватар с первой буквой имени/ника — используется
-    в списке личных чатов, когда у собеседника нет своей картинки профиля."""
     label_text = (label_text or "?").strip()
     initial = label_text[0].upper() if label_text else "?"
     color = _AVATAR_COLORS[sum(ord(c) for c in label_text) % len(_AVATAR_COLORS)]
@@ -5088,11 +5087,6 @@ def make_avatar_image(label_text, size=44):
 
 
 class SearchableComboBox(ctk.CTkFrame):
-    """
-    Комбобокс с поповером: показывает не больше max_visible_items строк
-    (дальше — скролл) и строку поиска сверху для фильтрации версий.
-    Совместим по интерфейсу с CTkComboBox: get() / set() / configure(values=...).
-    """
 
     _ROW_HEIGHT = 30
 
@@ -5324,13 +5318,6 @@ class LauncherApp(ctk.CTk):
         LauncherApp.instance = self
 
 
-
-
-
-
-
-
-
         self.title("67Launcher - МЯУ")
         window_width, window_height = 1200, 950
         self.minsize(1000, 800)
@@ -5349,6 +5336,16 @@ class LauncherApp(ctk.CTk):
         self._splash.grid(row=0, column=0, sticky="nsew")
         self._splash.grid_columnconfigure(0, weight=1)
         self._splash.grid_rowconfigure(0, weight=1)
+
+        
+        
+        self._splash_gif_label = ctk.CTkLabel(self._splash, text="")
+        self._splash_gif_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self._splash_gif_frames = []
+        self._splash_gif_running = True
+        self._splash_size = (window_width, window_height)
+        self._load_splash_gif()
+
         splash_inner = ctk.CTkFrame(self._splash, fg_color="transparent")
         splash_inner.grid(row=0, column=0)
         ctk.CTkLabel(splash_inner, text="⚡ 67Launcher", font=ctk.CTkFont(size=30, weight="bold"),
@@ -5356,25 +5353,7 @@ class LauncherApp(ctk.CTk):
         self._splash_status = ctk.CTkLabel(splash_inner, text="⏳ Загрузка... бабайка.ехе",
                                             font=ctk.CTkFont(size=15), text_color="#a8a4bd")
         self._splash_status.pack()
-
-
-
-
-
-
-
-
-
-
-        self._splash_gif_label = ctk.CTkLabel(splash_inner, text="")
-        self._splash_gif_label.pack(pady=(14, 0))
-        self._splash_gif_frames = []
-        self._splash_gif_running = True
-        self._load_splash_gif()
-
-
-
-
+        splash_inner.lift()
 
         try:
             self.update()
@@ -5389,53 +5368,67 @@ class LauncherApp(ctk.CTk):
                 self._splash_status.configure(text=text)
 
 
-
-
                 self.update()
         except Exception:
             pass
 
     def _find_splash_gif_path(self):
-        """resource_path() строит путь от ТЕКУЩЕЙ РАБОЧЕЙ ПАПКИ процесса, а не
-        от расположения main.py — если лаунчер запущен не из своей папки (например,
-        из .venv, а cwd — на уровень выше), файл не находится, хотя физически лежит
-        рядом со скриптом. Проверяем несколько вероятных мест, как уже сделано для
-        звуков в этой же программе."""
-        candidates = [
-            resource_path(os.path.join("resources", "ZAGRIZKA.gif")),
-            os.path.join(get_launcher_dir(), "resources", "ZAGRIZKA.gif"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "ZAGRIZKA.gif"),
-        ]
+        base_dirs = []
         if hasattr(sys, "_MEIPASS"):
-            candidates.insert(0, os.path.join(sys._MEIPASS, "resources", "ZAGRIZKA.gif"))
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
+            base_dirs.append(os.path.join(sys._MEIPASS, "resources", "gif"))
+        base_dirs.append(os.path.join(get_launcher_dir(), "resources", "gif"))
+        base_dirs.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "gif"))
+        base_dirs.append(os.path.join(os.path.abspath("."), "resources", "gif"))
+        seen = set()
+        for d in base_dirs:
+            if d in seen:
+                continue
+            seen.add(d)
+            try:
+                if os.path.isdir(d):
+                    gifs = [f for f in os.listdir(d) if f.lower().endswith(".gif")]
+                    if gifs:
+                        return os.path.join(d, random.choice(gifs))
+            except Exception:
+                pass
         return None
 
     def _load_splash_gif(self):
-        """Читает и запускает кадры resources/ZAGRIZKA.gif. Вызывается
-        синхронно с главного потока (см. комментарий в __init__ — почему
-        не через фон + self.after(0, ...))."""
         gif_path = self._find_splash_gif_path()
         if not gif_path:
-            print("[splash] resources/ZAGRIZKA.gif не найден рядом ни с main.py, "
-                  "ни в рабочей папке процесса — гифка на загрузке не покажется")
+            print("[splash] В resources/gif не найдено ни одной .gif — "
+                  "фон на загрузке не покажется")
             return
+        target_w, target_h = getattr(self, "_splash_size", (1200, 950))
         try:
             img = Image.open(gif_path)
             frames = []
             for frame in ImageSequence.Iterator(img):
                 duration = frame.info.get("duration", 80)
-                frames.append((frame.convert("RGBA").copy(), max(int(duration), 20)))
+                fitted = self._fit_cover(frame.convert("RGBA"), target_w, target_h)
+                frames.append((fitted, max(int(duration), 20)))
             if not frames:
                 return
         except Exception as e:
             print(f"[splash] Не удалось загрузить {gif_path}: {e}")
             return
-        self._start_splash_gif(frames)
+        self._start_splash_gif(frames, (target_w, target_h))
 
-    def _start_splash_gif(self, frames):
+    @staticmethod
+    def _fit_cover(im, target_w, target_h):
+        src_w, src_h = im.size
+        if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+            return im
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(1, round(src_w * scale))
+        new_h = max(1, round(src_h * scale))
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+        im = im.resize((new_w, new_h), resample)
+        left = max(0, (new_w - target_w) // 2)
+        top = max(0, (new_h - target_h) // 2)
+        return im.crop((left, top, left + target_w, top + target_h))
+
+    def _start_splash_gif(self, frames, size):
         if not getattr(self, "_splash_gif_running", False):
             return
         try:
@@ -5443,7 +5436,6 @@ class LauncherApp(ctk.CTk):
                 return
         except Exception:
             return
-        size = frames[0][0].size
         self._splash_gif_frames = [
             (ctk.CTkImage(light_image=im, dark_image=im, size=size), dur) for im, dur in frames
         ]
@@ -5482,18 +5474,6 @@ class LauncherApp(ctk.CTk):
         self._chat_init_log_shown = False
 
         threading.Thread(target=fetch_active_relay_url, daemon=True).start()
-
-
-
-
-
-
-
-
-
-
-
-
 
 
         self._dm_inbox_running = True
@@ -5545,8 +5525,6 @@ class LauncherApp(ctk.CTk):
         self.create_widgets()
 
 
-
-
         try:
             self._splash.tkraise()
         except Exception:
@@ -5569,8 +5547,6 @@ class LauncherApp(ctk.CTk):
         self.start_idle_timer()
 
 
-
-
         self._splash_gif_running = False
         try:
             self._splash.destroy()
@@ -5578,7 +5554,6 @@ class LauncherApp(ctk.CTk):
             pass
 
     def create_emoji_icon(emoji_text="💬"):
-        """Создает иконку для трея с эмодзи чата"""
         img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         try:
@@ -5590,7 +5565,6 @@ class LauncherApp(ctk.CTk):
         return img
 
     def create_launcher_icon():
-        """Создает иконку для трея 67Лаунчера"""
         img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rectangle((4, 4, 60, 60), fill="#3d6bf0", outline="#ffffff", width=2)
@@ -5628,7 +5602,7 @@ class LauncherApp(ctk.CTk):
             launcher_app.after(0, launcher_app.destroy)
 
         launcher_menu = pystray.Menu(
-            pystray.MenuItem("🚀 Открыть 67Launcher", show_launcher_only, default=True),
+            pystray.MenuItem(" Открыть 67Launcher", show_launcher_only, default=True),
             pystray.MenuItem("❌ Полный выход", quit_app)
         )
         launcher_icon = pystray.Icon("67_launcher", LauncherApp.create_launcher_icon(), "67Launcher", launcher_menu)
@@ -5637,8 +5611,6 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=launcher_icon.run, daemon=True).start()
 
     def _live_chat_windows(self):
-        """Окна чатов (и комнаты, и личные), которые ещё существуют.
-        Вызывать только из главного потока."""
         windows, seen = [], set()
         for w in list(self.active_chat_windows.values()) + [self.active_chat_window]:
             if w is None or id(w) in seen:
@@ -5652,8 +5624,6 @@ class LauncherApp(ctk.CTk):
         return windows
 
     def open_chat_from_tray(self, icon=None, show_all=False):
-        """Клик по иконке чата в трее (в главном потоке). По умолчанию открывает тот
-        чат, где есть новые сообщения, а если таких нет — с которым работали последним."""
         windows = self._live_chat_windows()
         if not windows:
             self.log("ℹ️ Нажали на иконку чата, но открытых чатов нет")
@@ -8610,9 +8580,6 @@ class LauncherApp(ctk.CTk):
     def open_chat_window(self):
 
 
-
-
-
         def _check_relay():
             try:
                 new_relay, relay_status = fetch_active_relay_url(timeout=3)
@@ -8667,9 +8634,6 @@ class LauncherApp(ctk.CTk):
 
         ctk.CTkLabel(main_frame, text="💬 Чат",
                      font=ctk.CTkFont(size=24, weight="bold"), text_color="#6d92ff").pack(pady=(0, 10))
-
-
-
 
 
         SHOW_PERSONAL_CHATS = False
@@ -8910,11 +8874,6 @@ class LauncherApp(ctk.CTk):
         cancel_btn.pack(side="right", fill="x", expand=True)
 
 
-
-
-
-
-
         my_user_id = ensure_user_id(self.settings)
 
         my_id_frame = ctk.CTkFrame(chats_container, fg_color="#100e1a", corner_radius=10)
@@ -9073,9 +9032,6 @@ class LauncherApp(ctk.CTk):
                     widget.bind("<Button-1>", lambda e: open_personal_chat_and_finish(c))
 
 
-
-
-
                 clickable_widgets = [row, avatar_lbl, text_col, name_row, preview_row]
                 clickable_widgets += name_row.winfo_children()
                 clickable_widgets += preview_row.winfo_children()
@@ -9152,8 +9108,6 @@ class LauncherApp(ctk.CTk):
             make_sound_button(frame, text="✅ Добавить", command=confirm_add,
                               fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                               height=40, font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", pady=(6, 0))
-
-
 
 
         if SHOW_PERSONAL_CHATS and self.settings.get("chat_setup_last_view") == "chats":
@@ -9260,9 +9214,6 @@ class LauncherApp(ctk.CTk):
             print(f"LOG: {message}")
 
     def _dm_inbox_loop(self):
-        """Держит одно постоянное соединение с релеем в персональной комнате
-        dm-inbox-<мой_ID>, пока лаунчер запущен, и добавляет в «Чаты»
-        всех, кто пришлёт сюда заявку (см. send_friend_request_to)."""
         delay = 3
         while self._dm_inbox_running:
             ws = None
@@ -9311,8 +9262,6 @@ class LauncherApp(ctk.CTk):
             delay = min(delay * 2, 30)
 
     def _handle_incoming_friend_request(self, their_id, suggested_name):
-        """Выполняется в главном потоке: добавляет отправителя заявки в
-        «Чаты», если его там ещё нет."""
         contacts = self.settings.setdefault("personal_chats", [])
         for c in contacts:
             if c.get("id") == their_id:
@@ -9337,9 +9286,6 @@ class LauncherApp(ctk.CTk):
                 pass
 
     def send_friend_request_to(self, their_id, contact_name):
-        """Одноразово подключается к персональному инбоксу собеседника и
-        шлёт ему заявку, чтобы он появился у него в «Чатах» сам, без
-        ожидания, что вы оба одновременно откроете переписку."""
         def _worker():
             ws = None
             try:
@@ -9370,6 +9316,10 @@ class LauncherApp(ctk.CTk):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    try:
+        _boot_root.destroy()
+    except Exception:
+        pass
     try:
         app = LauncherApp()
         app.mainloop()
