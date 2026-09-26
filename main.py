@@ -8683,7 +8683,13 @@ class LauncherApp(ctk.CTk):
                 update_stats()
                 self.stats = load_stats()
                 if was_first_launch:
-                    self.after(0, self.show_first_launch_server_dialog)
+                    # TODO(upstream): show_first_launch_server_dialog вызывается,
+                    # но в KotiPlayYT/67launcher (495c0f7) такого метода нет —
+                    # вызов падал с AttributeError на первом запуске игры.
+                    # Своего диалога не придумываем: ждём реализации от автора.
+                    # Когда метод появится в апстриме — раскомментировать.
+                    # self.after(0, self.show_first_launch_server_dialog)
+                    pass
 
                 self.after(0, self.start_game_timer)
 
