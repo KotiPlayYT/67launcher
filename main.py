@@ -41,6 +41,76 @@ import customtkinter as ctk
 from tkinter import messagebox, filedialog
 import minecraft_launcher_lib as mll
 
+# --- Расширенные настройки: переопределение цветов ВСЕХ кнопок --------------
+# Ключ — оригинальный hex-цвет (в нижнем регистре) как он прописан в коде,
+# значение — новый hex-цвет, которым его нужно заменить. Заполняется из
+# settings["custom_button_colors"] при старте (см. _finish_startup).
+_BUTTON_COLOR_OVERRIDES = {}
+
+
+def resolve_button_color(value):
+    """Подменяет hex-цвет на пользовательский, если он переопределён
+    в расширенных настройках (код "set2026"). Не трогает всё остальное
+    (кортежи light/dark, "transparent", None и т.п.)."""
+    if isinstance(value, str) and value.lower() in _BUTTON_COLOR_OVERRIDES:
+        return _BUTTON_COLOR_OVERRIDES[value.lower()]
+    return value
+
+
+def _apply_button_color_overrides(overrides_dict):
+    _BUTTON_COLOR_OVERRIDES.clear()
+    for k, v in (overrides_dict or {}).items():
+        if isinstance(k, str) and isinstance(v, str):
+            _BUTTON_COLOR_OVERRIDES[k.lower()] = v
+
+
+# Патчим CTkButton.__init__ один раз — это перекрашивает АБСОЛЮТНО ВСЕ
+# кнопки в лаунчере (и через make_sound_button, и созданные напрямую),
+# без необходимости лезть в каждый вызов по отдельности.
+_original_ctkbutton_init = ctk.CTkButton.__init__
+
+
+def _patched_ctkbutton_init(self, *args, **kwargs):
+    for _color_key in ("fg_color", "hover_color", "text_color", "border_color"):
+        if _color_key in kwargs:
+            kwargs[_color_key] = resolve_button_color(kwargs[_color_key])
+    _original_ctkbutton_init(self, *args, **kwargs)
+
+
+ctk.CTkButton.__init__ = _patched_ctkbutton_init
+
+# Человекочитаемые подписи для известных цветов кнопок — только для UI
+# расширенных настроек. Реальная замена работает по hex-ключу, так что
+# даже если подпись не идеально точная, замена всё равно применится
+# правильно ко всем кнопкам с этим цветом.
+KNOWN_BUTTON_COLORS = [
+    ("#6fce7f", "🟢 Зелёная (успех / запуск / сохранить)"),
+    ("#5cb56c", "🟢 Зелёная — при наведении"),
+    ("#d3453f", "🔴 Красная (опасность / отмена / удалить)"),
+    ("#b83530", "🔴 Красная — при наведении"),
+    ("#6d92ff", "🔵 Синяя (акцент / чат)"),
+    ("#5a7dd8", "🔵 Синяя — при наведении"),
+    ("#5b8ef0", "🔵 Синяя (вариант) — при наведении"),
+    ("#2b2840", "⚪ Тёмно-серая (вторичная кнопка)"),
+    ("#3d3a52", "⚪ Тёмно-серая — при наведении"),
+    ("#d9622f", "🟠 Оранжевая (поддержать / установка)"),
+    ("#c14f26", "🟠 Оранжевая — при наведении"),
+    ("#7896f7", "🟣 Сине-фиолетовая (запустить игру)"),
+    ("#5f7fe0", "🟣 Сине-фиолетовая — при наведении"),
+    ("#201d30", "🟪 Тёмно-фиолетовая (карточки/панели)"),
+    ("#3d3a58", "🟪 Тёмно-фиолетовая — при наведении"),
+    ("#2a2840", "🟪 Тёмно-фиолетовая (вариант 2)"),
+    ("#3a3850", "⬛ Серо-фиолетовая тёмная"),
+    ("#4a4666", "⬛ Серо-фиолетовая светлее"),
+    ("#5a1c1c", "🟤 Тёмно-красная (опасная зона)"),
+    ("#712323", "🟤 Тёмно-красная — при наведении"),
+    ("#8b2f2f", "🟤 Красно-коричневая"),
+    ("#a53a3a", "🟤 Красно-коричневая — при наведении"),
+    ("#16141f", "🔤 Тёмный текст на светлых кнопках"),
+    ("#9b97b8", "🔤 Серый текст"),
+    ("#e0ddf0", "🔤 Светлый текст"),
+]
+
 _boot_tick("Загрузка интерфейса...")
 import subprocess
 import os
@@ -182,7 +252,7 @@ def check_room_active(relay_url, room, timeout=5):
 
 def check_dependencies():
     required = ['customtkinter', 'minecraft_launcher_lib', 'requests', 'PIL', 'certifi']
-    pip_names = {}
+    pip_names = {'PIL': 'Pillow'}
     missing = []
     for pkg in required:
         try:
@@ -390,6 +460,200 @@ def play_click():
 
 def play_error():
     threading.Thread(target=lambda: play_sound("error"), daemon=True).start()
+
+
+_ACTIVE_TOASTS = []
+
+
+def close_all_toasts():
+    """Немедленно закрывает все сейчас открытые всплывающие уведомления
+    (используется, например, при переключении вкладок)."""
+    for t in list(_ACTIVE_TOASTS):
+        try:
+            if t.winfo_exists():
+                t.destroy()
+        except Exception:
+            pass
+        try:
+            _ACTIVE_TOASTS.remove(t)
+        except ValueError:
+            pass
+
+
+_TOAST_STYLES = {
+    "error": {"border": "#ff5f5f", "bg": "#241a22", "title_fg": "#ff9c9c",
+               "msg_fg": "#e6c9c9", "icon": "⚠️"},
+    "success": {"border": "#6fce7f", "bg": "#16241c", "title_fg": "#9be8ab",
+                "msg_fg": "#cfe8d4", "icon": "✅"},
+    "info": {"border": "#6d92ff", "bg": "#161c26", "title_fg": "#a8c2ff",
+             "msg_fg": "#cfd8ea", "icon": "ℹ️"},
+}
+
+
+def _show_toast(master, title, message, kind="info", duration=500):
+    """Всплывающее уведомление у курсора: появляется сразу, немного висит,
+    затем улетает вверх и растворяется — вместо модального диалогового окна."""
+    if threading.current_thread() is not threading.main_thread():
+        try:
+            master.after(0, lambda: _show_toast(master, title, message, kind, duration))
+        except Exception:
+            pass
+        return
+
+    style = _TOAST_STYLES.get(kind, _TOAST_STYLES["info"])
+
+    def _fallback():
+        try:
+            if kind == "error":
+                messagebox.showerror(title, message)
+            else:
+                messagebox.showinfo(title, message)
+        except Exception:
+            print(f"{title} — {message}")
+
+    try:
+        toast = tk.Toplevel(master)
+    except Exception as e:
+        print(f"[toast] не удалось создать окно уведомления: {e}")
+        _fallback()
+        return
+
+    _ACTIVE_TOASTS.append(toast)
+
+    try:
+        toast.overrideredirect(True)
+    except Exception:
+        pass
+    try:
+        toast.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        toast.configure(bg=style["border"])
+    except Exception:
+        pass
+
+    try:
+        inner = tk.Frame(toast, bg=style["bg"])
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        header = tk.Frame(inner, bg=style["bg"])
+        header.pack(fill="x", padx=14, pady=(10, 2))
+        tk.Label(header, text=style["icon"], font=("Segoe UI", 13), bg=style["bg"],
+                 fg=style["title_fg"]).pack(side="left")
+        tk.Label(header, text=str(title), font=("Segoe UI", 12, "bold"),
+                 bg=style["bg"], fg=style["title_fg"], anchor="w", justify="left").pack(side="left", padx=(6, 0))
+
+        tk.Label(inner, text=str(message), font=("Segoe UI", 10),
+                 bg=style["bg"], fg=style["msg_fg"], anchor="w", justify="left",
+                 wraplength=320).pack(fill="x", padx=14, pady=(0, 12))
+    except Exception as e:
+        print(f"[toast] ошибка построения содержимого: {e}")
+        try:
+            _ACTIVE_TOASTS.remove(toast)
+        except ValueError:
+            pass
+        try:
+            toast.destroy()
+        except Exception:
+            pass
+        _fallback()
+        return
+
+    try:
+        toast.update_idletasks()
+        w = max(toast.winfo_reqwidth(), 220)
+        h = max(toast.winfo_reqheight(), 60)
+    except Exception:
+        w, h = 300, 90
+
+    try:
+        sw = master.winfo_screenwidth()
+        sh = master.winfo_screenheight()
+    except Exception:
+        sw, sh = 1920, 1080
+
+    try:
+        px = master.winfo_pointerx()
+        py = master.winfo_pointery()
+    except Exception:
+        px, py = sw // 2, sh // 2
+
+    x = px + 18
+    y_start = py + 18
+    if x + w > sw:
+        x = sw - w - 10
+    if y_start + h > sh:
+        y_start = sh - h - 10
+    if x < 0:
+        x = 10
+    if y_start < 0:
+        y_start = 10
+
+    try:
+        toast.geometry(f"{w}x{h}+{x}+{y_start}")
+    except Exception:
+        pass
+    try:
+        toast.attributes("-alpha", 1.0)
+    except Exception:
+        pass
+    try:
+        toast.deiconify()
+        toast.lift()
+        toast.update()
+    except Exception:
+        pass
+
+    state = {"alpha": 1.0, "y": float(y_start)}
+
+    def _safe_alive():
+        try:
+            return toast.winfo_exists()
+        except Exception:
+            return False
+
+    def fly_away():
+        if not _safe_alive():
+            return
+        state["y"] -= 1.5
+        state["alpha"] = max(0.0, state["alpha"] - 0.02)
+        try:
+            toast.geometry(f"{w}x{h}+{x}+{int(state['y'])}")
+            toast.attributes("-alpha", state["alpha"])
+        except Exception:
+            pass
+        if state["alpha"] > 0.0:
+            try:
+                toast.after(15, fly_away)
+            except Exception:
+                pass
+        else:
+            try:
+                _ACTIVE_TOASTS.remove(toast)
+            except ValueError:
+                pass
+            try:
+                toast.destroy()
+            except Exception:
+                pass
+
+    try:
+        toast.after(duration, fly_away)
+    except Exception:
+        fly_away()
+
+
+def show_error_toast(master, title, message, duration=500):
+    _show_toast(master, title, message, kind="error", duration=duration)
+
+
+def show_info_toast(master, title, message, duration=500):
+    t = str(title)
+    kind = "info" if ("инф" in t.lower() or "пуст" in t.lower()) else "success"
+    _show_toast(master, title, message, kind=kind, duration=duration)
+
+
 
 
 GOLDEN_THEME_ACTIVE = {"value": False}
@@ -794,7 +1058,8 @@ def load_launcher_settings():
         "ms_client_id": DEFAULT_MS_CLIENT_ID,
         "ms_redirect_uri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
         "user_id": "",
-        "personal_chats": []
+        "personal_chats": [],
+        "custom_button_colors": {}
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -1294,7 +1559,7 @@ def scan_versions():
                     version_type = "fabric"
                 elif "forge" in folder_lower:
                     version_type = "forge"
-                elif "optifine" in folder_lower or "of" in folder_lower:
+                elif "optifine" in folder_lower:
                     version_type = "optifine"
                 elif "snapshot" in folder_lower:
                     version_type = "snapshot"
@@ -1754,6 +2019,109 @@ class LoadingSpinner(ctk.CTkLabel):
         self.configure(text="✅")
 
 
+class AdvancedColorSettingsWindow(ctk.CTkToplevel):
+    """Секретное окно (код 'set2026' в поиске версий на вкладке «Установка»),
+    где можно перекрасить ЛЮБОЙ цвет любой кнопки лаунчера hex-кодом."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.launcher = master
+        self.title("🎨 Расширенные настройки — цвета кнопок")
+        self.geometry("620x680")
+        self.minsize(500, 400)
+        self.grab_set()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(self, text="🎨 Цвета всех кнопок лаунчера",
+                     font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, pady=(15, 5))
+        ctk.CTkLabel(self, text="Впиши свой HTML/hex-код (например #ff00aa) для любого цвета ниже.\n"
+                                "Изменения применятся после перезапуска лаунчера.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="center").grid(
+            row=0, column=0, pady=(60, 0))
+
+        scroll = ctk.CTkScrollableFrame(self)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=15, pady=(5, 10))
+        scroll.grid_columnconfigure(1, weight=1)
+
+        custom = master.settings.get("custom_button_colors", {})
+        self.entries = {}
+
+        for i, (original_hex, label) in enumerate(KNOWN_BUTTON_COLORS):
+            current_value = custom.get(original_hex, original_hex)
+
+            swatch = ctk.CTkFrame(scroll, width=28, height=28, corner_radius=6, fg_color=original_hex)
+            swatch.grid(row=i, column=0, padx=(4, 10), pady=6)
+            swatch.grid_propagate(False)
+
+            ctk.CTkLabel(scroll, text=label, font=ctk.CTkFont(size=12), anchor="w").grid(
+                row=i, column=1, sticky="w", padx=(0, 10))
+
+            entry = ctk.CTkEntry(scroll, width=110, height=28)
+            entry.insert(0, current_value)
+            entry.grid(row=i, column=2, padx=(0, 4))
+            self.entries[original_hex] = entry
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, pady=(0, 15))
+
+        save_btn = make_sound_button(btn_frame, text="💾 Сохранить всё", command=self.save_all,
+                                     fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                                     width=180, height=38)
+        save_btn.pack(side="left", padx=(0, 10))
+
+        reset_btn = make_sound_button(btn_frame, text="↩️ Сбросить всё", command=self.reset_all,
+                                      fg_color="#2b2840", hover_color="#3d3a52", width=180, height=38)
+        reset_btn.pack(side="left")
+
+    @staticmethod
+    def _normalize_hex(value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        if not value.startswith("#"):
+            value = "#" + value
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value.lower()
+        return False
+
+    def save_all(self):
+        custom = {}
+        bad = []
+        for original_hex, entry in self.entries.items():
+            normalized = self._normalize_hex(entry.get())
+            if normalized is False:
+                bad.append(entry.get())
+                continue
+            if normalized and normalized != original_hex:
+                custom[original_hex] = normalized
+
+        if bad:
+            play_error()
+            show_error_toast(self.launcher, "Ошибка",
+                             f"Не похоже на hex-цвет: {', '.join(bad[:3])}")
+            return
+
+        self.launcher.settings["custom_button_colors"] = custom
+        save_launcher_settings(self.launcher.settings)
+        _apply_button_color_overrides(custom)
+        play_click()
+        self.launcher.log(f"🎨 Сохранено кастомных цветов кнопок: {len(custom)} — перезапусти лаунчер")
+        show_info_toast(self.launcher, "Сохранено",
+                        "Цвета сохранены! Перезапусти лаунчер, чтобы увидеть все изменения.")
+
+    def reset_all(self):
+        for original_hex, entry in self.entries.items():
+            entry.delete(0, "end")
+            entry.insert(0, original_hex)
+        self.launcher.settings["custom_button_colors"] = {}
+        save_launcher_settings(self.launcher.settings)
+        _apply_button_color_overrides({})
+        play_click()
+        self.launcher.log("↩️ Все кастомные цвета кнопок сброшены — перезапусти лаунчер")
+
+
 class SecretGeometryDashLauncher(ctk.CTkToplevel):
     def __init__(self, master):
         super().__init__(master)
@@ -1970,7 +2338,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         self.install_btn.configure(state="normal", text="🔄 Переустановить")
         self.launch_btn.configure(state="normal")
         play_click()
-        messagebox.showinfo("Успешно!",
+        show_info_toast(self, "Успешно!",
                             "🎮 Geometry Dash успешно установлен!\n\n📁 Папка: " + self.gd_path + "\n🚀 Нажмите 'Запустить GD' для игры!")
 
     def install_error(self, error):
@@ -1981,7 +2349,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         self.install_btn.configure(state="normal", text="📥 Установить GD")
         self.launch_btn.configure(state="disabled")
         play_error()
-        messagebox.showerror("Ошибка установки",
+        show_error_toast(self, "Ошибка установки",
                              f"Не удалось установить Geometry Dash.\n\nОшибка: {error}\n\n💡 Попробуйте:\n1. Проверьте интернет\n2. Отключите антивирус\n3. Запустите от имени администратора")
 
     def launch_geometry_dash(self):
@@ -1995,7 +2363,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                     break
             if not os.path.exists(self.exe_path):
                 play_error()
-                messagebox.showerror("Ошибка", "GeometryDash.exe куда-то потерялся\n\nПосмотри тут:\n" + self.gd_path)
+                show_error_toast(self, "Ошибка", "GeometryDash.exe куда-то потерялся\n\nПосмотри тут:\n" + self.gd_path)
                 return
         try:
             self.status_label.configure(text="🚀 Запуск...", text_color="#d9622f")
@@ -2010,7 +2378,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
             self.status_label.configure(text="❌ Ошибка запуска", text_color="#d3453f")
             self.launch_btn.configure(state="normal")
             play_error()
-            messagebox.showerror("Ошибка", f"Не запустилось:\n{e}")
+            show_error_toast(self, "Ошибка", f"Не запустилось:\n{e}")
 
 
 MAX_PERSONAL_CHATS = 10
@@ -2408,6 +2776,9 @@ class ChatWindow(ctk.CTkToplevel):
         self.unread_count = 0
         self.participant_count = 1
         self.max_room_size = 20
+        self._room_members = []
+        self._members_popup = None
+        self._muted_members = set()  # заглушённые участники комнаты (локально)
 
         self._socket_lock = threading.Lock()
 
@@ -2450,11 +2821,65 @@ class ChatWindow(ctk.CTkToplevel):
         except:
             pass
 
+        self._desired_username = self.username
+        self._reclaim_attempts = 0
+        self._reclaim_scheduled = False
+        self._wd_last_tick = time.time()
+        self.after(4000, self._sleep_watchdog_tick)
+
         self.create_widgets()
         self._clear_personal_unread()
         self._load_personal_history()
         self._show_chat_loading_overlay()
         self._start_connection()
+
+    def _sleep_watchdog_tick(self):
+        now = time.time()
+        gap = now - getattr(self, "_wd_last_tick", now)
+        self._wd_last_tick = now
+        if gap > 15:
+            self.log("💤 Похоже, компьютер был в спящем режиме — переподключаюсь...")
+            self._handle_resume_from_sleep()
+        if self.running and self.winfo_exists():
+            self.after(4000, self._sleep_watchdog_tick)
+
+    def _handle_resume_from_sleep(self):
+        # Старое соединение могло ещё числиться на сервере как активное.
+        # Аккуратно закрываем его локально и ждём чуть дольше обычного,
+        # чтобы сервер успел признать старую сессию мёртвой и не выдал новый ник.
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except Exception:
+                pass
+            self.client_socket = None
+        self.connected = False
+        self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
+        self._reconnect_attempts = 0
+
+        def _delayed_retry():
+            if self.running and self.winfo_exists() and not self.connected:
+                threading.Thread(target=self.run_relay, daemon=True).start()
+
+        self.after(6000, _delayed_retry)
+
+    def _schedule_username_reclaim(self):
+        if self._reclaim_scheduled or self._reclaim_attempts > 6:
+            return
+        self._reclaim_scheduled = True
+        delay_sec = min(60 * (2 ** min(self._reclaim_attempts, 4)), 600)
+        self.after(delay_sec * 1000, self._try_reclaim_username)
+
+    def _try_reclaim_username(self):
+        self._reclaim_scheduled = False
+        if not self.running or not self.connected:
+            return
+        if self.username == self._desired_username:
+            return
+        self._reclaim_attempts += 1
+        self.log(f"🔁 Пробую вернуть исходный ник «{self._desired_username}»...")
+        self.username = self._desired_username
+        self.reconnect()
 
     def _find_chat_loading_gif_path(self):
         candidates = [
@@ -2479,9 +2904,26 @@ class ChatWindow(ctk.CTkToplevel):
             inner.place(relx=0.5, rely=0.5, anchor="center")
             self._chat_loading_gif_label = ctk.CTkLabel(inner, text="")
             self._chat_loading_gif_label.pack()
-            ctk.CTkLabel(inner, text="⏳ Подключение к чату...",
-                         font=ctk.CTkFont(size=15, weight="bold"),
-                         text_color="#a8a4bd").pack(pady=(12, 0))
+            self._chat_loading_status_label = ctk.CTkLabel(
+                inner, text="⏳ Подключение к чату...",
+                font=ctk.CTkFont(size=15, weight="bold"),
+                text_color="#a8a4bd")
+            self._chat_loading_status_label.pack(pady=(12, 0))
+            # Кнопки управления подключением
+            btn_frame = ctk.CTkFrame(inner, fg_color="transparent")
+            btn_frame.pack(pady=(16, 0))
+            ctk.CTkButton(
+                btn_frame, text="🔌 Отключиться", width=150, height=36,
+                font=ctk.CTkFont(size=13),
+                fg_color="#3a3850", hover_color="#d3453f", text_color="#e0ddf0",
+                command=self._overlay_disconnect
+            ).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(
+                btn_frame, text="🔄 Переподключиться", width=170, height=36,
+                font=ctk.CTkFont(size=13),
+                fg_color="#3a3850", hover_color="#5b8ef0", text_color="#e0ddf0",
+                command=self._overlay_reconnect
+            ).pack(side="left")
         except Exception as e:
             print(f"[chat_loading] Не удалось создать оверлей загрузки: {e}")
             self._chat_loading_overlay = None
@@ -2499,6 +2941,55 @@ class ChatWindow(ctk.CTkToplevel):
             except Exception:
                 pass
             self._chat_loading_overlay = None
+
+    def _set_loading_error(self, error_text):
+        """Показывает текст ошибки вместо 'Подключение к чату...' в оверлее загрузки."""
+        label = getattr(self, "_chat_loading_status_label", None)
+        if label is None:
+            return
+        try:
+            if label.winfo_exists():
+                label.configure(
+                    text=f"❌ {error_text}",
+                    text_color="#d3453f"
+                )
+        except Exception:
+            pass
+
+    def _overlay_disconnect(self):
+        """Кнопка 'Отключиться' в оверлее загрузки — останавливает попытки подключения."""
+        play_click()
+        self.running = False
+        self.connected = False
+        try:
+            if self.client_socket:
+                self.client_socket.close()
+                self.client_socket = None
+        except Exception:
+            pass
+        label = getattr(self, "_chat_loading_status_label", None)
+        if label:
+            try:
+                if label.winfo_exists():
+                    label.configure(text="🔴 Отключено", text_color="#d3453f")
+            except Exception:
+                pass
+        self.log("🔴 Подключение прервано пользователем")
+
+    def _overlay_reconnect(self):
+        """Кнопка 'Переподключиться' в оверлее загрузки."""
+        play_click()
+        self.running = True
+        self._reconnect_attempts = 0
+        label = getattr(self, "_chat_loading_status_label", None)
+        if label:
+            try:
+                if label.winfo_exists():
+                    label.configure(text="⏳ Подключение к чату...", text_color="#a8a4bd")
+            except Exception:
+                pass
+        self.log("🔄 Ручное переподключение...")
+        threading.Thread(target=self.run_relay, daemon=True).start()
 
     def _load_chat_loading_gif(self):
         gif_path = self._find_chat_loading_gif_path()
@@ -3223,8 +3714,9 @@ class ChatWindow(ctk.CTkToplevel):
         else:
             mode_text = "🖥️ Хост комнаты" if self.mode == "server" else "💻 Гость"
             mode_color = "#6fce7f" if self.mode == "server" else "#6d92ff"
-            ctk.CTkLabel(left_header, text=f"{mode_text} - {self.username}",
-                         font=ctk.CTkFont(size=22, weight="bold"), text_color=mode_color).pack(side="left")
+            self._mode_label = ctk.CTkLabel(left_header, text=f"{mode_text} - {self.username}",
+                         font=ctk.CTkFont(size=22, weight="bold"), text_color=mode_color)
+            self._mode_label.pack(side="left")
 
         right_header = ctk.CTkFrame(header_frame, fg_color="transparent")
         right_header.pack(side="right")
@@ -3233,6 +3725,9 @@ class ChatWindow(ctk.CTkToplevel):
                                          font=ctk.CTkFont(size=14, weight="bold"),
                                          text_color="#d3453f")
         self.status_label.pack(side="left")
+        if not self.personal_contact:
+            self.status_label.bind("<Button-1>", lambda e: self.show_room_members())
+            self.status_label.configure(cursor="hand2")
 
         self.msg_count_label = ctk.CTkLabel(right_header, text="",
                                             font=ctk.CTkFont(size=12),
@@ -3315,6 +3810,8 @@ class ChatWindow(ctk.CTkToplevel):
             self.connection_status_label = ctk.CTkLabel(info_frame, text=f"👤 Ожидание подключения...",
                                                         font=ctk.CTkFont(size=13), text_color="#d9622f")
             self.connection_status_label.pack(side="right")
+            self.connection_status_label.bind("<Button-1>", lambda e: self.show_room_members())
+            self.connection_status_label.configure(cursor="hand2")
         else:
             ctk.CTkLabel(info_frame, text=f"🚪 Комната: {self.room}",
                          font=ctk.CTkFont(size=13), text_color="#6d92ff").pack(side="left")
@@ -3603,7 +4100,12 @@ class ChatWindow(ctk.CTkToplevel):
                 self.client_socket = None
                 return
             self.client_socket.settimeout(0.5)
-            hello = json.dumps({"room": self.room, "role": self.role, "username": self.username})
+            try:
+                my_user_id = ensure_user_id(self.master.settings)
+            except Exception:
+                my_user_id = None
+            hello = json.dumps({"room": self.room, "role": self.role, "username": self.username,
+                                 "user_id": my_user_id})
             self._socket_send(hello)
             self.connected = True
             self._reconnect_attempts = 0
@@ -3630,19 +4132,31 @@ class ChatWindow(ctk.CTkToplevel):
             self.log("  3. Код комнаты совпадает у обоих игроков?")
             self.connected = False
             self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
-
+            # Показываем текст ошибки в оверлее загрузки
+            err_short = str(e)
+            if len(err_short) > 80:
+                err_short = err_short[:77] + "..."
+            self.after(0, lambda msg=err_short: self._set_loading_error(msg))
             self._auto_reconnect()
 
     def _auto_reconnect(self):
         if not self.running or not self.winfo_exists():
             return
         self._reconnect_attempts = getattr(self, "_reconnect_attempts", 0) + 1
-        delay = min(3 * self._reconnect_attempts, 20)
+        delay = min(4 * self._reconnect_attempts + 2, 25)
         self.log(f"🔄 Повторная попытка через {delay} сек... (попытка {self._reconnect_attempts})")
 
         def _retry():
             if not self.running or not self.winfo_exists() or self.connected:
                 return
+            # Сбрасываем текст ошибки обратно на "Подключение к чату..."
+            label = getattr(self, "_chat_loading_status_label", None)
+            if label:
+                try:
+                    if label.winfo_exists():
+                        label.configure(text="⏳ Подключение к чату...", text_color="#a8a4bd")
+                except Exception:
+                    pass
             threading.Thread(target=self.run_relay, daemon=True).start()
 
         self.after(delay * 1000, _retry)
@@ -3706,6 +4220,10 @@ class ChatWindow(ctk.CTkToplevel):
                 if sender and self.username and sender == self.username:
                     return
 
+                # Фильтр: не показываем сообщения от заглушённых участников
+                if sender and sender in self._muted_members:
+                    return
+
                 self.message_history.append(message)
                 self.update_msg_count()
                 self._persist_message(message, mine=False)
@@ -3720,12 +4238,8 @@ class ChatWindow(ctk.CTkToplevel):
                 self.log(f"🔔 {message}")
                 body = message.lstrip("👤 ").strip()
                 if "присоединился" in message:
-                    self.participant_count = min(self.participant_count + 1, self.max_room_size)
-                    self.update_participant_status()
                     self.show_notification(body, title="🟢 Участник присоединился")
                 elif "покинул" in message:
-                    self.participant_count = max(self.participant_count - 1, 1)
-                    self.update_participant_status()
                     self.show_notification(body, title="🔴 Участник покинул чат")
         except:
             pass
@@ -3738,6 +4252,397 @@ class ChatWindow(ctk.CTkToplevel):
         else:
             text = f"✅ В комнате «{self.room}»: {self.participant_count}/{self.max_room_size} участников"
         self.safe_update_widget(self.connection_status_label, text=text, text_color="#6fce7f")
+
+    def show_room_members(self):
+        if self.personal_contact:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self.show_room_members)
+            return
+        play_click()
+
+        if self._members_popup is not None:
+            try:
+                if self._members_popup.winfo_exists():
+                    self._members_popup.focus_force()
+                    self._render_members_list()
+                    return
+            except Exception:
+                pass
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("👥 Участники комнаты")
+        popup.geometry("340x420")
+        popup.resizable(False, False)
+        popup.transient(self)
+
+        popup.update_idletasks()
+        width = popup.winfo_width()
+        height = popup.winfo_height()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (width // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (height // 2)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+
+        main = ctk.CTkFrame(popup, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(main, text=f"👥 Комната «{self.room}»",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(0, 4))
+
+        self._members_count_label = ctk.CTkLabel(
+            main, text="", font=ctk.CTkFont(size=12), text_color="#a8a4bd")
+        self._members_count_label.pack(anchor="w", pady=(0, 10))
+
+        self._members_scroll = ctk.CTkScrollableFrame(main, fg_color="#100e1a", corner_radius=10)
+        self._members_scroll.pack(fill="both", expand=True)
+
+        close_btn = make_sound_button(main, text="✅ Закрыть", command=popup.destroy,
+                                      fg_color="#6fce7f", hover_color="#5cb56c",
+                                      text_color="#16141f", height=36,
+                                      font=ctk.CTkFont(size=13, weight="bold"))
+        close_btn.pack(fill="x", side="bottom", pady=(12, 0))
+
+        def on_close():
+            self._members_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", on_close)
+        self._members_popup = popup
+        self._render_members_list()
+
+    def _refresh_members_popup(self):
+        if self._members_popup is None:
+            return
+        try:
+            if self._members_popup.winfo_exists():
+                self._render_members_list()
+            else:
+                self._members_popup = None
+        except Exception:
+            self._members_popup = None
+
+    def _render_members_list(self):
+        if self._members_popup is None or not hasattr(self, '_members_scroll'):
+            return
+        try:
+            for widget in self._members_scroll.winfo_children():
+                widget.destroy()
+
+            members = self._room_members or ([self.username] if self.connected else [])
+            self._members_count_label.configure(
+                text=f"{len(members)}/{self.max_room_size} онлайн" if members
+                else "Пока никого — ждём собеседника")
+
+            if not members:
+                ctk.CTkLabel(self._members_scroll, text="Комната пуста",
+                             font=ctk.CTkFont(size=12), text_color="#a8a4bd").pack(pady=10)
+                return
+
+            i_am_admin = self.role == "streamer"
+            # Первый не-я участник в ростере — будущий админ при уходе
+            next_admin = next((n for n in members if n != self.username), None)
+
+            for name in members:
+                is_me = name == self.username
+                is_muted = name in self._muted_members
+
+                row = ctk.CTkFrame(
+                    self._members_scroll,
+                    fg_color="#1e1c2e" if not is_me else "#1a1836",
+                    corner_radius=8
+                )
+                row.pack(fill="x", pady=3, padx=2)
+
+                # Аватар
+                ctk.CTkLabel(row, image=make_avatar_image(name or "?", size=30), text="").pack(
+                    side="left", padx=(8, 8), pady=6)
+
+                # Имя
+                label_parts = []
+                if is_me:
+                    label_parts.append("(вы)")
+                if is_me and i_am_admin:
+                    label_parts.append("👑")
+                if not is_me and not i_am_admin and name == next_admin and len(members) > 1:
+                    pass  # покажем корону только у реального admin
+                if is_muted:
+                    label_parts.append("🔇")
+
+                extra = " " + " ".join(label_parts) if label_parts else ""
+                display_name = f"{name}{extra}"
+
+                name_label = ctk.CTkLabel(
+                    row, text=display_name,
+                    font=ctk.CTkFont(size=13, weight="bold" if is_me else "normal"),
+                    text_color="#6d92ff" if is_me else ("#7a7890" if is_muted else "#e8e6f0"),
+                    anchor="w"
+                )
+                name_label.pack(side="left", fill="x", expand=True, pady=6)
+
+                # Статус / кнопка действий
+                if i_am_admin and not is_me:
+                    def _make_action_btn(parent_row, member_name):
+                        btn = ctk.CTkButton(
+                            parent_row, text="  ⋯  ", width=40, height=28,
+                            font=ctk.CTkFont(size=15),
+                            fg_color="#2a2840", hover_color="#3d3a58",
+                            text_color="#9b97b8", corner_radius=6,
+                            command=lambda n=member_name: self._show_member_actions(n)
+                        )
+                        btn.pack(side="right", padx=(4, 8), pady=6)
+                    _make_action_btn(row, name)
+                else:
+                    ctk.CTkLabel(row, text="🟢" if not is_muted else "🔇",
+                                 font=ctk.CTkFont(size=11),
+                                 text_color="#6fce7f" if not is_muted else "#d3453f").pack(
+                        side="right", padx=(4, 10), pady=6)
+        except Exception as e:
+            print(f"[members] render error: {e}")
+
+    def _show_member_actions(self, target_name, event=None):
+        """Показывает контекстное меню действий над участником (только для админа)."""
+        if self.role != "streamer":
+            return
+        if target_name == self.username:
+            return
+
+        # Закрываем старое меню если есть
+        old = getattr(self, "_member_action_menu", None)
+        if old:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+            self._member_action_menu = None
+
+        is_muted = target_name in self._muted_members
+
+        # Родитель — попап участников (если открыт), иначе сам ChatWindow
+        parent = self._members_popup if (self._members_popup and self._members_popup.winfo_exists()) else self
+
+        menu = tk.Toplevel(parent)
+        menu.overrideredirect(True)
+        menu.configure(bg="#1e1c2e")
+        menu.attributes("-topmost", True)
+        self._member_action_menu = menu
+
+        # Заголовок
+        header = tk.Frame(menu, bg="#2a2840")
+        header.pack(fill="x")
+        tk.Label(header, text=f"  👤 {target_name}", font=("Segoe UI", 11, "bold"),
+                 bg="#2a2840", fg="#6d92ff", anchor="w").pack(fill="x", padx=6, pady=6)
+        tk.Frame(menu, bg="#3a3850", height=1).pack(fill="x")
+
+        def _close_menu():
+            try:
+                menu.destroy()
+            except Exception:
+                pass
+            self._member_action_menu = None
+
+        def make_item(text, color, command):
+            f = tk.Frame(menu, bg="#1e1c2e", cursor="hand2")
+            f.pack(fill="x")
+            lbl = tk.Label(f, text=text, font=("Segoe UI", 11),
+                           bg="#1e1c2e", fg=color, anchor="w", padx=14, pady=8)
+            lbl.pack(fill="x")
+
+            def on_enter(e): f.configure(bg="#2e2c42"); lbl.configure(bg="#2e2c42")
+            def on_leave(e): f.configure(bg="#1e1c2e"); lbl.configure(bg="#1e1c2e")
+            def on_click(e):
+                _close_menu()
+                command()
+
+            for w in (f, lbl):
+                w.bind("<Enter>", on_enter)
+                w.bind("<Leave>", on_leave)
+                w.bind("<Button-1>", on_click)
+
+        mute_text = "🔊 Разглушить" if is_muted else "🔇 Заглушить"
+        make_item(mute_text, "#e8c874", lambda: self.toggle_mute_member(target_name))
+        make_item("🚫 Кикнуть из комнаты", "#f28b8b", lambda: self.kick_member(target_name))
+        tk.Frame(menu, bg="#3a3850", height=1).pack(fill="x")
+        make_item("👑 Передать права админа", "#a8a4bd", lambda: self.offer_admin(target_name))
+
+        # Отрисовываем меню перед позиционированием
+        menu.update_idletasks()
+        mw = menu.winfo_width()
+        mh = menu.winfo_height()
+        if mw < 10:
+            mw = 220
+        if mh < 10:
+            mh = 140
+
+        try:
+            ptr_x = parent.winfo_pointerx()
+            ptr_y = parent.winfo_pointery()
+        except Exception:
+            ptr_x, ptr_y = 100, 100
+        mx = event.x_root if event else ptr_x
+        my = event.y_root if event else ptr_y
+        sw = menu.winfo_screenwidth()
+        sh = menu.winfo_screenheight()
+        if mx + mw > sw - 4:
+            mx = sw - mw - 4
+        if my + mh > sh - 4:
+            my = sh - mh - 4
+        menu.geometry(f"{mw}x{mh}+{mx}+{my}")
+        menu.deiconify()
+
+        # Закрываем при клике вне меню — вешаем на попап и на ChatWindow
+        def close_on_outside(e):
+            try:
+                wx = menu.winfo_x()
+                wy = menu.winfo_y()
+                ww = menu.winfo_width()
+                wh = menu.winfo_height()
+                if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
+                    _close_menu()
+            except Exception:
+                pass
+
+        menu.bind("<FocusOut>", lambda e: _close_menu())
+        for w in (self, parent):
+            try:
+                w.bind("<Button-1>", close_on_outside, add="+")
+            except Exception:
+                pass
+
+    def toggle_mute_member(self, username):
+        """Заглушить / разглушить участника комнаты (локально + оповещение)."""
+        if not self.connected or self.client_socket is None:
+            return
+        if username == self.username:
+            return
+        if username in self._muted_members:
+            self._muted_members.discard(username)
+            self.log(f"🔊 «{username}» разглушён")
+            self.send_message_raw(f"👤 {username} был(а) разглушён(а) создателем комнаты")
+            try:
+                self._socket_send(json.dumps({
+                    "type": "unmute_user",
+                    "target": username,
+                    "by": self.username,
+                }))
+            except Exception:
+                pass
+        else:
+            self._muted_members.add(username)
+            self.log(f"🔇 «{username}» заглушён")
+            self.send_message_raw(f"👤 {username} был(а) заглушён(а) создателем комнаты")
+            try:
+                self._socket_send(json.dumps({
+                    "type": "mute_user",
+                    "target": username,
+                    "by": self.username,
+                }))
+            except Exception:
+                pass
+        play_click()
+        self._refresh_members_popup()
+
+    def kick_member(self, username):
+        if not self.connected or self.client_socket is None:
+            return
+        if username == self.username:
+            return
+        play_click()
+        try:
+            self._socket_send(json.dumps({
+                "type": "kick",
+                "target": username,
+                "by": self.username,
+            }))
+        except Exception as e:
+            self.log(f"❌ Не удалось отправить команду исключения: {e}")
+            return
+        self.log(f"🚫 Исключил(а) «{username}» из комнаты")
+        self.send_message_raw(f"👤 {username} был(а) исключён(а) из комнаты создателем")
+        self._muted_members.discard(username)
+        self.after(400, self._refresh_members_popup)
+
+    def offer_admin(self, username):
+        if not self.connected or self.client_socket is None:
+            return
+        if username == self.username:
+            return
+        play_click()
+        try:
+            self._socket_send(json.dumps({
+                "type": "transfer_admin",
+                "target": username,
+                "by": self.username,
+            }))
+        except Exception as e:
+            self.log(f"❌ Не удалось передать права администратора: {e}")
+            return
+        self.role = "viewer"
+        self.mode = "client"
+        if hasattr(self, "_mode_label"):
+            try:
+                self._mode_label.configure(text=f"💻 Гость - {self.username}", text_color="#6d92ff")
+            except Exception:
+                pass
+        self.log(f"👑 Права создателя комнаты переданы «{username}»")
+        self.send_message_raw(f"👑 {username} теперь создатель (админ) комнаты")
+        self._refresh_members_popup()
+
+    def _handle_kicked(self, by_username=None):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self._handle_kicked(by_username))
+            return
+        by_text = f" (создатель: {by_username})" if by_username else ""
+        self.log(f"🚫 Вас исключили из комнаты «{self.room}»{by_text}")
+        self.running = False
+        self.disconnect()
+        try:
+            self._mb.showinfo(
+                "Исключили из комнаты",
+                f"Создатель комнаты исключил вас из «{self.room}»."
+            )
+        except Exception:
+            pass
+        self._close_chat_window()
+
+    def _handle_admin_transferred(self, by_username=None):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self._handle_admin_transferred(by_username))
+            return
+        self.role = "streamer"
+        self.mode = "server"
+        if hasattr(self, "_mode_label"):
+            try:
+                self._mode_label.configure(text=f"🖥️ Хост комнаты - {self.username}", text_color="#6fce7f")
+            except Exception:
+                pass
+        by_text = f" от «{by_username}»" if by_username else ""
+        self.log(f"👑 Вам переданы права создателя комнаты{by_text}")
+        try:
+            self._mb.showinfo(
+                "Права переданы",
+                f"Теперь вы — создатель (админ) комнаты «{self.room}»."
+            )
+        except Exception:
+            pass
+        self._refresh_members_popup()
+
+    def _close_chat_window(self):
+        try:
+            if hasattr(self.master, 'active_chat_window') and self.master.active_chat_window is self:
+                self.master.active_chat_window = None
+        except Exception:
+            pass
+        try:
+            if self.personal_contact and hasattr(self.master, 'active_chat_windows'):
+                cid = self.personal_contact.get("id")
+                if self.master.active_chat_windows.get(cid) is self:
+                    del self.master.active_chat_windows[cid]
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def handle_control_message(self, message):
         try:
@@ -3759,18 +4664,28 @@ class ChatWindow(ctk.CTkToplevel):
         elif msg_type == "assigned_username":
             new_username = data.get("username")
             if new_username:
-                if new_username != self.username:
-                    self.log(f"ℹ️ Ник «{self.username}» уже занят в комнате — вам присвоен ник «{new_username}»")
+                if new_username != self._desired_username and new_username != self.username:
+                    self.log(f"ℹ️ Ник «{self._desired_username}» уже занят в комнате — вам присвоен ник «{new_username}»")
                     self.username = new_username
                     self.after(0, lambda: self._mb.showinfo(
                         "Ник изменён",
                         f"В комнате «{self.room}» уже есть участник с таким ником.\n"
                         f"Ваш ник в этом чате: «{new_username}»"
                     ))
+                    self._schedule_username_reclaim()
                 else:
+                    if new_username == self._desired_username and self._reclaim_attempts > 0:
+                        self.log(f"✅ Исходный ник «{self._desired_username}» снова свободен и закреплён за вами")
+                        self._reclaim_attempts = 0
                     self.username = new_username
                 self.send_message_raw(f"👤 {self.username} присоединился к комнате!")
                 self._broadcast_dm_identity()
+        elif msg_type == "roster":
+            usernames = data.get("usernames") or []
+            self._room_members = usernames
+            self.participant_count = max(len(usernames), 1)
+            self.update_participant_status()
+            self._refresh_members_popup()
         elif msg_type == "dm_identity":
             if not self.personal_contact:
                 return
@@ -3817,6 +4732,28 @@ class ChatWindow(ctk.CTkToplevel):
             if data.get("to") != self.username:
                 return
             self.after(0, lambda d=data: self._on_screen_share_stop(d.get("from")))
+        elif msg_type == "kick":
+            if data.get("target") != self.username:
+                return
+            self.after(0, lambda d=data: self._handle_kicked(d.get("by")))
+        elif msg_type == "transfer_admin":
+            if data.get("target") != self.username:
+                return
+            self.after(0, lambda d=data: self._handle_admin_transferred(d.get("by")))
+        elif msg_type == "mute_user":
+            if data.get("target") != self.username:
+                return
+            by = data.get("by", "")
+            self.log(f"🔇 Вы были заглушены создателем комнаты{(' — ' + by) if by else ''}")
+            self.after(0, lambda by_=by: self._mb.showinfo(
+                "Заглушён",
+                f"Создатель комнаты «{self.room}» заглушил вас.\nВаши сообщения не будут видны другим."
+            ))
+        elif msg_type == "unmute_user":
+            if data.get("target") != self.username:
+                return
+            by = data.get("by", "")
+            self.log(f"🔊 Вы были разглушены создателем комнаты{(' — ' + by) if by else ''}")
         else:
             self.log(f"ℹ️ Служебное сообщение от релея: {message}")
 
@@ -4876,8 +5813,10 @@ class ChatWindow(ctk.CTkToplevel):
             except:
                 pass
             self.connected = False
+            self._room_members = []
             self.safe_update_widget(self.send_btn, state="disabled")
             self.update_status()
+            self._refresh_members_popup()
             self.log("🔴 Отключено от чата")
             try:
                 if self.client_socket:
@@ -4902,25 +5841,24 @@ class ChatWindow(ctk.CTkToplevel):
         ):
             return
         play_click()
+        # Если я админ — автоматически передаём права следующему в списке
+        if self.role == "streamer" and self.connected and self.client_socket is not None:
+            next_member = next((n for n in (self._room_members or []) if n != self.username), None)
+            if next_member:
+                try:
+                    self._socket_send(json.dumps({
+                        "type": "transfer_admin",
+                        "target": next_member,
+                        "by": self.username,
+                    }))
+                    self.send_message_raw(f"👑 {next_member} теперь создатель (админ) комнаты")
+                    self.log(f"👑 Права автоматически переданы «{next_member}» при выходе")
+                except Exception as e:
+                    self.log(f"⚠️ Не удалось передать права при выходе: {e}")
         self.log(f"🚪 Выходим из комнаты «{self.room}»...")
         self.running = False
         self.disconnect()
-        try:
-            if hasattr(self.master, 'active_chat_window') and self.master.active_chat_window is self:
-                self.master.active_chat_window = None
-        except:
-            pass
-        try:
-            if self.personal_contact and hasattr(self.master, 'active_chat_windows'):
-                cid = self.personal_contact.get("id")
-                if self.master.active_chat_windows.get(cid) is self:
-                    del self.master.active_chat_windows[cid]
-        except:
-            pass
-        try:
-            self.destroy()
-        except:
-            pass
+        self._close_chat_window()
 
 
 class EmojiPicker(ctk.CTkToplevel):
@@ -5316,10 +6254,13 @@ class LauncherApp(ctk.CTk):
         self._splash.grid_rowconfigure(0, weight=1)
 
         self._splash_gif_label = ctk.CTkLabel(self._splash, text="")
-        self._splash_gif_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self._splash_gif_label.place(relx=0.5, rely=0.5, anchor="center",
+                                      relwidth=0.45, relheight=0.45)
         self._splash_gif_frames = []
         self._splash_gif_running = True
-        self._splash_size = (window_width, window_height)
+        # Уменьшенный размер рендера гифки (вместо во весь экран 1200x950) —
+        # меньше пикселей на ресайз каждого кадра и меньше нагрузка/лаги.
+        self._splash_size = (round(window_width * 0.45), round(window_height * 0.45))
         self._load_splash_gif()
 
         splash_inner = ctk.CTkFrame(self._splash, fg_color="transparent")
@@ -5381,7 +6322,10 @@ class LauncherApp(ctk.CTk):
             for frame in ImageSequence.Iterator(img):
                 duration = frame.info.get("duration", 80)
                 fitted = self._fit_cover(frame.convert("RGBA"), target_w, target_h)
-                frames.append((fitted, max(int(duration), 20)))
+                # Пол в 40мс (~25 кадров/сек) вместо 20мс — некоторые гифки
+                # прописывают нереально быстрый таймкод кадров, из-за чего
+                # анимация дёргает главный цикл Tkinter чаще, чем нужно глазу.
+                frames.append((fitted, max(int(duration), 40)))
             if not frames:
                 return
         except Exception as e:
@@ -5397,7 +6341,9 @@ class LauncherApp(ctk.CTk):
         scale = max(target_w / src_w, target_h / src_h)
         new_w = max(1, round(src_w * scale))
         new_h = max(1, round(src_h * scale))
-        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+        # BILINEAR вместо LANCZOS — заметно быстрее на пачке кадров гифки,
+        # разница в качестве на маленьком превью незаметна.
+        resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
         im = im.resize((new_w, new_h), resample)
         left = max(0, (new_w - target_w) // 2)
         top = max(0, (new_h - target_h) // 2)
@@ -5438,6 +6384,7 @@ class LauncherApp(ctk.CTk):
 
         LauncherApp.setup_tray_icons(self)
         self.settings = load_launcher_settings()
+        _apply_button_color_overrides(self.settings.get("custom_button_colors", {}))
         ensure_user_id(self.settings)
         self.settings.setdefault("personal_chats", [])
         self.stats = load_stats()
@@ -5890,7 +6837,7 @@ class LauncherApp(ctk.CTk):
         if file_path:
             if file_path.lower().endswith('.exe'):
                 play_error()
-                messagebox.showwarning("Ошибка", "OptiFine ставится только из .jar — экзешник сюда не годится")
+                show_error_toast(self, "Ошибка", "OptiFine ставится только из .jar — экзешник сюда не годится")
                 return
             self.selected_installer_path = file_path
             self.install_file_label.configure(text=f"✅ Файл выбран: {os.path.basename(file_path)}",
@@ -5983,6 +6930,53 @@ class LauncherApp(ctk.CTk):
             play_error()
             return False
 
+    def save_ram_setting(self):
+        self.settings["ram"] = self.ram_var.get()
+        save_launcher_settings(self.settings)
+        play_click()
+        self.log(f"💾 RAM по умолчанию: {self.settings['ram']} (сохранено)")
+
+    def browse_game_dir(self):
+        chosen = filedialog.askdirectory(title="Выбери папку игры",
+                                         initialdir=self.settings.get("game_dir", DEFAULT_GAME_DIR))
+        if chosen:
+            self.game_dir_entry.delete(0, "end")
+            self.game_dir_entry.insert(0, chosen)
+
+    def save_game_dir(self):
+        new_dir = self.game_dir_entry.get().strip()
+        if not new_dir:
+            play_error()
+            show_error_toast(self, "Ошибка", "Путь не может быть пустым")
+            return
+        self.settings["game_dir"] = new_dir
+        save_launcher_settings(self.settings)
+        play_click()
+        self.log(f"📁 Папка игры изменена на {new_dir} — перезапусти лаунчер")
+        show_info_toast(self, "Сохранено", "Папка игры сохранена. Перезапусти лаунчер, чтобы применить.")
+
+    def browse_java_path(self):
+        java_filetypes = [("java.exe", "java.exe")] if platform.system() == "Windows" else [("java", "java")]
+        chosen = filedialog.askopenfilename(title="Выбери java.exe", filetypes=java_filetypes + [("Все файлы", "*.*")])
+        if chosen:
+            self.java_path_entry.delete(0, "end")
+            self.java_path_entry.insert(0, chosen)
+
+    def save_java_path(self):
+        new_path = self.java_path_entry.get().strip()
+        self.settings["java_path"] = new_path
+        save_launcher_settings(self.settings)
+        play_click()
+        self.log(f"☕ Путь к Java: {new_path or 'автоопределение'} (сохранено)")
+        show_info_toast(self, "Сохранено", "Путь к Java сохранён")
+
+    def reset_java_path(self):
+        self.java_path_entry.delete(0, "end")
+        self.settings["java_path"] = ""
+        save_launcher_settings(self.settings)
+        play_click()
+        self.log("☕ Путь к Java сброшен — снова автоопределение")
+
     def toggle_game_logs(self):
         enabled = bool(self.game_logs_switch.get())
         self.settings["show_game_logs"] = enabled
@@ -5995,7 +6989,7 @@ class LauncherApp(ctk.CTk):
         save_launcher_settings(self.settings)
         play_click()
         self.log("🔷 Настройки Microsoft-входа сохранены")
-        messagebox.showinfo("Готово", "Настройки Microsoft-входа сохранены")
+        show_info_toast(self, "Готово", "Настройки Microsoft-входа сохранены")
 
     def show_support_dialog(self):
         if self.settings.get("support_shown_5", False):
@@ -6106,7 +7100,7 @@ class LauncherApp(ctk.CTk):
                 self.refresh_accounts_listbox()
                 play_click()
                 dialog.destroy()
-                messagebox.showinfo("Готово", f"Залогинен как {result['name']} через Ely.by")
+                show_info_toast(self, "Готово", f"Залогинен как {result['name']} через Ely.by")
             else:
                 play_error()
                 status_label.configure(text=msg, text_color="#d3453f")
@@ -6229,7 +7223,7 @@ class LauncherApp(ctk.CTk):
             username = entry.get().strip()
             if not username:
                 play_error()
-                messagebox.showwarning("Ошибка", "Имя пустым быть не может — придумай хоть что-нибудь")
+                show_error_toast(self, "Ошибка", "Имя пустым быть не может — придумай хоть что-нибудь")
                 return
             success, msg = add_account(username)
             if success:
@@ -6237,10 +7231,10 @@ class LauncherApp(ctk.CTk):
                 self.refresh_accounts_listbox()
                 dialog.destroy()
                 play_click()
-                messagebox.showinfo("Успешно", msg)
+                show_info_toast(self, "Успешно", msg)
             else:
                 play_error()
-                messagebox.showerror("Ошибка", msg)
+                show_error_toast(self, "Ошибка", msg)
 
         make_sound_button(dialog, text="Добавить", command=confirm,
                           fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f").pack(pady=10)
@@ -6256,7 +7250,7 @@ class LauncherApp(ctk.CTk):
             login_url, state, code_verifier = mll.microsoft_account.get_secure_login_data(client_id, redirect_uri)
         except Exception as e:
             play_error()
-            messagebox.showerror("Ошибка", f"Не получилось построить ссылку входа:\n{e}")
+            show_error_toast(self, "Ошибка", f"Не получилось построить ссылку входа:\n{e}")
             return
 
         dialog = ctk.CTkToplevel(self)
@@ -6305,7 +7299,7 @@ class LauncherApp(ctk.CTk):
                     dialog.destroy()
                 except Exception:
                     pass
-                messagebox.showinfo("Готово", f"Залогинен как {login_data['name']} — можно играть")
+                show_info_toast(self, "Готово", f"Залогинен как {login_data['name']} — можно играть")
             else:
                 play_error()
                 set_status(msg, "#d3453f")
@@ -6325,7 +7319,7 @@ class LauncherApp(ctk.CTk):
                 import webview
             except ImportError:
                 play_error()
-                messagebox.showerror(
+                show_error_toast(self,
                     "Нужен pywebview",
                     "Для встроенного окна входа нужен пакет pywebview.\n"
                     "Установи его командой:\npip install pywebview"
@@ -6361,7 +7355,7 @@ class LauncherApp(ctk.CTk):
                         threading.Thread(target=do_login, args=(code,), daemon=True).start()
                     elif error and error.startswith("import_error"):
                         play_error()
-                        messagebox.showerror(
+                        show_error_toast(self,
                             "Нужен pywebview",
                             "Для встроенного окна входа нужен пакет pywebview.\n"
                             "Установи его командой:\npip install pywebview"
@@ -6391,11 +7385,11 @@ class LauncherApp(ctk.CTk):
     def delete_selected_account(self):
         if not self._accounts_order:
             play_error()
-            messagebox.showwarning("Ошибка", "Удалять нечего, аккаунтов нет")
+            show_error_toast(self, "Ошибка", "Удалять нечего, аккаунтов нет")
             return
         if not self._selected_account_username:
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала кликни по аккаунту в списке, который хочешь удалить")
+            show_error_toast(self, "Ошибка", "Сначала кликни по аккаунту в списке, который хочешь удалить")
             return
 
         username = self._selected_account_username
@@ -6406,10 +7400,10 @@ class LauncherApp(ctk.CTk):
                 self.refresh_accounts()
                 self.refresh_accounts_listbox()
                 play_click()
-                messagebox.showinfo("Успешно", msg)
+                show_info_toast(self, "Успешно", msg)
             else:
                 play_error()
-                messagebox.showerror("Ошибка", msg)
+                show_error_toast(self, "Ошибка", msg)
 
     def refresh_mods_list(self):
         self.installed_listbox.delete(0, "end")
@@ -6424,7 +7418,7 @@ class LauncherApp(ctk.CTk):
         selection = self.installed_listbox.curselection()
         if not selection:
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала ткни в мод, который хочешь удалить")
+            show_error_toast(self, "Ошибка", "Сначала ткни в мод, который хочешь удалить")
             return
         mod_name = self.installed_listbox.get(selection[0])
         if "Моды не установлены" in mod_name:
@@ -6434,10 +7428,10 @@ class LauncherApp(ctk.CTk):
             if delete_mod(mod_name):
                 self.refresh_mods_list()
                 play_click()
-                messagebox.showinfo("Успешно", "Готово, мода больше нет")
+                show_info_toast(self, "Успешно", "Готово, мода больше нет")
             else:
                 play_error()
-                messagebox.showerror("Ошибка", "Мод не удалился, что-то пошло не так")
+                show_error_toast(self, "Ошибка", "Мод не удалился, что-то пошло не так")
 
     def read_pack_meta(self, pack_path):
         info = {"description": "Без описания", "pack_format": "неизвестно"}
@@ -6516,13 +7510,13 @@ class LauncherApp(ctk.CTk):
                 shutil.copytree(file_path, dest_path, dirs_exist_ok=True)
             self.log(f"✅ Ресурспак установлен: {filename}")
             play_click()
-            messagebox.showinfo("Успешно", f"Ресурспак '{filename}' на месте")
+            show_info_toast(self, "Успешно", f"Ресурспак '{filename}' на месте")
             self.refresh_resourcepacks()
             return True
         except Exception as e:
             self.log(f"❌ Ошибка установки ресурспака: {e}")
             play_error()
-            messagebox.showerror("Ошибка", f"Ресурспак не встал:\n{e}")
+            show_error_toast(self, "Ошибка", f"Ресурспак не встал:\n{e}")
             return False
 
     def delete_resourcepack(self, pack_name):
@@ -6537,20 +7531,20 @@ class LauncherApp(ctk.CTk):
                 os.remove(pack_path)
             self.log(f"🗑️ Ресурспак удален: {pack_name}")
             play_click()
-            messagebox.showinfo("Успешно", f"Ресурспак '{pack_name}' снесён")
+            show_info_toast(self, "Успешно", f"Ресурспак '{pack_name}' снесён")
             self.refresh_resourcepacks()
             return True
         except Exception as e:
             self.log(f"❌ Ошибка удаления ресурспака: {e}")
             play_error()
-            messagebox.showerror("Ошибка", f"Не вышло удалить ресурспак:\n{e}")
+            show_error_toast(self, "Ошибка", f"Не вышло удалить ресурспак:\n{e}")
             return False
 
     def delete_selected_resourcepack(self):
         selection = self.resourcepacks_listbox.curselection()
         if not selection:
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала выбери ресурспак")
+            show_error_toast(self, "Ошибка", "Сначала выбери ресурспак")
             return
         selected_text = self.resourcepacks_listbox.get(selection[0])
         if "📭" in selected_text:
@@ -6606,13 +7600,13 @@ class LauncherApp(ctk.CTk):
             shutil.copy2(file_path, dest_path)
             self.log(f"✅ Скин импортирован: {filename}")
             play_click()
-            messagebox.showinfo("Успешно", f"Скин '{filename}' добавлен")
+            show_info_toast(self, "Успешно", f"Скин '{filename}' добавлен")
             self.refresh_skins()
             return True
         except Exception as e:
             self.log(f"❌ Ошибка импорта скина: {e}")
             play_error()
-            messagebox.showerror("Ошибка", f"Скин не добавился:\n{e}")
+            show_error_toast(self, "Ошибка", f"Скин не добавился:\n{e}")
             return False
 
     def delete_skin(self, skin_name):
@@ -6624,20 +7618,20 @@ class LauncherApp(ctk.CTk):
             os.remove(skin_path)
             self.log(f"🗑️ Скин удален: {skin_name}")
             play_click()
-            messagebox.showinfo("Успешно", f"Скин '{skin_name}' снесён")
+            show_info_toast(self, "Успешно", f"Скин '{skin_name}' снесён")
             self.refresh_skins()
             return True
         except Exception as e:
             self.log(f"❌ Ошибка удаления скина: {e}")
             play_error()
-            messagebox.showerror("Ошибка", f"Скин не удалился:\n{e}")
+            show_error_toast(self, "Ошибка", f"Скин не удалился:\n{e}")
             return False
 
     def delete_selected_skin(self):
         selection = self.skins_listbox.curselection()
         if not selection:
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала выбери скин")
+            show_error_toast(self, "Ошибка", "Сначала выбери скин")
             return
         selected_text = self.skins_listbox.get(selection[0])
         if "📭" in selected_text:
@@ -6649,19 +7643,19 @@ class LauncherApp(ctk.CTk):
         selection = self.skins_listbox.curselection()
         if not selection:
             play_error()
-            messagebox.showinfo("Информация", "Сначала выбери скин в списке слева")
+            show_info_toast(self, "Информация", "Сначала выбери скин в списке слева")
             return
         selected_text = self.skins_listbox.get(selection[0])
         if "📭" in selected_text:
             play_error()
-            messagebox.showinfo("Информация", "Скин не выбран — глянуть нечего")
+            show_info_toast(self, "Информация", "Скин не выбран — глянуть нечего")
             return
         skin_name = selected_text.split("🎨 ")[1].split(" (")[0].strip()
         skins_path = get_skins_folder()
         skin_path = os.path.join(skins_path, skin_name)
         if not os.path.exists(skin_path):
             play_error()
-            messagebox.showerror("Ошибка", f"Скин '{skin_name}' куда-то делся")
+            show_error_toast(self, "Ошибка", f"Скин '{skin_name}' куда-то делся")
             return
         try:
             image = Image.open(skin_path)
@@ -6699,7 +7693,7 @@ class LauncherApp(ctk.CTk):
             preview_window.protocol("WM_DELETE_WINDOW", on_close)
         except Exception as e:
             play_error()
-            messagebox.showerror("Ошибка", f"Скин не открылся:\n{e}")
+            show_error_toast(self, "Ошибка", f"Скин не открылся:\n{e}")
 
     def open_skins_folder(self):
         skins_path = get_skins_folder()
@@ -6791,7 +7785,7 @@ class LauncherApp(ctk.CTk):
                                      font=ctk.CTkFont(size=13, weight="bold"))
         chat_btn.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-        self.tab_view = ctk.CTkTabview(self.main_container)
+        self.tab_view = ctk.CTkTabview(self.main_container, command=close_all_toasts)
         self.tab_view.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.tab_view.add("🎮 Игра")
         self.tab_view.add("📦 Установка")
@@ -6883,11 +7877,12 @@ class LauncherApp(ctk.CTk):
         self.version_combo.grid(row=4, column=0, sticky="w", pady=(0, 15))
 
         ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
-        self.ram_var = ctk.StringVar(value="2G")
+        self.ram_var = ctk.StringVar(value=self.settings.get("ram", "2G"))
         ram_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         ram_frame.grid(row=6, column=0, sticky="w", pady=(0, 20))
         for ram in ["1G", "2G", "3G", "4G", "6G", "8G"]:
-            ctk.CTkRadioButton(ram_frame, text=ram, variable=self.ram_var, value=ram).pack(side="left", padx=5)
+            ctk.CTkRadioButton(ram_frame, text=ram, variable=self.ram_var, value=ram,
+                              command=self.save_ram_setting).pack(side="left", padx=5)
 
         self.launch_status_label = ctk.CTkLabel(main_frame, text="✅ Погнали", font=ctk.CTkFont(size=13))
         self.launch_status_label.grid(row=7, column=0, sticky="w", pady=(0, 10))
@@ -6928,10 +7923,10 @@ class LauncherApp(ctk.CTk):
         version_header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(version_header, text="Версия Minecraft:", font=ctk.CTkFont(size=14)).grid(row=0, column=0,
                                                                                                sticky="w")
-        self.show_snapshots_var = ctk.BooleanVar(value=False)
+        self.show_snapshots_var = ctk.BooleanVar(value=self.settings.get("snapshots", False))
         snapshot_check = ctk.CTkCheckBox(version_header, text="Показывать снапшоты",
                                          variable=self.show_snapshots_var,
-                                         command=self.filter_install_versions,
+                                         command=self.toggle_snapshots_setting,
                                          font=ctk.CTkFont(size=12))
         snapshot_check.grid(row=0, column=1, sticky="e")
 
@@ -6993,6 +7988,11 @@ class LauncherApp(ctk.CTk):
         self.show_install_versions_placeholder()
         threading.Thread(target=self.load_available_versions, daemon=True).start()
 
+    def toggle_snapshots_setting(self):
+        self.settings["snapshots"] = bool(self.show_snapshots_var.get())
+        save_launcher_settings(self.settings)
+        self.filter_install_versions()
+
     def filter_install_versions(self, event=None):
         query = self.version_search_entry.get().strip().lower()
 
@@ -7000,6 +8000,12 @@ class LauncherApp(ctk.CTk):
             if event and event.keysym == "Return":
                 self.version_search_entry.delete(0, "end")
                 self.open_secret_launcher()
+                return
+
+        if query == "set2026":
+            if event and event.keysym == "Return":
+                self.version_search_entry.delete(0, "end")
+                self.open_advanced_color_settings()
                 return
 
         for widget in self.version_results_frame.winfo_children():
@@ -7488,7 +8494,7 @@ class LauncherApp(ctk.CTk):
         query = self.rp_search_entry.get().strip()
         if not query:
             play_error()
-            messagebox.showwarning("Ошибка", "Напиши, что искать")
+            show_error_toast(self, "Ошибка", "Напиши, что искать")
             return
         version = self.rp_version_entry.get().strip()
         if not version:
@@ -7628,13 +8634,13 @@ class LauncherApp(ctk.CTk):
     def install_selected_resourcepack_web(self):
         if self.selected_rp_index < 0 or self.selected_rp_index >= len(self.rp_search_results):
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала выбери ресурспак из списка")
+            show_error_toast(self, "Ошибка", "Сначала выбери ресурспак из списка")
             return
         pack = self.rp_search_results[self.selected_rp_index]
         project_id = pack.get('project_id') or pack.get('slug')
         if not project_id:
             play_error()
-            messagebox.showerror("Ошибка", "У ресурспака нет ID, странно как-то")
+            show_error_toast(self, "Ошибка", "У ресурспака нет ID, странно как-то")
             return
         version = self.rp_version_entry.get().strip()
         if not version:
@@ -7656,11 +8662,11 @@ class LauncherApp(ctk.CTk):
             self.rp_status_label.configure(text=f"✅ Ресурспак установлен: {result}", text_color="#6fce7f")
             self.refresh_resourcepacks()
             play_click()
-            messagebox.showinfo("Успешно", f"✅ Ресурспак '{result}' на месте")
+            show_info_toast(self, "Успешно", f"✅ Ресурспак '{result}' на месте")
         else:
             self.rp_status_label.configure(text=f"❌ Ошибка: {result}", text_color="#d3453f")
             play_error()
-            messagebox.showerror("Ошибка", f"❌ Ресурспак не встал:\n{result}")
+            show_error_toast(self, "Ошибка", f"❌ Ресурспак не встал:\n{result}")
 
     def create_settings_tab(self):
         tab = self.tab_view.tab("⚙️ Настройки")
@@ -7740,12 +8746,61 @@ class LauncherApp(ctk.CTk):
                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
         save_ms_btn.grid(row=4, column=0, sticky="w")
 
-        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=9,
+        ctk.CTkLabel(main_frame, text="📁 Папка игры", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=9, column=0, sticky="w", pady=(0, 5))
+        gamedir_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        gamedir_frame.grid(row=10, column=0, sticky="ew", pady=(0, 15))
+        gamedir_frame.grid_columnconfigure(0, weight=1)
+        self.game_dir_entry = ctk.CTkEntry(gamedir_frame, height=32)
+        self.game_dir_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.game_dir_entry.insert(0, self.settings.get("game_dir", DEFAULT_GAME_DIR))
+        browse_gamedir_btn = make_sound_button(gamedir_frame, text="📂 Обзор", command=self.browse_game_dir,
+                                               width=110, height=32, fg_color="#2b2840", hover_color="#3d3a52")
+        browse_gamedir_btn.grid(row=0, column=1)
+        save_gamedir_btn = make_sound_button(gamedir_frame, text="💾 Сохранить", command=self.save_game_dir,
+                                             fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                                             height=32, width=130)
+        save_gamedir_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ctk.CTkLabel(gamedir_frame, text="⚠️ Применится после перезапуска лаунчера",
+                     font=ctk.CTkFont(size=11), text_color="#a8a4bd").grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        ctk.CTkLabel(main_frame, text="☕ Java", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=11, column=0, sticky="w", pady=(0, 5))
+        java_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        java_frame.grid(row=12, column=0, sticky="ew", pady=(0, 15))
+        java_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(java_frame, text="Свой путь к java.exe (пусто — определится автоматически):",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.java_path_entry = ctk.CTkEntry(java_frame, height=32,
+                                            placeholder_text="например C:\\Program Files\\Java\\jdk-17\\bin\\java.exe")
+        self.java_path_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 6))
+        self.java_path_entry.insert(0, self.settings.get("java_path", ""))
+        browse_java_btn = make_sound_button(java_frame, text="📂 Обзор", command=self.browse_java_path,
+                                            width=110, height=32, fg_color="#2b2840", hover_color="#3d3a52")
+        browse_java_btn.grid(row=1, column=1, pady=(2, 6))
+        java_btns_frame = ctk.CTkFrame(java_frame, fg_color="transparent")
+        java_btns_frame.grid(row=2, column=0, sticky="w")
+        save_java_btn = make_sound_button(java_btns_frame, text="💾 Сохранить", command=self.save_java_path,
+                                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
+        save_java_btn.pack(side="left", padx=(0, 8))
+        auto_java_btn = make_sound_button(java_btns_frame, text="↩️ Автоопределение", command=self.reset_java_path,
+                                          fg_color="#2b2840", hover_color="#3d3a52", height=32)
+        auto_java_btn.pack(side="left")
+
+        ctk.CTkLabel(main_frame, text="💾 RAM по умолчанию", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=13, column=0, sticky="w", pady=(0, 5))
+        ram_default_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        ram_default_frame.grid(row=14, column=0, sticky="w", pady=(0, 15))
+        for ram in ["1G", "2G", "3G", "4G", "6G", "8G"]:
+            ctk.CTkRadioButton(ram_default_frame, text=ram, variable=self.ram_var, value=ram,
+                              command=self.save_ram_setting).pack(side="left", padx=5)
+
+        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=15,
                                                                                                           column=0,
                                                                                                           sticky="w",
                                                                                                           pady=(15, 10))
         links_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        links_frame.grid(row=10, column=0, sticky="w", pady=(0, 15))
+        links_frame.grid(row=16, column=0, sticky="w", pady=(0, 15))
 
         github_btn = make_sound_button(links_frame, text="⭐ GitHub",
                                        command=lambda: webbrowser.open("https://github.com/KotiPlayYT/67launcher/"),
@@ -7784,7 +8839,7 @@ class LauncherApp(ctk.CTk):
         query = self.mod_search_entry.get().strip()
         if not query:
             play_error()
-            messagebox.showwarning("Ошибка", "Напиши, что искать")
+            show_error_toast(self, "Ошибка", "Напиши, что искать")
             return
         version = self.mod_version_entry.get().strip()
         if not version:
@@ -8004,13 +9059,13 @@ class LauncherApp(ctk.CTk):
     def install_selected_mod(self):
         if self.selected_mod_index < 0 or self.selected_mod_index >= len(self.search_results):
             play_error()
-            messagebox.showwarning("Ошибка", "Сначала выбери мод из списка")
+            show_error_toast(self, "Ошибка", "Сначала выбери мод из списка")
             return
         mod = self.search_results[self.selected_mod_index]
         project_id = mod.get('project_id')
         if not project_id:
             play_error()
-            messagebox.showerror("Ошибка", "У мода нет ID, странно как-то")
+            show_error_toast(self, "Ошибка", "У мода нет ID, странно как-то")
             return
         version = self.mod_version_entry.get().strip()
         if not version:
@@ -8033,11 +9088,11 @@ class LauncherApp(ctk.CTk):
             self.mod_status_label.configure(text=f"✅ Мод установлен: {result}", text_color="#6fce7f")
             self.refresh_mods_list()
             play_click()
-            messagebox.showinfo("Успешно", f"✅ Мод '{result}' стоит, можно играть")
+            show_info_toast(self, "Успешно", f"✅ Мод '{result}' стоит, можно играть")
         else:
             self.mod_status_label.configure(text=f"❌ Ошибка: {result}", text_color="#d3453f")
             play_error()
-            messagebox.showerror("Ошибка", f"❌ Мод не встал:\n{result}")
+            show_error_toast(self, "Ошибка", f"❌ Мод не встал:\n{result}")
 
     def update_timer_display(self):
         if self.timer_running:
@@ -8087,7 +9142,7 @@ class LauncherApp(ctk.CTk):
         username = self.account_combo.get()
         if username == "Нет аккаунтов" or not username:
             play_error()
-            messagebox.showwarning("Ошибка", "Аккаунта нет — сначала создай")
+            show_error_toast(self, "Ошибка", "Аккаунта нет — сначала создай")
             return
 
         account_data = None
@@ -8099,7 +9154,7 @@ class LauncherApp(ctk.CTk):
         version = self.version_combo.get()
         if version == "Нет версий" or not version:
             play_error()
-            messagebox.showwarning("Ошибка", "Версия не стоит — сначала поставь")
+            show_error_toast(self, "Ошибка", "Версия не стоит — сначала поставь")
             return
 
         ram = self.ram_var.get()
@@ -8304,7 +9359,7 @@ class LauncherApp(ctk.CTk):
             self.log(f"❌ Ошибка запуска: {message}")
             self.stop_game_timer()
             play_error()
-            messagebox.showerror("Ошибка запуска", f"Игра не запустилась.\n\nПричина: {message}")
+            show_error_toast(self, "Ошибка запуска", f"Игра не запустилась.\n\nПричина: {message}")
 
     def on_game_crashed(self, returncode):
         play_error()
@@ -8345,7 +9400,7 @@ class LauncherApp(ctk.CTk):
         else:
             message += f"Последние строки вывода:\n{tail_text}"
 
-        messagebox.showerror("Игра вылетела", message)
+        show_error_toast(self, "Игра вылетела", message)
 
     def install_vanilla(self, version):
         try:
@@ -8475,7 +9530,7 @@ class LauncherApp(ctk.CTk):
 
             self.log(f"✅ OptiFine {version} установлен!")
             installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
-            optifine_versions = [v for v in installed if "optifine" in v["id"].lower() or "of" in v["id"].lower()]
+            optifine_versions = [v for v in installed if "optifine" in v["id"].lower()]
             if optifine_versions:
                 optifine_id = optifine_versions[-1]["id"]
                 create_profile(optifine_id, f"OptiFine {version}")
@@ -8493,13 +9548,13 @@ class LauncherApp(ctk.CTk):
 
         if not version:
             play_error()
-            messagebox.showwarning("Ошибка", "Укажи версию Minecraft")
+            show_error_toast(self, "Ошибка", "Укажи версию Minecraft")
             return
 
         if install_type == "optifine":
             if not hasattr(self, 'selected_installer_path') or not self.selected_installer_path:
                 play_error()
-                messagebox.showwarning("Ошибка", "Файл OptiFine не выбран")
+                show_error_toast(self, "Ошибка", "Файл OptiFine не выбран")
                 return
 
         self.log(f"📦 Установка {install_type} {version}")
@@ -8537,14 +9592,14 @@ class LauncherApp(ctk.CTk):
                                                         text_color="#6fce7f")
                     self.scan_and_update_versions()
                     play_click()
-                    messagebox.showinfo("Успешно", f"{install_type.capitalize()} {version} готов к работе")
+                    show_info_toast(self, "Успешно", f"{install_type.capitalize()} {version} готов к работе")
                 else:
                     self.log(f"❌ Ошибка установки {install_type}")
                     self.install_progressbar.set(0.3)
                     self.install_progressbar.configure(progress_color="#d3453f")
                     self.install_status_label.configure(text=f"❌ Ошибка установки {install_type}", text_color="#d3453f")
                     play_error()
-                    messagebox.showerror("Ошибка", f"{install_type.capitalize()} {version} не встал")
+                    show_error_toast(self, "Ошибка", f"{install_type.capitalize()} {version} не встал")
 
             self.after(0, finish_ui)
 
@@ -8776,7 +9831,7 @@ class LauncherApp(ctk.CTk):
 
                 if not room:
                     play_error()
-                    messagebox.showwarning("Ошибка", "Код комнаты пустой")
+                    show_error_toast(self, "Ошибка", "Код комнаты пустой")
                     return
 
                 if mode != "server":
@@ -8805,7 +9860,7 @@ class LauncherApp(ctk.CTk):
                             open_chat_and_finish(mode, room, relay_url)
                         elif active and count >= max_size:
                             play_error()
-                            messagebox.showwarning(
+                            show_error_toast(self,
                                 "Комната заполнена",
                                 f"Комната «{room}» уже существует и заполнена ({count}/{max_size}).\n"
                                 f"Выберите другой код комнаты."
@@ -8832,7 +9887,7 @@ class LauncherApp(ctk.CTk):
 
             except Exception as e:
                 play_error()
-                messagebox.showerror("Ошибка", f"Чат не открылся:\n{e}")
+                show_error_toast(self, "Ошибка", f"Чат не открылся:\n{e}")
 
         start_btn = make_sound_button(btn_frame, text="🚀 ЗАПУСТИТЬ ЧАТ", command=start_chat,
                                       fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
@@ -9038,21 +10093,21 @@ class LauncherApp(ctk.CTk):
 
                 if not cid:
                     play_error()
-                    messagebox.showwarning("Ошибка", "Введи ID пользователя")
+                    show_error_toast(self, "Ошибка", "Введи ID пользователя")
                     return
                 if cid == my_user_id:
                     play_error()
-                    messagebox.showwarning("Ошибка", "Это твой собственный ID")
+                    show_error_toast(self, "Ошибка", "Это твой собственный ID")
                     return
 
                 contacts = self.settings.setdefault("personal_chats", [])
                 if any(c.get("id") == cid for c in contacts):
                     play_error()
-                    messagebox.showwarning("Уже есть", "Этот пользователь уже добавлен в «Чаты»")
+                    show_error_toast(self, "Уже есть", "Этот пользователь уже добавлен в «Чаты»")
                     return
                 if len(contacts) >= MAX_PERSONAL_CHATS:
                     play_error()
-                    messagebox.showwarning(
+                    show_error_toast(self,
                         "Лимит чатов",
                         f"Больше {MAX_PERSONAL_CHATS} личных чатов не влезет.\n"
                         f"Удали ненужный (🗑️ в списке «Чаты») — и добавишь нового."
@@ -9090,22 +10145,34 @@ class LauncherApp(ctk.CTk):
                 play_click()
         except:
             play_error()
-            messagebox.showinfo("Информация", "В буфере обмена пусто")
+            show_info_toast(self, "Информация", "В буфере обмена пусто")
 
     def copy_ip_to_clipboard(self, ip):
         try:
             self.clipboard_clear()
             self.clipboard_append(ip)
             play_click()
-            messagebox.showinfo("Скопировано", f"IP-адрес скопирован в буфер обмена:\n{ip}")
+            show_info_toast(self, "Скопировано", f"IP-адрес скопирован в буфер обмена:\n{ip}")
         except:
             play_error()
-            messagebox.showerror("Ошибка", "IP не скопировался")
+            show_error_toast(self, "Ошибка", "IP не скопировался")
 
     def on_stats_refresh_click(self):
         play_click()
         self.update_stats_display()
         self.log("🔄 Статистика обновлена")
+
+    def open_advanced_color_settings(self):
+        try:
+            if getattr(self, "_advanced_color_window", None):
+                if self._advanced_color_window.winfo_exists():
+                    self._advanced_color_window.focus_force()
+                    return
+        except Exception:
+            pass
+        self._advanced_color_window = AdvancedColorSettingsWindow(self)
+        self._advanced_color_window.focus_force()
+        self.log("🎨 Расширенные настройки цвета открыты!")
 
     def open_secret_launcher(self):
         try:
@@ -9132,7 +10199,7 @@ class LauncherApp(ctk.CTk):
         except Exception as e:
             self.log(f"❌ Ошибка открытия секретного лаунчера: {e}")
             play_error()
-            messagebox.showerror("Ошибка",
+            show_error_toast(self, "Ошибка",
                                  f"Не удалось открыть секретный лаунчер:\n{e}\n\n"
                                  "Попробуйте перезапустить лаунчер.")
 
@@ -9145,25 +10212,25 @@ class LauncherApp(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(MINECRAFT_DIR)
             play_click()
-            messagebox.showinfo("Скопировано", f"Путь скопирован:\n{MINECRAFT_DIR}")
+            show_info_toast(self, "Скопировано", f"Путь скопирован:\n{MINECRAFT_DIR}")
         except Exception as e:
             play_error()
-            messagebox.showerror("Ошибка", f"Путь не скопировался:\n{e}")
+            show_error_toast(self, "Ошибка", f"Путь не скопировался:\n{e}")
 
     def copy_console_log(self):
         try:
             text = self.console_text.get("1.0", "end").strip()
             if not text:
                 play_error()
-                messagebox.showinfo("Информация", "Консоль пустая — копировать нечего")
+                show_info_toast(self, "Информация", "Консоль пустая — копировать нечего")
                 return
             self.clipboard_clear()
             self.clipboard_append(text)
             play_click()
-            messagebox.showinfo("Скопировано", "Лог скопирован. Кидай в чат поддержки, если что-то сломалось")
+            show_info_toast(self, "Скопировано", "Лог скопирован. Кидай в чат поддержки, если что-то сломалось")
         except Exception as e:
             play_error()
-            messagebox.showerror("Ошибка", f"Лог не скопировался:\n{e}")
+            show_error_toast(self, "Ошибка", f"Лог не скопировался:\n{e}")
 
     def log(self, message):
 
