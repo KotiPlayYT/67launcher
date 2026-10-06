@@ -1,32 +1,251 @@
+import subprocess
+import time
+import re
+import sys
+import os
+import multiprocessing
+
+# ВАЖНО для exe (PyInstaller): freeze_support() должен стоять САМЫМ первым делом,
+# до окна загрузки и тяжёлых импортов. Иначе дочерний процесс (окно входа Microsoft)
+# заново поднимает весь лаунчер вместо того, чтобы выполнить свою задачу.
+multiprocessing.freeze_support()
+
+# Сборка без консоли (--noconsole): sys.stdout / sys.stderr / sys.stdin равны None,
+# и любой print/write в библиотеках падает. Подставляем заглушки и чиним кодировку.
+for _std_name in ("stdout", "stderr"):
+    _std = getattr(sys, _std_name, None)
+    if _std is None:
+        try:
+            setattr(sys, _std_name, open(os.devnull, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    else:
+        try:
+            _std.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+if getattr(sys, "stdin", None) is None:
+    try:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    except Exception:
+        pass
+
 import tkinter as tk
 
+
+import weakref
+
+# Режим курсора: "custom" — свой из resources/cursor.cur, "classic" — обычный системный.
+# Переключается в Настройках, хранится в settings.json (ключ cursor_mode).
+_CURSOR_MODE = "custom"
+_CURSOR_WINDOWS = weakref.WeakSet()
+_CURSOR_MISSING_REPORTED = False
+
+
+def _custom_cursor_string():
+    """Путь к .cur в формате, который понимает Tk на Windows ('@путь'). None, если файла нет."""
+    global _CURSOR_MISSING_REPORTED
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    cursor_path = os.path.join(base, "resources", "cursor.cur")
+    if not os.path.isfile(cursor_path):
+        if not _CURSOR_MISSING_REPORTED:
+            _CURSOR_MISSING_REPORTED = True
+            print(f"[cursor] Не найден: {cursor_path}")
+        return None
+    return "@" + cursor_path.replace("\\", "/")
+
+
+def _apply_cursor_to_window(window):
+    """Выставляет курсор окну по текущему режиму. Дочерние виджеты без своего
+    cursor= наследуют его от окна. Безопасно вызывать сколько угодно раз."""
+    try:
+        if not window.winfo_exists():
+            return
+    except Exception:
+        return
+    try:
+        if _CURSOR_MODE == "classic":
+            window.configure(cursor="")
+            window._67_tk_cursor = ""
+        else:
+            cursor_str = _custom_cursor_string()
+            if not cursor_str:
+                return
+            window.configure(cursor=cursor_str)
+            window._67_tk_cursor = cursor_str
+    except Exception as e:
+        print(f"[cursor] Ошибка установки курсора: {e}")
+
+
+def _install_custom_cursor(window):
+    """Запоминает окно и ставит ему курсор. Tk НЕ передаёт курсор из корневого окна
+    в Toplevel-окна (чат, диалоги и т.д.), поэтому каждое окно регистрируем отдельно."""
+    try:
+        _CURSOR_WINDOWS.add(window)
+    except Exception:
+        pass
+    _apply_cursor_to_window(window)
+
+
+def _set_cursor_mode(mode):
+    """Переключает режим и сразу применяет ко всем живым окнам."""
+    global _CURSOR_MODE
+    _CURSOR_MODE = "classic" if mode == "classic" else "custom"
+    for _w in list(_CURSOR_WINDOWS):
+        _apply_cursor_to_window(_w)
+
+
+def _reapply_cursor_after_show(window):
+    """После deiconify (например, из трея) Tk может не обновить курсор, пока указатель
+    не пересечёт границу окна. Ставим сразу и ещё раз чуть позже."""
+    _apply_cursor_to_window(window)
+    try:
+        window.after(120, lambda: _apply_cursor_to_window(window))
+    except Exception:
+        pass
+
+
+def _parse_shortcut_args(argv):
+    """Режим ярлыка: `--play <версия> [--account <ник>]`.
+    Возвращает {"version", "account"} или None, если запуск обычный (с окном лаунчера)."""
+    version = account = None
+    for i, arg in enumerate(argv):
+        if arg == "--play" and i + 1 < len(argv):
+            version = argv[i + 1]
+        elif arg == "--account" and i + 1 < len(argv):
+            account = argv[i + 1]
+    return {"version": version, "account": account or ""} if version else None
+
+
+_SHORTCUT_LAUNCH = _parse_shortcut_args(sys.argv)
+
+if (_SHORTCUT_LAUNCH or getattr(sys, "frozen", False)) and sys.platform == "win32":
+    # Ярлык не должен светить консолью: ни своей, ни у дочерних процессов
+    # (java -version, сама игра и т.д.), поэтому глушим окно консоли у всех Popen.
+    import subprocess as _sp
+    import ctypes as _ct
+
+    _orig_popen_init = _sp.Popen.__init__
+
+
+    def _popen_no_console(self, *args, **kwargs):
+        _flags = kwargs.get("creationflags", 0)
+        if not (_flags & 0x00000008):  # у DETACHED_PROCESS своя логика, не мешаем
+            kwargs["creationflags"] = _flags | 0x08000000  # CREATE_NO_WINDOW
+        _orig_popen_init(self, *args, **kwargs)
+
+
+    _sp.Popen.__init__ = _popen_no_console
+    try:
+        # Если exe собран с консолью — прячем её, но только если она наша собственная
+        # (не трогаем cmd, из которого человек запустил лаунчер руками).
+        _k32 = _ct.windll.kernel32
+        _k32.GetConsoleWindow.restype = _ct.c_void_p
+        _ct.windll.user32.ShowWindow.argtypes = [_ct.c_void_p, _ct.c_int]
+        _con_hwnd = _k32.GetConsoleWindow()
+        _con_pids = (_ct.c_uint * 4)()
+        if _con_hwnd and _k32.GetConsoleProcessList(_con_pids, 4) <= 1:
+            _ct.windll.user32.ShowWindow(_con_hwnd, 0)
+    except Exception:
+        pass
+
+if sys.platform == "win32":
+    # Без этого Windows растягивает окно как картинку при масштабе экрана > 100% и текст мылится.
+    # Режим процесса ставится один раз и навсегда, поэтому делаем это до первого окна.
+    # customtkinter дальше сам подстроит размеры под масштаб.
+    try:
+        import ctypes as _dpi0
+        try:
+            _dpi0.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+        except Exception:
+            _dpi0.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 _boot_root = tk.Tk()
-_boot_root.title("67Launcher")
-_boot_root.configure(bg="#16141f")
+# Сразу прячем окно ДО любых настроек — иначе Windows успевает показать
+# его в дефолтной позиции (угол экрана) на несколько кадров.
+_boot_root.withdraw()
 try:
     _boot_root.overrideredirect(True)
 except Exception:
     pass
+_boot_root.title("67Launcher — запуск игры" if _SHORTCUT_LAUNCH else "67Launcher")
+_boot_root.configure(bg="#16141f")
+_install_custom_cursor(_boot_root)
 
-tk.Label(_boot_root, text="⚡ 67Launcher", font=("Segoe UI", 20, "bold"),
-         bg="#16141f", fg="#6d92ff").pack(pady=(24, 8), padx=40)
-_boot_status_label = tk.Label(_boot_root, text="⏳ Загрузка...", font=("Segoe UI", 13),
-                              bg="#16141f", fg="#a8a4bd")
-_boot_status_label.pack(pady=(0, 24))
+_boot_state = {"value": 0.0}
 
+if _SHORTCUT_LAUNCH:
+    # Сплеш ярлыка: что запускаем, что сейчас происходит и полоска прогресса.
+    from tkinter import ttk as _ttk
+
+    try:
+        _boot_root.attributes("-topmost", True)
+        _boot_root.configure(highlightthickness=1, highlightbackground="#3d3a58")
+    except Exception:
+        pass
+
+    tk.Label(_boot_root, text="Minecraft", font=("Segoe UI", 20, "bold"),
+             bg="#16141f", fg="#6d92ff").pack(pady=(24, 2), padx=40)
+    _boot_sub = _SHORTCUT_LAUNCH["version"]
+    if _SHORTCUT_LAUNCH["account"]:
+        _boot_sub += f"   ·   {_SHORTCUT_LAUNCH['account']}"
+    tk.Label(_boot_root, text=_boot_sub, font=("Segoe UI", 11),
+             bg="#16141f", fg="#9b97b8").pack(pady=(0, 14))
+    _boot_status_label = tk.Label(_boot_root, text="Готовлюсь к запуску...", font=("Segoe UI", 13),
+                                  bg="#16141f", fg="#a8a4bd")
+    _boot_status_label.pack(pady=(0, 12))
+
+    _boot_style = _ttk.Style(_boot_root)
+    try:
+        _boot_style.theme_use("clam")
+    except Exception:
+        pass
+    _boot_style.configure("Splash.Horizontal.TProgressbar", troughcolor="#2b2840", background="#7896f7",
+                          bordercolor="#16141f", lightcolor="#7896f7", darkcolor="#7896f7", thickness=10)
+    _boot_bar = _ttk.Progressbar(_boot_root, style="Splash.Horizontal.TProgressbar", orient="horizontal",
+                                 mode="determinate", maximum=100, length=340)
+    _boot_bar.pack(pady=(0, 26), padx=40)
+else:
+    tk.Label(_boot_root, text="67Launcher", font=("Segoe UI", 20, "bold"),
+             bg="#16141f", fg="#6d92ff").pack(pady=(24, 8), padx=40)
+    _boot_status_label = tk.Label(_boot_root, text="Загрузка...", font=("Segoe UI", 13),
+                                  bg="#16141f", fg="#a8a4bd")
+    _boot_status_label.pack(pady=(0, 24))
+
+# Считаем размеры скрытого окна и сразу выставляем центральную позицию.
+# update_idletasks() обновляет геометрию виджетов без показа окна.
 _boot_root.update_idletasks()
 _bw = _boot_root.winfo_reqwidth() or 320
 _bh = _boot_root.winfo_reqheight() or 120
-_bsw = _boot_root.winfo_screenwidth()
-_bsh = _boot_root.winfo_screenheight()
+
+# Процесс DPI-aware, так что winfo_screenwidth() и geometry() работают в одних и тех же пикселях.
+_bsw = _bsh = 0
+
+if not _bsw:
+    _bsw = _boot_root.winfo_screenwidth()
+if not _bsh:
+    _bsh = _boot_root.winfo_screenheight()
+
 _boot_root.geometry(f"{_bw}x{_bh}+{(_bsw - _bw) // 2}+{(_bsh - _bh) // 2}")
+# Только теперь показываем — окно появляется сразу в центре, без мигания.
+_boot_root.deiconify()
 _boot_root.update()
 
 
 def _boot_tick(status=None):
-    if status:
+    if _SHORTCUT_LAUNCH:
+        # В режиме ярлыка тексты про загрузку модулей лаунчера ни к чему —
+        # просто плавно двигаем полоску до 20%, дальше её ведёт GameShortcutRunner.
         try:
-            _boot_status_label.configure(text=f"⏳ {status}")
+            _boot_state["value"] = min(_boot_state["value"] + 2.5, 20.0)
+            _boot_bar["value"] = _boot_state["value"]
+        except Exception:
+            pass
+    elif status:
+        try:
+            _boot_status_label.configure(text=f"{status}")
         except Exception:
             pass
     try:
@@ -38,6 +257,35 @@ def _boot_tick(status=None):
 _boot_tick("Запуск...")
 
 import customtkinter as ctk
+
+
+def _patch_toplevel_cursor():
+    """Все новые окна (чат, диалоги, тосты, меню) сразу получают курсор лаунчера."""
+    try:
+        _orig_ctk_init = ctk.CTkToplevel.__init__
+
+        def _ctk_toplevel_init(self, *args, **kwargs):
+            _orig_ctk_init(self, *args, **kwargs)
+            _install_custom_cursor(self)
+
+        ctk.CTkToplevel.__init__ = _ctk_toplevel_init
+    except Exception as e:
+        print(f"[cursor] CTkToplevel patch failed: {e}")
+    try:
+        _orig_tk_init = tk.Toplevel.__init__
+
+        def _tk_toplevel_init(self, *args, **kwargs):
+            _orig_tk_init(self, *args, **kwargs)
+            # CTkToplevel сам обрабатывается выше, тут только «голые» tk.Toplevel
+            if type(self) is tk.Toplevel:
+                _install_custom_cursor(self)
+
+        tk.Toplevel.__init__ = _tk_toplevel_init
+    except Exception as e:
+        print(f"[cursor] tk.Toplevel patch failed: {e}")
+
+
+_patch_toplevel_cursor()
 from tkinter import messagebox, filedialog
 import minecraft_launcher_lib as mll
 
@@ -144,6 +392,8 @@ import re
 import traceback
 import hashlib
 import uuid
+import secrets
+import http.server
 
 _boot_tick("Загрузка чата и трея...")
 import websocket as ws_client
@@ -165,7 +415,7 @@ try:
 except ImportError:
     pyautogui = None
 
-RELAY_URL_DEFAULT = "wss://screen-relay-production.up.railway.app"
+RELAY_URL_DEFAULT = "wss://screen-relay-bibb.onrender.com"
 RELAY_URL_API_SOURCE = "https://api.github.com/repos/KotiPlayYT/67launcher/contents/relay.active.txt?ref=main"
 RELAY_URL_RAW_SOURCE = "https://raw.githubusercontent.com/KotiPlayYT/67launcher/main/relay.active.txt"
 RELAY_URL = RELAY_URL_DEFAULT
@@ -177,6 +427,15 @@ def _extract_relay_candidate(text):
 
 
 def fetch_active_relay_url(timeout=5):
+    # 67Launcher 2.0: the friends/leaderboard relay is explicitly pinned here.
+    # Do not silently replace it from an old relay.active.txt file.
+    global RELAY_URL
+    RELAY_URL = RELAY_URL_DEFAULT
+    return RELAY_URL, "pinned"
+
+
+# Legacy dynamic-relay implementation intentionally disabled below.
+def _fetch_active_relay_url_legacy(timeout=5):
     global RELAY_URL
     candidate = ""
     source_used = None
@@ -250,7 +509,250 @@ def check_room_active(relay_url, room, timeout=5):
             pass
 
 
+# ---------- Мировой рейтинг по времени в игре ----------
+# Рейтинг «мировой» только пока все ходят на ОДИН сервер, поэтому адрес зашит отдельно
+# и не подменяется ни relay.active.txt, ни адресом релея из настроек чата.
+LEADERBOARD_RELAY_URL = "wss://screen-relay-bibb.onrender.com"
+LEADERBOARD_TOP_LIMIT = 50
+# Бесплатный Render засыпает: первое подключение после простоя может тянуться минуту и больше.
+LEADERBOARD_CONNECT_TIMEOUT = 90
+LEADERBOARD_REPLY_TIMEOUT = 60
+MOJANG_SESSION_JOIN_URL = "https://sessionserver.mojang.com/session/minecraft/join"
+MINECRAFT_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+
+_LB_REASON_TEXT = {
+    "not_verified": "Mojang не подтвердил, что аккаунт твой — перезайди в него во вкладке «Аккаунты»",
+    "rate_limited": "слишком часто шлёшь, подожди {retry_in} сек",
+    "too_fast": "время выросло быстрее, чем реально прошло, — сервер такое не берёт",
+    "mojang_unavailable": "Mojang сейчас не отвечает, попробуй позже",
+    "bad_request": "сервер не разобрал запрос",
+    "timeout": "сервер не дождался ответа, попробуй ещё раз",
+    "leaderboard_full": "в рейтинге больше нет мест",
+    "internal": "на сервере рейтинга что-то сломалось, попробуй позже",
+}
+
+
+class LeaderboardError(Exception):
+    """Понятная человеку причина, почему с рейтингом не вышло."""
+
+
+class LeaderboardNetworkError(LeaderboardError):
+    """До сервера рейтинга не достучались (повторять для других аккаунтов смысла нет)."""
+
+
+def lb_normalize_uuid(value):
+    """UUID без дефисов, нижний регистр; None, если это не UUID."""
+    if not isinstance(value, str):
+        return None
+    v = value.replace("-", "").strip().lower()
+    return v if re.fullmatch(r"[0-9a-f]{32}", v) else None
+
+
+def lb_safe_int(value, default=0):
+    try:
+        if isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def lb_format_duration(seconds):
+    seconds = max(0, lb_safe_int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    if hours:
+        return f"{hours}ч {minutes:02d}м"
+    if minutes:
+        return f"{minutes}м"
+    return "меньше минуты" if seconds else "0м"
+
+
+def _lb_net_error_text(e):
+    if isinstance(e, (ws_client.WebSocketTimeoutException, requests.exceptions.Timeout, socket.timeout, TimeoutError)):
+        return "сервер долго не отвечал — бесплатный хостинг мог спать, попробуй ещё раз через минуту"
+    return f"нет связи с сервером ({type(e).__name__}: {e})"
+
+
+def _lb_connect():
+    try:
+        return ws_client.create_connection(
+            LEADERBOARD_RELAY_URL, timeout=LEADERBOARD_CONNECT_TIMEOUT, sslopt=_ws_sslopt())
+    except Exception as e:
+        raise LeaderboardNetworkError(_lb_net_error_text(e))
+
+
+def _lb_close(ws):
+    try:
+        ws.close()
+    except Exception:
+        pass
+
+
+def _lb_reason_message(result):
+    reason = result.get("reason")
+    template = _LB_REASON_TEXT.get(reason, f"сервер отказал ({reason})")
+    try:
+        return template.format(retry_in=lb_safe_int(result.get("retry_in"), 15))
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+def _lb_recv_json(ws):
+    raw = ws.recv()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise LeaderboardError("сервер ответил что-то непонятное")
+    if not isinstance(data, dict):
+        raise LeaderboardError("сервер ответил что-то непонятное")
+    if data.get("type") == "error":
+        if data.get("reason") in ("missing_room", "invalid_json", "invalid_message", "unknown_action"):
+            raise LeaderboardError("на сервере старый relay.py без рейтинга — залей новый на Render")
+        raise LeaderboardError(f"сервер ответил ошибкой ({data.get('reason')})")
+    return data
+
+
+def fetch_world_leaderboard(uuids=None, limit=LEADERBOARD_TOP_LIMIT):
+    """Топ мирового рейтинга. uuids — свои лицензионные аккаунты, чтобы узнать своё место."""
+    ws = _lb_connect()
+    try:
+        ws.settimeout(LEADERBOARD_REPLY_TIMEOUT)
+        ws.send(json.dumps({"action": "lb_top", "limit": limit, "uuids": list(uuids or [])[:10]}))
+        data = _lb_recv_json(ws)
+    except LeaderboardError:
+        raise
+    except Exception as e:
+        raise LeaderboardNetworkError(_lb_net_error_text(e))
+    finally:
+        _lb_close(ws)
+    if data.get("type") != "lb_top":
+        raise LeaderboardError("сервер ответил не то, что просили")
+    return data
+
+
+def fetch_world_player_stats(uuid):
+    """Запрашивает публичную статистику игрока рейтинга по Minecraft UUID."""
+    uid = lb_normalize_uuid(uuid)
+    if not uid:
+        raise LeaderboardError("у игрока нет корректного идентификатора")
+    ws = _lb_connect()
+    try:
+        ws.settimeout(LEADERBOARD_REPLY_TIMEOUT)
+        ws.send(json.dumps({"action": "lb_stats", "uuid": uid}))
+        data = _lb_recv_json(ws)
+    except LeaderboardError:
+        raise
+    except Exception as e:
+        raise LeaderboardNetworkError(_lb_net_error_text(e))
+    finally:
+        _lb_close(ws)
+    if data.get("type") != "lb_stats":
+        raise LeaderboardError("сервер ответил не то, что просили")
+    if not data.get("ok"):
+        raise LeaderboardError(_lb_reason_message(data))
+    return data
+
+
+def _lb_minecraft_profile(access_token):
+    """(uuid, ник) владельца токена; None — токен не подошёл (просрочен или недействителен)."""
+    if not access_token:
+        return None
+    try:
+        r = requests.get(MINECRAFT_PROFILE_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
+    except Exception as e:
+        raise LeaderboardNetworkError(_lb_net_error_text(e))
+    if r.status_code == 200:
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        uid = lb_normalize_uuid(data.get("id")) if isinstance(data, dict) else None
+        name = data.get("name") if isinstance(data, dict) else None
+        if uid and isinstance(name, str) and name:
+            return uid, name
+        raise LeaderboardError("Minecraft вернул странный профиль")
+    if r.status_code in (401, 403):
+        return None
+    if r.status_code == 404:
+        raise LeaderboardError("на этом аккаунте нет лицензии Minecraft Java")
+    raise LeaderboardError(f"профиль Minecraft не отдался (код {r.status_code})")
+
+
+def _lb_resolve_credentials(account):
+    """Свежий токен + актуальные uuid и ник. Токен обновляем, только если старый уже не годится."""
+    token = account.get("access_token") or ""
+    profile = _lb_minecraft_profile(token)
+    if profile is None:
+        refreshed = refresh_microsoft_account(account)
+        token = (refreshed or {}).get("access_token") or ""
+        profile = _lb_minecraft_profile(token) if token else None
+        if profile is None:
+            raise LeaderboardError("вход в Microsoft протух — добавь аккаунт заново во вкладке «Аккаунты»")
+    stored = lb_normalize_uuid(account.get("uuid"))
+    if stored and stored != profile[0]:
+        raise LeaderboardError("токен оказался от другого аккаунта — добавь аккаунт заново")
+    return token, profile[0], profile[1]
+
+
+def submit_licensed_playtime(account, seconds, stats=None, launcher_user_id=None, friend_auth_token=None):
+    """Отправляет лицензионное время и снимок статистики в мировой рейтинг.
+
+    Токен Minecraft серверу рейтинга НЕ передаётся: сначала выполняется обычная
+    проверка владения аккаунтом через Mojang, после чего в relay отправляется
+    только безопасный снимок статистики. Старый протокол без stats поддерживается.
+    """
+    seconds = max(0, lb_safe_int(seconds))
+    token, uuid32, name = _lb_resolve_credentials(account)
+    ws = _lb_connect()
+    result = None
+    try:
+        ws.settimeout(LEADERBOARD_REPLY_TIMEOUT)
+        ws.send(json.dumps({"action": "lb_begin", "uuid": uuid32, "name": name}))
+        challenge = _lb_recv_json(ws)
+        if challenge.get("type") == "lb_result" and not challenge.get("ok"):
+            raise LeaderboardError(_lb_reason_message(challenge))
+        server_id = challenge.get("server_id")
+        if challenge.get("type") != "lb_challenge" or not isinstance(server_id, str) or not server_id:
+            raise LeaderboardError("сервер ответил не то, что просили")
+
+        r = requests.post(
+            MOJANG_SESSION_JOIN_URL,
+            json={"accessToken": token, "selectedProfile": uuid32, "serverId": server_id},
+            timeout=20,
+        )
+        if r.status_code != 204:
+            raise LeaderboardError(f"Mojang не принял проверку аккаунта (код {r.status_code})")
+
+        payload = {"action": "lb_submit", "seconds": seconds}
+        if isinstance(stats, dict):
+            payload["stats"] = stats
+        if isinstance(launcher_user_id, str) and launcher_user_id.strip():
+            payload["launcher_user_id"] = launcher_user_id.strip()[:32]
+            if isinstance(friend_auth_token, str) and friend_auth_token.strip():
+                payload["friend_auth"] = friend_auth_token.strip()
+        ws.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        result = _lb_recv_json(ws)
+    except LeaderboardError:
+        raise
+    except Exception as e:
+        raise LeaderboardNetworkError(_lb_net_error_text(e))
+    finally:
+        _lb_close(ws)
+    if not isinstance(result, dict) or result.get("type") != "lb_result":
+        raise LeaderboardError("сервер ответил не то, что просили")
+    if not result.get("ok"):
+        raise LeaderboardError(_lb_reason_message(result))
+    return result
+
+
 def check_dependencies():
+    if getattr(sys, "frozen", False):
+        # В exe все пакеты уже внутри. Проверка через __import__ тут только
+        # даёт ложные срабатывания, а input() в сборке без консоли падает.
+        return
     required = ['customtkinter', 'minecraft_launcher_lib', 'requests', 'PIL', 'certifi']
     pip_names = {'PIL': 'Pillow'}
     missing = []
@@ -271,7 +773,10 @@ def check_dependencies():
         print(f"❌ Отсутствуют пакеты: {', '.join(missing)}")
         print("Установите их командой:")
         print(f"pip install {' '.join(missing)}")
-        input("Нажмите Enter для выхода...")
+        try:
+            input("Нажмите Enter для выхода...")
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -339,6 +844,173 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+
+
+
+# ===================== LAUNCHER UPDATER =====================
+UPDATER_VERSION_URL = "https://raw.githubusercontent.com/KotiPlayYT/67launcher/main/LAUNCHERVERSION.JOPA"
+UPDATER_USER_AGENT = "67Launcher/2.0"
+
+
+def _launcher_base_dir():
+    return os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+
+
+def _launcher_version_tuple(value):
+    parts = re.findall(r"\d+", str(value or ""))
+    return tuple(int(x) for x in parts) if parts else ()
+
+
+def _launcher_read_local_version():
+    path = os.path.join(_launcher_base_dir(), "LAUNCHERVERSION.JOPA")
+    if not os.path.isfile(path):
+        # onefile: файл мог быть упакован внутрь exe через --add-data
+        bundled = resource_path("LAUNCHERVERSION.JOPA")
+        if os.path.isfile(bundled):
+            path = bundled
+    if not os.path.isfile(path):
+        return "", path
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper().startswith("LAUNCHERVERSION="):
+                line = line.split("=", 1)[1].strip()
+            if re.fullmatch(r"\d+(?:\.\d+)*", line):
+                return line, path
+            return "", path
+    return "", path
+
+
+def _launcher_fetch_update_info():
+    headers = {"User-Agent": UPDATER_USER_AGENT, "Cache-Control": "no-cache"}
+    url = UPDATER_VERSION_URL + ("&" if "?" in UPDATER_VERSION_URL else "?") + "t=" + str(int(time.time()))
+    response = requests.get(url, headers=headers, timeout=12)
+    response.raise_for_status()
+    data = {}
+    for raw in response.text.splitlines():
+        line = raw.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip().upper()] = value.strip()
+    remote = data.get("LAUNCHERVERSION", "")
+    download = data.get("URLDOWNLOAD", "")
+    if not re.fullmatch(r"\d+(?:\.\d+)*", remote):
+        raise ValueError("GitHub: неверный LAUNCHERVERSION")
+    if not download.lower().startswith(("https://", "http://")):
+        raise ValueError("GitHub: неверный URLDOWNLOAD")
+    return remote, download
+
+
+def _launcher_find_updater():
+    base = _launcher_base_dir()
+    current = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__).lower()
+    for name in ("launcherupdate.exe", "launcherupdate.py", "client.exe"):
+        candidate = os.path.abspath(os.path.join(base, name))
+        if candidate.lower() == current:
+            continue
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _clean_pyinstaller_env():
+    """Копия окружения без следов PyInstaller onefile — для запуска ДРУГИХ exe."""
+    env = dict(os.environ)
+    for key in list(env):
+        if key == "_MEIPASS2" or key.startswith("_PYI_"):
+            env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def _launcher_start_updater(self, download_url, target_version):
+    updater = _launcher_find_updater()
+    if not updater:
+        raise FileNotFoundError("Не найден launcherupdate.exe / launcherupdate.py / client.exe")
+    args = [updater, "--update-url", download_url, "--target-version", target_version]
+    if updater.lower().endswith(".py"):
+        if getattr(sys, "frozen", False):
+            # В exe sys.executable — это сам лаунчер, а не Python. Ищем настоящий.
+            py = shutil.which("pythonw") or shutil.which("python") or shutil.which("py")
+            if not py:
+                raise FileNotFoundError("Для launcherupdate.py нужен Python, а в системе его нет. "
+                                        "Положи рядом launcherupdate.exe")
+            args.insert(0, py)
+        else:
+            args.insert(0, sys.executable)
+    self.log(f"[Updater] Запуск: {args}")
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    # onefile: дочерний exe не должен подхватить временную папку лаунчера (она удалится
+    # при его закрытии), поэтому сбрасываем переменные PyInstaller.
+    child_env = _clean_pyinstaller_env()
+    return subprocess.Popen(args, cwd=os.path.dirname(updater), creationflags=creationflags,
+                            close_fds=True, env=child_env, stdin=subprocess.DEVNULL)
+
+
+def _launcher_update_result(self, ok, message, local_version, remote_version, download_url=""):
+    self._launcher_update_check_running = False
+    try:
+        self._launcher_update_button.configure(state="normal")
+    except Exception:
+        pass
+    if not ok:
+        self.log(f"[Updater] Ошибка: {message}")
+        try:
+            self._launcher_update_status.configure(text=f"Ошибка: {message}", text_color="#d3453f")
+        except Exception:
+            pass
+        try:
+            show_error_toast(self, "Обновление", message)
+        except Exception:
+            pass
+        return
+    self.log(f"[Updater] Текущая: {local_version} | GitHub: {remote_version}")
+    if _launcher_version_tuple(remote_version) <= _launcher_version_tuple(local_version):
+        self._launcher_update_status.configure(text=f"Установлена последняя версия: {local_version}", text_color="#6fce7f")
+        try:
+            show_info_toast(self, "Обновление", "У тебя уже установлена последняя версия.")
+        except Exception:
+            pass
+        return
+    self._launcher_update_status.configure(text=f"Доступно обновление: {local_version} → {remote_version}", text_color="#e5c76b")
+    if not messagebox.askyesno("Обновление 67Launcher", f"Доступна версия {remote_version}.\n\nСкачать и установить сейчас?"):
+        self.log("[Updater] Пользователь отменил обновление")
+        return
+    try:
+        proc = _launcher_start_updater(self, download_url, remote_version)
+        self.log(f"[Updater] Updater запущен, PID={proc.pid}")
+        self._launcher_update_status.configure(text="Updater запущен. Лаунчер закроется...", text_color="#6fce7f")
+        self.after(700, self.destroy)
+    except Exception as e:
+        _launcher_update_result(self, False, str(e), local_version, remote_version, download_url)
+
+
+def check_launcher_update_from_settings(self):
+    if getattr(self, "_launcher_update_check_running", False):
+        return
+    self._launcher_update_check_running = True
+    try:
+        self._launcher_update_button.configure(state="disabled")
+        self._launcher_update_status.configure(text="Проверяю обновления...", text_color="#e5c76b")
+    except Exception:
+        pass
+    local_version, local_path = _launcher_read_local_version()
+    if not local_version:
+        _launcher_update_result(self, False, f"Не удалось прочитать версию: {local_path}", "", "")
+        return
+    self.log(f"[Updater] Локальная версия: {local_version}")
+    def worker():
+        try:
+            remote, download = _launcher_fetch_update_info()
+            self.after(0, lambda: _launcher_update_result(self, True, "", local_version, remote, download))
+        except Exception as e:
+            self.after(0, lambda: _launcher_update_result(self, False, str(e), local_version, "", ""))
+    threading.Thread(target=worker, daemon=True, name="launcher-update-check").start()
 
 def get_launcher_dir():
     if getattr(sys, "frozen", False):
@@ -960,6 +1632,8 @@ def _load_67launcher_theme():
         base_theme_path = os.path.join(
             os.path.dirname(ctk.__file__), "assets", "themes", "blue.json"
         )
+        if not os.path.isfile(base_theme_path):
+            base_theme_path = resource_path(os.path.join("customtkinter", "assets", "themes", "blue.json"))
         with open(base_theme_path, "r", encoding="utf-8") as f:
             merged = json.load(f)
     except Exception:
@@ -986,11 +1660,16 @@ def _load_67launcher_theme():
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme(_load_67launcher_theme())
 
-DEFAULT_GAME_DIR = os.path.join(os.environ['APPDATA'], ".minecraft")
+DEFAULT_GAME_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), ".minecraft")
 GAME_DIR = DEFAULT_GAME_DIR
 MINECRAFT_DIR = GAME_DIR
 
 SETTINGS_FILE = get_settings_path()
+try:
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as _cf:
+        _set_cursor_mode((json.load(_cf) or {}).get("cursor_mode", "custom"))
+except Exception:
+    pass
 STATS_FILE = os.path.join(os.path.dirname(SETTINGS_FILE), "launcher_stats.json")
 
 ACCOUNTS_FILE = os.path.join(MINECRAFT_DIR, "accounts.json")
@@ -1052,24 +1731,37 @@ def load_launcher_settings():
         "support_shown_5": False,
         "theme": "dark",
         "golden_theme_enabled": True,
+        "cursor_mode": "custom",
         "secret_clicks": 0,
         "show_game_logs": False,
         "chat_window_size": "800x850",
         "ms_client_id": DEFAULT_MS_CLIENT_ID,
         "ms_redirect_uri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
         "user_id": "",
+        "launcher_google_sub": "",
+        "launcher_google_email": "",
+        "launcher_google_name": "",
+        "launcher_google_refresh_token": "",
         "personal_chats": [],
-        "custom_button_colors": {}
+        "custom_button_colors": {},
+        "custom_variables": {}
     }
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
-                if 'support_shown' in settings:
-                    del settings['support_shown']
-                for key in default_settings:
+                if not isinstance(settings, dict):
+                    raise ValueError("settings.json должен содержать объект JSON")
+                settings.pop('support_shown', None)
+                for key, default_value in default_settings.items():
                     if key not in settings:
-                        settings[key] = default_settings[key]
+                        # Копируем mutable defaults, чтобы настройки не делили один объект.
+                        if isinstance(default_value, dict):
+                            settings[key] = dict(default_value)
+                        elif isinstance(default_value, list):
+                            settings[key] = list(default_value)
+                        else:
+                            settings[key] = default_value
                 return settings
         except:
             return default_settings
@@ -1096,16 +1788,36 @@ def save_launcher_settings(settings):
 
 
 def generate_short_user_code():
-    digits = "".join(random.choice("23456789") for _ in range(3))
-    letters = "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(3))
-    return digits + letters
+    # Новый публичный ID делаем длинным и непредсказуемым. Старые ID не меняем,
+    # чтобы не ломать существующие связи друзей и записи рейтинга.
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    return "".join(secrets.choice(alphabet) for _ in range(12))
 
 
 def ensure_user_id(settings):
+    # После входа Google ID 67Launcher становится стабильным и не зависит
+    # от ника Minecraft. Старые установки без Google получают локальный ID
+    # до момента входа, чтобы лаунчер не ломался на миграции.
+    google_sub = str(settings.get("launcher_google_sub") or "").strip()
+    if google_sub:
+        stable_id = launcher_google_user_id(google_sub)
+        if stable_id and settings.get("user_id") != stable_id:
+            settings["user_id"] = stable_id
+            save_launcher_settings(settings)
+        return stable_id
     if not settings.get("user_id"):
         settings["user_id"] = generate_short_user_code()
         save_launcher_settings(settings)
     return settings["user_id"]
+
+
+def ensure_friend_auth_token(settings):
+    token = str(settings.get("friend_auth_token") or "").strip()
+    if len(token) < 48:
+        token = secrets.token_urlsafe(48)
+        settings["friend_auth_token"] = token
+        save_launcher_settings(settings)
+    return token
 
 
 def load_stats():
@@ -1113,24 +1825,54 @@ def load_stats():
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return default_stats
+                stats = json.load(f)
+            if not isinstance(stats, dict):
+                raise ValueError("stats.json должен содержать объект JSON")
+            stats.setdefault("launches", 0)
+            stats.setdefault("total_play_time", 0)
+            stats.setdefault("last_launch", None)
+            if not isinstance(stats.get("launch_history"), list):
+                stats["launch_history"] = []
+            return stats
+        except (OSError, ValueError, TypeError):
+            return default_stats.copy()
     return default_stats
 
 
 def save_stats(stats):
     try:
+        # Санитизация перед сохранением: не даём записать явно накрученные данные
+        launches = lb_safe_int(stats.get("launches", 0))
+        play_time = lb_safe_int(stats.get("total_play_time", 0))
+        # total_play_time не может быть больше launches * 24 часа (если запусков > 0)
+        if launches > 0 and play_time > launches * 86400:
+            stats["total_play_time"] = launches * 86400
+        # total_play_time не может быть отрицательным
+        if play_time < 0:
+            stats["total_play_time"] = 0
+        # Аналогично для licensed_play
+        licensed_book = stats.get("licensed_play")
+        if isinstance(licensed_book, dict):
+            for uid, rec in licensed_book.items():
+                if isinstance(rec, dict):
+                    secs = lb_safe_int(rec.get("seconds", 0))
+                    if secs < 0:
+                        rec["seconds"] = 0
+                    elif launches > 0 and secs > launches * 86400:
+                        rec["seconds"] = launches * 86400
         with open(STATS_FILE, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
         return True
-    except:
+    except Exception:
         return False
 
 
 def update_stats():
     stats = load_stats()
-    stats["launches"] += 1
+    stats["launches"] = max(0, lb_safe_int(stats.get("launches", 0))) + 1
+    stats["total_play_time"] = max(0, lb_safe_int(stats.get("total_play_time", 0)))
+    if not isinstance(stats.get("launch_history"), list):
+        stats["launch_history"] = []
     stats["last_launch"] = datetime.now().isoformat()
     stats["launch_history"].append({
         "time": datetime.now().isoformat(),
@@ -1152,9 +1894,109 @@ def update_stats():
             pass
 
 
-def update_play_time(seconds):
+def _get_real543_path():
+    """Путь к защитному файлу real-543.txt в папке temp."""
+    return os.path.join(tempfile.gettempdir(), "real-543.txt")
+
+
+def _write_real543(start_epoch):
+    """Записывает эпоху старта сессии в real-543.txt."""
+    try:
+        path = _get_real543_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(start_epoch))
+    except Exception as e:
+        print(f"[real-543] Не удалось записать: {e}")
+
+
+def _read_real543():
+    """Читает эпоху старта из real-543.txt. Возвращает float или None."""
+    try:
+        path = _get_real543_path()
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+        return float(val)
+    except Exception:
+        return None
+
+
+def _delete_real543():
+    """Удаляет real-543.txt после завершения сессии."""
+    try:
+        path = _get_real543_path()
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _get_real_session_seconds():
+    """Вычисляет реальное время сессии по real-543.txt.
+    Возвращает количество секунд (int) или None если файл отсутствует."""
+    start = _read_real543()
+    if start is None:
+        return None
+    elapsed = time.time() - start
+    # Sanity-check: не больше 24 часов и не отрицательное
+    if elapsed < 0:
+        return 0
+    return int(min(elapsed, 86400))
+
+
+def update_play_time(seconds, licensed=None):
+    """licensed — {"uuid", "name"} лицензионного аккаунта, на котором шла игра (или None).
+    Только это время идёт в мировой рейтинг; общее время игры считается как раньше.
+
+    Защита от накрутки: сравниваем seconds (из UI-таймера) с реальным временем
+    из real-543.txt. Берём минимум, чтобы накрутка через правку txt не работала.
+    """
+    # --- Anti-cheat: определяем реальное время сессии ---
+    real_seconds = _get_real_session_seconds()
+    if real_seconds is not None:
+        # Если разница больше 60 секунд — кто-то правил launcher_stats.json вручную
+        # или системные часы прыгнули. Берём реальное время из real-543.txt.
+        if abs(seconds - real_seconds) > 60:
+            print(f"[anti-cheat] timer_seconds={seconds}, real={real_seconds} — "
+                  f"использую реальное время из real-543.txt")
+            seconds = real_seconds
+        _delete_real543()
+    else:
+        # real-543.txt отсутствует — возможно, файл удалили. Не добавляем ничего подозрительного.
+        # Таймер всё равно работает от start_game_timer, поэтому seconds берём как есть,
+        # но ограничиваем разумным максимумом (24 часа).
+        seconds = min(int(seconds), 86400)
+
+    # --- Проверяем текущий total_play_time на накрутку ---
     stats = load_stats()
-    stats["total_play_time"] = stats.get("total_play_time", 0) + seconds
+    old_total = lb_safe_int(stats.get("total_play_time", 0))
+    new_total = old_total + max(0, seconds)
+
+    # Если total_play_time в файле вдруг стал больше, чем мог накопиться
+    # (больше 24 часов * количество запусков), обнуляем до реалистичного значения.
+    launches = lb_safe_int(stats.get("launches", 1))
+    max_possible = launches * 86400
+    if old_total > max_possible and max_possible > 0:
+        print(f"[anti-cheat] total_play_time={old_total} подозрительно велик, "
+              f"сбрасываю к разумному значению")
+        stats["total_play_time"] = min(old_total, max_possible)
+        old_total = stats["total_play_time"]
+        new_total = old_total + max(0, seconds)
+
+    stats["total_play_time"] = new_total
+
+    if licensed:
+        uid = lb_normalize_uuid(licensed.get("uuid"))
+        if uid:
+            book = stats.get("licensed_play")
+            if not isinstance(book, dict):
+                book = stats["licensed_play"] = {}
+            rec = book.get(uid)
+            if not isinstance(rec, dict):
+                rec = book[uid] = {"name": "", "seconds": 0}
+            rec["seconds"] = lb_safe_int(rec.get("seconds")) + max(0, seconds)
+            rec["name"] = licensed.get("name") or rec.get("name", "")
     save_stats(stats)
     if LauncherApp.instance:
         def _update_ui():
@@ -1168,6 +2010,26 @@ def update_play_time(seconds):
 
 
 def create_launcher_profiles():
+    """Создаёт launcher_profiles.json только если его ещё нет.
+
+    Старый код перезаписывал файл при каждом запуске и мог стирать
+    профили/настройки Minecraft.
+    """
+    os.makedirs(os.path.dirname(LAUNCHER_PROFILES_FILE), exist_ok=True)
+    if os.path.exists(LAUNCHER_PROFILES_FILE):
+        try:
+            with open(LAUNCHER_PROFILES_FILE, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                return existing
+        except (OSError, ValueError, TypeError):
+            # Повреждённый файл не удаляем молча: сохраняем резервную копию.
+            try:
+                backup = LAUNCHER_PROFILES_FILE + '.broken'
+                shutil.copy2(LAUNCHER_PROFILES_FILE, backup)
+            except OSError:
+                pass
+
     launcher_profiles = {
         "profiles": {},
         "settings": {"enableSnapshots": False, "enableHistorical": False, "keepLauncherOpen": False},
@@ -1175,9 +2037,13 @@ def create_launcher_profiles():
         "clientToken": "67-launcher-token",
         "authenticationDatabase": {}
     }
-    os.makedirs(os.path.dirname(LAUNCHER_PROFILES_FILE), exist_ok=True)
-    with open(LAUNCHER_PROFILES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(launcher_profiles, f, indent=2)
+    try:
+        with open(LAUNCHER_PROFILES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(launcher_profiles, f, indent=2, ensure_ascii=False)
+    except OSError:
+        # Ошибка создания профиля не должна блокировать запуск лаунчера.
+        pass
+    return launcher_profiles
 
 
 def cleanup_forge_temp():
@@ -1225,6 +2091,7 @@ def load_accounts():
                         accounts = list(data.values())
                 else:
                     accounts = []
+                accounts = [acc for acc in accounts if isinstance(acc, dict)]
                 for acc in accounts:
                     if 'created' not in acc:
                         acc['created'] = "давно"
@@ -1268,8 +2135,11 @@ def create_microsoft_account(login_data):
 
 def add_microsoft_account(login_data):
     accounts = load_accounts()
+    login_name = str(login_data.get("name", "")).strip()
+    login_uuid = login_data.get("id")
     for i, acc in enumerate(accounts):
-        if acc.get("uuid") == login_data["id"] or acc["username"].lower() == login_data["name"].lower():
+        account_name = str(acc.get("username", "")).strip()
+        if acc.get("uuid") == login_uuid or (account_name and login_name and account_name.casefold() == login_name.casefold()):
             accounts[i] = create_microsoft_account(login_data)
             save_accounts(accounts)
             return True, "Аккаунт обновлён"
@@ -1366,8 +2236,11 @@ def create_elyby_account(login_data):
 
 def add_elyby_account(login_data):
     accounts = load_accounts()
+    login_name = str(login_data.get("name", "")).strip()
+    login_uuid = login_data.get("id")
     for i, acc in enumerate(accounts):
-        if acc.get("uuid") == login_data["id"] or acc["username"].lower() == login_data["name"].lower():
+        account_name = str(acc.get("username", "")).strip()
+        if acc.get("uuid") == login_uuid or (account_name and login_name and account_name.casefold() == login_name.casefold()):
             accounts[i] = create_elyby_account(login_data)
             save_accounts(accounts)
             return True, "Аккаунт обновлён"
@@ -1575,7 +2448,8 @@ def scan_versions():
 
 def get_java_version(java_path="java"):
     try:
-        result = subprocess.run([java_path, "-version"], capture_output=True, text=True)
+        result = subprocess.run([java_path, "-version"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
         if result.returncode == 0:
             output = (result.stderr + result.stdout).lower()
             if "1.8" in output or '"8.' in output:
@@ -1633,7 +2507,7 @@ def get_forge_full_version(mc_version):
     try:
         response = requests.get(
             "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
-            headers={"User-Agent": "67Launcher/1.5"})
+            headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         promos = response.json().get("promos", {})
         build = promos.get(f"{mc_version}-recommended") or promos.get(f"{mc_version}-latest")
@@ -1644,44 +2518,70 @@ def get_forge_full_version(mc_version):
     return None
 
 
+def _required_java_major(minecraft_version):
+    """Возвращает минимальную major-версию Java для Minecraft.
+
+    1.20.5+ и 1.21+ требуют Java 21; 1.18–1.20.4 — Java 17;
+    1.17 обычно запускается на Java 17; старые версии — Java 8.
+    """
+    raw = str(minecraft_version).strip()
+    snapshot = re.match(r"^(\d{2})w(\d{2})[a-z]?$", raw, re.IGNORECASE)
+    if snapshot and int(snapshot.group(1)) >= 24:
+        return 21
+    m = re.match(r"^(?:release[-_])?(\d+)\.(\d+)(?:\.(\d+))?", raw)
+    if not m:
+        return 17
+    major, minor, patch = map(lambda x: int(x or 0), m.groups())
+    if major == 1 and minor == 20 and patch >= 5:
+        return 21
+    if major == 1 and minor >= 21:
+        return 21
+    if major == 1 and minor >= 18:
+        return 17
+    if major == 1 and minor == 17:
+        return 17
+    return 8
+
+
 def get_java_for_version(minecraft_version):
     settings = load_launcher_settings()
-    needs_java17 = any(x in minecraft_version for x in ["1.20", "1.21", "1.19", "1.18", "1.17"])
-    target_version = 17 if needs_java17 else 8
+    target_version = _required_java_major(minecraft_version)
     manual_java = settings.get("java_path", "")
     if manual_java and os.path.exists(manual_java):
         ver = get_java_version(manual_java)
         if ver == target_version:
             return manual_java
-    try:
-        result = subprocess.run(["java", "-version"], capture_output=True, text=True)
-        if result.returncode == 0:
-            output = (result.stderr + result.stdout).lower()
-            if target_version == 17 and ("17." in output or '"17' in output):
-                return "java"
-            elif target_version == 8 and ("1.8" in output or '"8.' in output):
-                return "java"
-    except:
-        pass
-    if target_version == 17:
-        common_paths = [
-            "C:\\Program Files\\Java\\jdk-17.0.13\\bin\\java.exe",
-            "C:\\Program Files\\Java\\jdk-17.0.12\\bin\\java.exe",
-            "C:\\Program Files\\Java\\jdk-17\\bin\\java.exe",
-            "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.13.11-hotspot\\bin\\java.exe",
-            "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.12.7-hotspot\\bin\\java.exe"
-        ]
-        for path in common_paths:
-            if os.path.exists(path):
-                ver = get_java_version(path)
-                if ver == 17:
-                    return path
+
+    def _check_java(path):
+        try:
+            ver = get_java_version(path)
+            return ver == target_version
+        except Exception:
+            return False
+
+    if _check_java("java"):
+        return "java"
+
+    common_roots = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Java"),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Eclipse Adoptium"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Java"),
+    ]
+    for root in common_roots:
+        try:
+            if not os.path.isdir(root):
+                continue
+            for name in sorted(os.listdir(root), reverse=True):
+                candidate = os.path.join(root, name, "bin", "java.exe")
+                if os.path.exists(candidate) and _check_java(candidate):
+                    return candidate
+        except OSError:
+            continue
+
     local_java_dir = os.path.join(MINECRAFT_DIR, f"java{target_version}")
     java_exe = os.path.join(local_java_dir, "bin", "java.exe")
-    if os.path.exists(java_exe):
-        ver = get_java_version(java_exe)
-        if ver == target_version:
-            return java_exe
+    if os.path.exists(java_exe) and _check_java(java_exe):
+        return java_exe
     return "java"
 
 
@@ -1701,7 +2601,7 @@ def load_image_from_url(url, size=(48, 48)):
     if cache_key in _icon_cache:
         return _icon_cache[cache_key]
     try:
-        response = requests.get(url, timeout=10, headers={"User-Agent": "67Launcher/1.5"})
+        response = requests.get(url, timeout=10, headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         img = Image.open(BytesIO(response.content)).convert("RGBA")
         ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
@@ -1720,7 +2620,7 @@ def search_mods(query, game_version, mod_loader, limit=20):
     }
     try:
         response = requests.get("https://api.modrinth.com/v2/search", params=params,
-                                headers={"User-Agent": "67Launcher/1.5"})
+                                headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         return response.json().get("hits", [])
     except:
@@ -1731,7 +2631,7 @@ def install_mod(project_id, game_version, mod_loader):
     try:
         params = {"game_versions": f'["{game_version}"]', "loaders": f'["{mod_loader}"]'}
         response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}/version",
-                                params=params, headers={"User-Agent": "67Launcher/1.5"})
+                                params=params, headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         versions = response.json()
         if not versions:
@@ -1768,7 +2668,7 @@ def identify_mod_by_hash(filepath):
 
         response = requests.get(f"https://api.modrinth.com/v2/version_file/{file_hash}",
                                 params={"algorithm": "sha1"},
-                                headers={"User-Agent": "67Launcher/1.5"})
+                                headers={"User-Agent": "67Launcher/2.0"})
         if response.status_code != 200:
             return None
         version_data = response.json()
@@ -1777,7 +2677,7 @@ def identify_mod_by_hash(filepath):
             return None
 
         project_response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}",
-                                        headers={"User-Agent": "67Launcher/1.5"})
+                                        headers={"User-Agent": "67Launcher/2.0"})
         project_response.raise_for_status()
         project = project_response.json()
         return {
@@ -1807,7 +2707,7 @@ def search_resourcepacks(query, game_version, limit=20):
     }
     try:
         response = requests.get("https://api.modrinth.com/v2/search", params=params,
-                                headers={"User-Agent": "67Launcher/1.5"})
+                                headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         return response.json().get("hits", [])
     except:
@@ -1818,7 +2718,7 @@ def install_resourcepack_web(project_id, game_version):
     try:
         params = {"game_versions": f'["{game_version}"]'}
         response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}/version",
-                                params=params, headers={"User-Agent": "67Launcher/1.5"})
+                                params=params, headers={"User-Agent": "67Launcher/2.0"})
         response.raise_for_status()
         versions = response.json()
         if not versions:
@@ -1846,6 +2746,78 @@ def delete_mod(mod_name):
         os.remove(filepath)
         return True
     return False
+
+
+def get_shaderpacks_folder():
+    """Папка стандартных шейдерпаков Minecraft."""
+    shader_path = os.path.join(MINECRAFT_DIR, "shaderpacks")
+    os.makedirs(shader_path, exist_ok=True)
+    return shader_path
+
+def search_shaders(query, game_version, limit=20, index="relevance"):
+    """Ищет шейдеры через Modrinth. Пустой query используется для режима «Популярные»."""
+    params = {
+        "limit": limit,
+        "index": index,
+        "facets": f'[["project_type:shader"],["versions:{game_version}"]]'
+    }
+    # Для популярных результатов не передаём query="", а полностью убираем параметр.
+    if query:
+        params["query"] = query
+
+    try:
+        response = requests.get(
+            "https://api.modrinth.com/v2/search",
+            params=params,
+            headers={"User-Agent": "67Launcher/2.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json().get("hits", [])
+    except Exception:
+        return []
+
+def install_shader(project_id, game_version):
+    """Скачивает совместимый шейдерпак в .minecraft/shaderpacks."""
+    try:
+        params = {"game_versions": f'["{game_version}"]'}
+        response = requests.get(
+            f"https://api.modrinth.com/v2/project/{project_id}/version",
+            params=params,
+            headers={"User-Agent": "67Launcher/2.0"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        versions = response.json()
+        if not versions:
+            return False, "Нет совместимых версий"
+
+        files = versions[0].get("files", [])
+        if not files:
+            return False, "У этой версии нет файла"
+
+        shader_file = next(
+            (f for f in files if str(f.get("filename", "")).lower().endswith(".zip")),
+            files[0],
+        )
+        download_url = shader_file.get("url")
+        filename = shader_file.get("filename")
+        if not download_url or not filename:
+            return False, "Нет ссылки для скачивания"
+
+        filepath = os.path.join(get_shaderpacks_folder(), filename)
+        response = requests.get(
+            download_url, stream=True,
+            headers={"User-Agent": "67Launcher/2.0"}, timeout=60
+        )
+        response.raise_for_status()
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True, filename
+    except Exception as e:
+        return False, str(e)
 
 
 def get_skins_folder():
@@ -1883,7 +2855,7 @@ def _report_install_progress():
 
 
 def mll_set_status(text):
-    log_message(f"📌 {text}")
+    log_message(f"{text}")
 
     if text.lower().startswith("download"):
         _install_progress_state["download_count"] += 1
@@ -2019,33 +2991,188 @@ class LoadingSpinner(ctk.CTkLabel):
         self.configure(text="✅")
 
 
+# --- Расширенные настройки: ВСЕ переменные лаунчера ---------------------------
+# Три источника значений, которые можно менять в окне «set2026»:
+#   1) цвета кнопок (settings["custom_button_colors"]);
+#   2) все ключи launcher_settings.json (settings целиком);
+#   3) все простые константы из кода (ЗАГЛАВНЫЕ имена: числа, строки, bool,
+#      списки и словари) — переопределения лежат в settings["custom_variables"]
+#      и накатываются на модуль при старте (и сразу при сохранении).
+_VARIABLE_DEFAULTS = None
+_VARIABLES_SKIP = {"KNOWN_BUTTON_COLORS"}  # цвета редактируются на своей вкладке
+_HIDDEN_SETTING_KEYS = {"custom_button_colors", "custom_variables"}
+
+
+def _is_editable_value(value):
+    if isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, dict)):
+        try:
+            json.dumps(value)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _collect_editable_variables():
+    """{ИМЯ: значение} для всех простых констант верхнего уровня."""
+    found = {}
+    for name, value in list(globals().items()):
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name) or name in _VARIABLES_SKIP:
+            continue
+        if _is_editable_value(value):
+            found[name] = value
+    return found
+
+
+def _snapshot_variable_defaults():
+    """Запоминает исходные значения констант (один раз, до любых переопределений)."""
+    global _VARIABLE_DEFAULTS
+    if _VARIABLE_DEFAULTS is None:
+        import copy
+        _VARIABLE_DEFAULTS = {n: copy.deepcopy(v) for n, v in _collect_editable_variables().items()}
+    return _VARIABLE_DEFAULTS
+
+
+def _same_kind(template, value):
+    if isinstance(template, bool):
+        return isinstance(value, bool)
+    if isinstance(template, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(template, float):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(template, str):
+        return isinstance(value, str)
+    if isinstance(template, list):
+        return isinstance(value, list)
+    if isinstance(template, dict):
+        return isinstance(value, dict)
+    return False
+
+
+def _set_global_variable(name, value):
+    """Меняет константу; списки и словари правим на месте, чтобы ссылки на них не ломались."""
+    g = globals()
+    current = g.get(name)
+    if isinstance(current, dict) and isinstance(value, dict):
+        current.clear()
+        current.update(value)
+    elif isinstance(current, list) and isinstance(value, list):
+        current[:] = value
+    else:
+        g[name] = value
+
+
+def _apply_custom_variables(overrides):
+    """Накатывает сохранённые переопределения. Незнакомые имена и значения другого типа пропускает."""
+    import copy
+    defaults = _snapshot_variable_defaults()
+    for name, value in (overrides or {}).items():
+        if name in defaults and _same_kind(defaults[name], value):
+            _set_global_variable(name, copy.deepcopy(value))
+
+
+def _parse_typed_value(text, template):
+    """Текст из поля ввода -> значение того же типа, что и template. При ошибке — ValueError."""
+    text = text if isinstance(text, str) else str(text)
+    if isinstance(template, bool):
+        low = text.strip().lower()
+        if low in ("true", "1", "да", "yes"):
+            return True
+        if low in ("false", "0", "нет", "no"):
+            return False
+        raise ValueError("нужно true/false")
+    if isinstance(template, int):
+        try:
+            return int(text.strip())
+        except ValueError:
+            raise ValueError("нужно целое число")
+    if isinstance(template, float):
+        try:
+            return float(text.strip().replace(",", "."))
+        except ValueError:
+            raise ValueError("нужно число")
+    if isinstance(template, str):
+        return text
+    try:
+        value = json.loads(text)
+    except ValueError:
+        raise ValueError("нужен корректный JSON")
+    if isinstance(template, (list, dict)) and not isinstance(value, type(template)):
+        raise ValueError("нужен JSON-список" if isinstance(template, list) else "нужен JSON-объект")
+    return value
+
+
+def _value_to_text(value):
+    if isinstance(value, (list, dict)) or value is None:
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _make_value_widget(parent, value):
+    """Поле под значение: переключатель для bool, строка для остального.
+    Возвращает (виджет, получить_значение, задать_значение)."""
+    if isinstance(value, bool):
+        var = ctk.BooleanVar(value=value)
+        widget = ctk.CTkSwitch(parent, text="", variable=var, width=46)
+        return widget, (lambda: bool(var.get())), (lambda v: var.set(bool(v)))
+    entry = ctk.CTkEntry(parent, height=28)
+    entry.insert(0, _value_to_text(value))
+
+    def setter(v):
+        entry.delete(0, "end")
+        entry.insert(0, _value_to_text(v))
+
+    return entry, entry.get, setter
+
+
+def _read_row(getter, template):
+    raw = getter()
+    if isinstance(template, bool):
+        return bool(raw)
+    return _parse_typed_value(raw, template)
+
+
 class AdvancedColorSettingsWindow(ctk.CTkToplevel):
-    """Секретное окно (код 'set2026' в поиске версий на вкладке «Установка»),
-    где можно перекрасить ЛЮБОЙ цвет любой кнопки лаунчера hex-кодом."""
+    """Секретное окно (код 'set2026' в поиске версий на вкладке «Установка»):
+    цвета кнопок, все настройки лаунчера и все константы кода."""
 
     def __init__(self, master):
         super().__init__(master)
         self.launcher = master
-        self.title("🎨 Расширенные настройки — цвета кнопок")
-        self.geometry("620x680")
-        self.minsize(500, 400)
+        self.title("set2026 — все переменные лаунчера")
+        self.geometry("740x780")
+        self.minsize(560, 460)
         self.grab_set()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(self, text="🎨 Цвета всех кнопок лаунчера",
+        ctk.CTkLabel(self, text="Все переменные лаунчера",
                      font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, pady=(15, 5))
-        ctk.CTkLabel(self, text="Впиши свой HTML/hex-код (например #ff00aa) для любого цвета ниже.\n"
-                                "Изменения применятся после перезапуска лаунчера.",
-                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="center").grid(
-            row=0, column=0, pady=(60, 0))
 
-        scroll = ctk.CTkScrollableFrame(self)
-        scroll.grid(row=1, column=0, sticky="nsew", padx=15, pady=(5, 10))
+        self.tabs = ctk.CTkTabview(self)
+        self.tabs.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 15))
+        self._build_colors_tab(self.tabs.add("Цвета"))
+        self._build_settings_tab(self.tabs.add("Настройки"))
+        self._build_variables_tab(self.tabs.add("Переменные"))
+
+    # ---------------------------------------------------------------- цвета
+    def _build_colors_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="Впиши свой HTML/hex-код (например #ff00aa) для любого цвета ниже.\n"
+                               "Изменения применятся после перезапуска лаунчера.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="center").grid(
+            row=0, column=0, pady=(0, 6))
+
+        scroll = ctk.CTkScrollableFrame(tab)
+        scroll.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         scroll.grid_columnconfigure(1, weight=1)
 
-        custom = master.settings.get("custom_button_colors", {})
+        custom = self.launcher.settings.get("custom_button_colors", {})
         self.entries = {}
 
         for i, (original_hex, label) in enumerate(KNOWN_BUTTON_COLORS):
@@ -2063,17 +3190,14 @@ class AdvancedColorSettingsWindow(ctk.CTkToplevel):
             entry.grid(row=i, column=2, padx=(0, 4))
             self.entries[original_hex] = entry
 
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, pady=(0, 15))
+        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_frame.grid(row=2, column=0)
 
-        save_btn = make_sound_button(btn_frame, text="💾 Сохранить всё", command=self.save_all,
-                                     fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
-                                     width=180, height=38)
-        save_btn.pack(side="left", padx=(0, 10))
-
-        reset_btn = make_sound_button(btn_frame, text="↩️ Сбросить всё", command=self.reset_all,
-                                      fg_color="#2b2840", hover_color="#3d3a52", width=180, height=38)
-        reset_btn.pack(side="left")
+        make_sound_button(btn_frame, text="Сохранить всё", command=self.save_all,
+                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                          width=180, height=38).pack(side="left", padx=(0, 10))
+        make_sound_button(btn_frame, text="Сбросить всё", command=self.reset_all,
+                          fg_color="#2b2840", hover_color="#3d3a52", width=180, height=38).pack(side="left")
 
     @staticmethod
     def _normalize_hex(value):
@@ -2099,7 +3223,7 @@ class AdvancedColorSettingsWindow(ctk.CTkToplevel):
 
         if bad:
             play_error()
-            show_error_toast(self.launcher, "Ошибка",
+            show_error_toast(self.launcher, "Не вышло",
                              f"Не похоже на hex-цвет: {', '.join(bad[:3])}")
             return
 
@@ -2119,14 +3243,158 @@ class AdvancedColorSettingsWindow(ctk.CTkToplevel):
         save_launcher_settings(self.launcher.settings)
         _apply_button_color_overrides({})
         play_click()
-        self.launcher.log("↩️ Все кастомные цвета кнопок сброшены — перезапусти лаунчер")
+        self.launcher.log("Все кастомные цвета кнопок сброшены — перезапусти лаунчер")
+
+    # ------------------------------------------------------------ настройки
+    def _build_settings_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="Все значения из файла настроек лаунчера.\n"
+                               "Списки и словари пиши как JSON. Часть изменений применится после перезапуска.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="center").grid(
+            row=0, column=0, pady=(0, 6))
+
+        scroll = ctk.CTkScrollableFrame(tab)
+        scroll.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        scroll.grid_columnconfigure(1, weight=1)
+
+        self.setting_rows = {}
+        row = 0
+        for key, value in self.launcher.settings.items():
+            if key in _HIDDEN_SETTING_KEYS:
+                continue
+            ctk.CTkLabel(scroll, text=key, font=ctk.CTkFont(family="Consolas", size=12),
+                         anchor="w").grid(row=row, column=0, sticky="w", padx=(4, 10), pady=5)
+            widget, getter, _setter = _make_value_widget(scroll, value)
+            widget.grid(row=row, column=1, sticky="ew" if not isinstance(value, bool) else "w",
+                        padx=(0, 4), pady=5)
+            self.setting_rows[key] = (value, getter)
+            row += 1
+
+        make_sound_button(tab, text="Сохранить настройки", command=self.save_settings_values,
+                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                          width=220, height=38).grid(row=2, column=0)
+
+    def save_settings_values(self):
+        new_values, bad = {}, []
+        for key, (template, getter) in self.setting_rows.items():
+            try:
+                new_values[key] = _read_row(getter, template)
+            except ValueError as e:
+                bad.append(f"{key} ({e})")
+        if bad:
+            play_error()
+            show_error_toast(self.launcher, "Не вышло", "Не сохранил: " + "; ".join(bad[:3]))
+            return
+        self.launcher.settings.update(new_values)
+        save_launcher_settings(self.launcher.settings)
+        play_click()
+        self.launcher.log(f"Сохранено настроек: {len(new_values)} — перезапусти лаунчер")
+        show_info_toast(self.launcher, "Сохранено",
+                        "Настройки сохранены! Перезапусти лаунчер, чтобы всё применилось.")
+
+    # ----------------------------------------------------------- переменные
+    def _build_variables_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        defaults = _snapshot_variable_defaults()
+        current = _collect_editable_variables()
+
+        ctk.CTkLabel(tab, text="Все константы кода лаунчера. Изменённые подсвечены оранжевым, "
+                               "возвращает исходное значение.\n"
+                               "Списки и словари — JSON. Неудачное значение может сломать лаунчер: "
+                               "«Сбросить всё» вернёт как было.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", justify="center",
+                     wraplength=640).grid(row=0, column=0, pady=(0, 6))
+
+        self.var_search = ctk.CTkEntry(tab, height=30, placeholder_text="Поиск по имени")
+        self.var_search.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.var_search.bind("<KeyRelease>", self._filter_variables)
+
+        scroll = ctk.CTkScrollableFrame(tab)
+        scroll.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        scroll.grid_columnconfigure(1, weight=1)
+
+        self.var_rows = {}
+        self.var_widgets = {}
+        for i, (name, default) in enumerate(defaults.items()):
+            value = current.get(name, default)
+            changed = value != default
+            label = ctk.CTkLabel(scroll, text=name, font=ctk.CTkFont(family="Consolas", size=12),
+                                 anchor="w", text_color="#d9622f" if changed else None)
+            label.grid(row=i, column=0, sticky="w", padx=(4, 10), pady=5)
+            widget, getter, setter = _make_value_widget(scroll, value)
+            widget.grid(row=i, column=1, sticky="w" if isinstance(default, bool) else "ew",
+                        padx=(0, 6), pady=5)
+            reset_btn = make_sound_button(
+                scroll, text="↩", width=32, height=28,
+                fg_color="#2b2840", hover_color="#3d3a52",
+                command=lambda n=name: self.var_rows[n][2](_VARIABLE_DEFAULTS[n]))
+            reset_btn.grid(row=i, column=2, padx=(0, 4), pady=5)
+            self.var_rows[name] = (default, getter, setter)
+            self.var_widgets[name] = (label, widget, reset_btn)
+
+        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_frame.grid(row=3, column=0)
+        make_sound_button(btn_frame, text="Сохранить переменные", command=self.save_variables,
+                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                          width=220, height=38).pack(side="left", padx=(0, 10))
+        make_sound_button(btn_frame, text="Сбросить всё", command=self.reset_variables,
+                          fg_color="#2b2840", hover_color="#3d3a52", width=160, height=38).pack(side="left")
+
+    def _filter_variables(self, event=None):
+        query = self.var_search.get().strip().lower()
+        for name, widgets in self.var_widgets.items():
+            show = query in name.lower()
+            for w in widgets:
+                if show:
+                    w.grid()
+                else:
+                    w.grid_remove()
+
+    def save_variables(self):
+        import copy
+        parsed, overrides, bad = {}, {}, []
+        for name, (default, getter, _setter) in self.var_rows.items():
+            try:
+                value = _read_row(getter, default)
+            except ValueError as e:
+                bad.append(f"{name} ({e})")
+                continue
+            parsed[name] = value
+            if value != default:
+                overrides[name] = value
+        if bad:
+            play_error()
+            show_error_toast(self.launcher, "Не вышло", "Не сохранил: " + "; ".join(bad[:3]))
+            return
+
+        for name, value in parsed.items():
+            _set_global_variable(name, copy.deepcopy(value))
+            label = self.var_widgets[name][0]
+            label.configure(text_color="#d9622f" if name in overrides else ("gray14", "gray84"))
+        self.launcher.settings["custom_variables"] = overrides
+        save_launcher_settings(self.launcher.settings)
+        play_click()
+        self.launcher.log(f"Изменено переменных: {len(overrides)} — для надёжности перезапусти лаунчер")
+        show_info_toast(self.launcher, "Сохранено",
+                        f"Переменные сохранены (изменено: {len(overrides)}). "
+                        "Перезапусти лаунчер, чтобы всё применилось.")
+
+    def reset_variables(self):
+        import copy
+        for name, (default, _getter, setter) in self.var_rows.items():
+            setter(copy.deepcopy(default))
+        self.save_variables()
 
 
 class SecretGeometryDashLauncher(ctk.CTkToplevel):
     def __init__(self, master):
         super().__init__(master)
-        self.title("🎮 Geometry Dash")
-        self.geometry("450x520")
+        self.title("Geometry Dash")
+        self.geometry("450x590")
         self.resizable(False, False)
         self.grab_set()
 
@@ -2157,14 +3425,14 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                               text_color="#6d92ff")
         header.pack(pady=(0, 5))
 
-        sub_header = ctk.CTkLabel(main_frame, text="🎮 Секретный лаунчер",
+        sub_header = ctk.CTkLabel(main_frame, text="Секретный лаунчер",
                                   font=ctk.CTkFont(size=14),
                                   text_color="#d9622f")
         sub_header.pack(pady=(0, 15))
 
         ctk.CTkFrame(main_frame, height=2, fg_color="#6d92ff").pack(fill="x", pady=(0, 15))
 
-        self.status_label = ctk.CTkLabel(main_frame, text="🔍 Проверка установки...",
+        self.status_label = ctk.CTkLabel(main_frame, text="Проверка установки...",
                                          font=ctk.CTkFont(size=14))
         self.status_label.pack(pady=(0, 5))
 
@@ -2181,7 +3449,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(pady=(10, 5))
 
-        self.install_btn = make_sound_button(btn_frame, text="📥 Установить GD",
+        self.install_btn = make_sound_button(btn_frame, text="Поставить GD",
                                              command=self.install_geometry_dash,
                                              width=170, height=45,
                                              fg_color="#6fce7f", hover_color="#5cb56c",
@@ -2189,7 +3457,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                                              font=ctk.CTkFont(size=14, weight="bold"))
         self.install_btn.grid(row=0, column=0, padx=5)
 
-        self.launch_btn = make_sound_button(btn_frame, text="🚀 Запустить GD",
+        self.launch_btn = make_sound_button(btn_frame, text="Запустить GD",
                                             command=self.launch_geometry_dash,
                                             width=170, height=45,
                                             fg_color="#6d92ff", hover_color="#5a7dd8",
@@ -2197,7 +3465,16 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                                             state="disabled")
         self.launch_btn.grid(row=0, column=1, padx=5)
 
-        update_btn = make_sound_button(main_frame, text="🔄 Обновить статус",
+        self.shortcut_btn = make_sound_button(main_frame, text="Создать ярлык на рабочий стол",
+                                              command=self.create_desktop_shortcut,
+                                              width=350, height=38,
+                                              fg_color="#2b2840", hover_color="#3d3a52",
+                                              text_color="#e0ddf0",
+                                              font=ctk.CTkFont(size=13, weight="bold"),
+                                              state="disabled")
+        self.shortcut_btn.pack(pady=(10, 0))
+
+        update_btn = make_sound_button(main_frame, text="Обновить статус",
                                        command=self.check_installation,
                                        width=200, height=35,
                                        fg_color="#d9622f", hover_color="#c14f26",
@@ -2205,7 +3482,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                                        font=ctk.CTkFont(size=13, weight="bold"))
         update_btn.pack(pady=(10, 5))
 
-        info_label = ctk.CTkLabel(main_frame, text="📁 %APPDATA%/LDASH/gd/",
+        info_label = ctk.CTkLabel(main_frame, text="%APPDATA%/LDASH/gd/",
                                   font=ctk.CTkFont(size=11),
                                   text_color="#6d92ff")
         info_label.pack(pady=(10, 0))
@@ -2227,25 +3504,27 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                     if exe_found:
                         break
             if exe_found:
-                self.status_label.configure(text="✅ Geometry Dash установлен!", text_color="#6fce7f")
+                self.status_label.configure(text="Geometry Dash стоит", text_color="#6fce7f")
                 self.launch_btn.configure(state="normal")
-                self.install_btn.configure(text="🔄 Переустановить")
+                self.shortcut_btn.configure(state="normal")
+                self.install_btn.configure(text="Поставить заново")
                 self.progressbar.set(1.0)
                 self.percent_label.configure(text="100%", text_color="#6fce7f")
                 try:
                     size = self.get_folder_size(self.gd_path)
                     size_text = self.format_size(size)
-                    self.status_label.configure(text=f"✅ Geometry Dash установлен! ({size_text})", text_color="#6fce7f")
+                    self.status_label.configure(text=f"Geometry Dash стоит ({size_text})", text_color="#6fce7f")
                 except:
                     pass
             else:
-                self.status_label.configure(text="❌ Geometry Dash не установлен", text_color="#d3453f")
+                self.status_label.configure(text="Geometry Dash не стоит", text_color="#d3453f")
                 self.launch_btn.configure(state="disabled")
-                self.install_btn.configure(text="📥 Установить GD")
+                self.shortcut_btn.configure(state="disabled")
+                self.install_btn.configure(text="Поставить GD")
                 self.progressbar.set(0)
                 self.percent_label.configure(text="0%", text_color="#d9622f")
         except Exception as e:
-            self.status_label.configure(text=f"❌ Ошибка: {e}", text_color="#d3453f")
+            self.status_label.configure(text=f"Ошибка: {e}", text_color="#d3453f")
             play_error()
 
     def format_size(self, size):
@@ -2274,7 +3553,7 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         try:
             self.progressbar.set(percent / 100)
             self.percent_label.configure(text=f"{percent}%", text_color="#d9622f")
-            self.status_label.configure(text=f"⏳ {stage}... ({percent}%)", text_color="#d9622f")
+            self.status_label.configure(text=f"{stage}... ({percent}%)", text_color="#d9622f")
             self.update_idletasks()
         except:
             pass
@@ -2283,13 +3562,14 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         if self.is_installing:
             return
         if os.path.exists(self.exe_path):
-            if not messagebox.askyesno("Переустановка", "Geometry Dash уже установлен.\n\nПереустановить?"):
+            if not messagebox.askyesno("Заново?", "Geometry Dash уже стоит.\n\nПоставить заново?"):
                 return
         self.is_installing = True
         os.makedirs(self.gd_path, exist_ok=True)
-        self.install_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
+        self.install_btn.configure(state="disabled", text="СТАВЛЮ...")
         self.launch_btn.configure(state="disabled")
-        self.status_label.configure(text="⏳ Начинаем скачивание... (0%)", text_color="#d9622f")
+        self.shortcut_btn.configure(state="disabled")
+        self.status_label.configure(text="Качаю... (0%)", text_color="#d9622f")
         self.percent_label.configure(text="0%", text_color="#d9622f")
         self.progressbar.set(0)
         self.progressbar.configure(progress_color="#d9622f")
@@ -2334,23 +3614,57 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
         self.progressbar.set(1.0)
         self.progressbar.configure(progress_color="#6fce7f")
         self.percent_label.configure(text="100%", text_color="#6fce7f")
-        self.status_label.configure(text="✅ Geometry Dash установлен!", text_color="#6fce7f")
-        self.install_btn.configure(state="normal", text="🔄 Переустановить")
+        self.status_label.configure(text="Geometry Dash стоит", text_color="#6fce7f")
+        self.install_btn.configure(state="normal", text="Поставить заново")
         self.launch_btn.configure(state="normal")
+        self.shortcut_btn.configure(state="normal")
         play_click()
-        show_info_toast(self, "Успешно!",
-                            "🎮 Geometry Dash успешно установлен!\n\n📁 Папка: " + self.gd_path + "\n🚀 Нажмите 'Запустить GD' для игры!")
+        show_info_toast(self, "Готово",
+                            "Geometry Dash встал.\n\nПапка: " + self.gd_path + "\nНажмите 'Запустить GD' для игры!")
 
     def install_error(self, error):
         self.progressbar.set(0.3)
         self.progressbar.configure(progress_color="#d3453f")
-        self.percent_label.configure(text="❌ Ошибка", text_color="#d3453f")
-        self.status_label.configure(text="❌ Ошибка", text_color="#d3453f")
-        self.install_btn.configure(state="normal", text="📥 Установить GD")
+        self.percent_label.configure(text="Не вышло", text_color="#d3453f")
+        self.status_label.configure(text="Не вышло", text_color="#d3453f")
+        self.install_btn.configure(state="normal", text="Поставить GD")
         self.launch_btn.configure(state="disabled")
+        self.shortcut_btn.configure(state="disabled")
         play_error()
-        show_error_toast(self, "Ошибка установки",
-                             f"Не удалось установить Geometry Dash.\n\nОшибка: {error}\n\n💡 Попробуйте:\n1. Проверьте интернет\n2. Отключите антивирус\n3. Запустите от имени администратора")
+        show_error_toast(self, "Не встало",
+                             f"Geometry Dash не поставился.\n\nЧто пишет: {error}\n\nПопробуйте:\n1. Проверьте интернет\n2. Отключите антивирус\n3. Запустите от имени администратора")
+
+    def create_desktop_shortcut(self):
+        if not os.path.exists(self.exe_path):
+            play_error()
+            show_error_toast(self, "Не вышло", "Сначала установи Geometry Dash")
+            return
+        play_click()
+        self.shortcut_btn.configure(state="disabled", text="Создаю ярлык...")
+        exe_path = self.exe_path
+
+        def finish(path, error):
+            try:
+                if not self.winfo_exists():
+                    return
+            except Exception:
+                return
+            self.shortcut_btn.configure(state="normal", text="Создать ярлык на рабочий стол")
+            if error:
+                play_error()
+                show_error_toast(self, "Не вышло", f"Не вышло создать ярлык: {error}")
+                return
+            play_click()
+            show_info_toast(self, "Готово", "Готово! Ярлык Geometry Dash лежит на рабочем столе")
+
+        def worker():
+            try:
+                path, error = create_exe_shortcut(exe_path, "Geometry Dash"), None
+            except Exception as e:
+                path, error = None, str(e)
+            self.after(0, lambda: finish(path, error))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def launch_geometry_dash(self):
         if not os.path.exists(self.exe_path):
@@ -2363,25 +3677,25 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                     break
             if not os.path.exists(self.exe_path):
                 play_error()
-                show_error_toast(self, "Ошибка", "GeometryDash.exe куда-то потерялся\n\nПосмотри тут:\n" + self.gd_path)
+                show_error_toast(self, "Не вышло", "GeometryDash.exe куда-то потерялся\n\nПосмотри тут:\n" + self.gd_path)
                 return
         try:
-            self.status_label.configure(text="🚀 Запуск...", text_color="#d9622f")
+            self.status_label.configure(text="Запуск...", text_color="#d9622f")
             self.launch_btn.configure(state="disabled")
             self.update_idletasks()
             exe_dir = os.path.dirname(self.exe_path)
             subprocess.Popen([self.exe_path], cwd=exe_dir)
-            self.status_label.configure(text="✅ Запущен!", text_color="#6fce7f")
+            self.status_label.configure(text="Запущен", text_color="#6fce7f")
             self.launch_btn.configure(state="normal")
             play_click()
         except Exception as e:
-            self.status_label.configure(text="❌ Ошибка запуска", text_color="#d3453f")
+            self.status_label.configure(text="Не запустилось", text_color="#d3453f")
             self.launch_btn.configure(state="normal")
             play_error()
-            show_error_toast(self, "Ошибка", f"Не запустилось:\n{e}")
+            show_error_toast(self, "Не вышло", f"Не запустилось:\n{e}")
 
 
-MAX_PERSONAL_CHATS = 10
+MAX_PERSONAL_CHATS = 50
 
 
 class _ChatMessagebox:
@@ -2633,12 +3947,12 @@ class _ScreenShareHostBanner(ctk.CTkToplevel):
         row.pack(fill="both", expand=True, padx=8, pady=6)
         ctk.CTkLabel(
             row,
-            text=f"🔴 Твой экран и управление транслируются «{viewer_username}»",
+            text=f"Твой экран и управление транслируются «{viewer_username}»",
             text_color="white",
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(side="left", padx=(4, 8))
         ctk.CTkButton(
-            row, text="⏹ Стоп", width=70, fg_color="#5a1c1c", hover_color="#712323",
+            row, text="Стоп", width=70, fg_color="#5a1c1c", hover_color="#712323",
             command=self._stop,
         ).pack(side="right")
 
@@ -2654,7 +3968,7 @@ class RemoteScreenWindow(ctk.CTkToplevel):
         self.peer_username = peer_username
         self.request_id = request_id
 
-        self.title(f"🖥️ Экран «{peer_username}»")
+        self.title(f"Экран «{peer_username}»")
         self.geometry("1040x660")
         self.minsize(480, 320)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2671,12 +3985,12 @@ class RemoteScreenWindow(ctk.CTkToplevel):
         top.pack(side="top", fill="x")
         ctk.CTkLabel(
             top,
-            text=f"🖥️ Управляешь экраном «{peer_username}» — мышь и клавиатура передаются в реальном времени",
+            text=f"Управляешь экраном «{peer_username}» — мышь и клавиатура передаются в реальном времени",
             text_color="#8fd18f",
             font=ctk.CTkFont(size=12),
         ).pack(side="left", padx=10, pady=6)
         ctk.CTkButton(
-            top, text="⏹ Остановить", width=120, fg_color="#8b2f2f", hover_color="#a53a3a",
+            top, text="Остановить", width=120, fg_color="#8b2f2f", hover_color="#a53a3a",
             command=self._on_close,
         ).pack(side="right", padx=8, pady=4)
 
@@ -2838,7 +4152,7 @@ class ChatWindow(ctk.CTkToplevel):
         gap = now - getattr(self, "_wd_last_tick", now)
         self._wd_last_tick = now
         if gap > 15:
-            self.log("💤 Похоже, компьютер был в спящем режиме — переподключаюсь...")
+            self.log("Похоже, компьютер был в спящем режиме — переподключаюсь...")
             self._handle_resume_from_sleep()
         if self.running and self.winfo_exists():
             self.after(4000, self._sleep_watchdog_tick)
@@ -2854,7 +4168,7 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
             self.client_socket = None
         self.connected = False
-        self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
+        self.safe_update_widget(self.status_label, text="Ждём", text_color="#d3453f")
         self._reconnect_attempts = 0
 
         def _delayed_retry():
@@ -2877,7 +4191,7 @@ class ChatWindow(ctk.CTkToplevel):
         if self.username == self._desired_username:
             return
         self._reclaim_attempts += 1
-        self.log(f"🔁 Пробую вернуть исходный ник «{self._desired_username}»...")
+        self.log(f"Пробую вернуть исходный ник «{self._desired_username}»...")
         self.username = self._desired_username
         self.reconnect()
 
@@ -2905,7 +4219,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._chat_loading_gif_label = ctk.CTkLabel(inner, text="")
             self._chat_loading_gif_label.pack()
             self._chat_loading_status_label = ctk.CTkLabel(
-                inner, text="⏳ Подключение к чату...",
+                inner, text="Подключение к чату...",
                 font=ctk.CTkFont(size=15, weight="bold"),
                 text_color="#a8a4bd")
             self._chat_loading_status_label.pack(pady=(12, 0))
@@ -2913,13 +4227,13 @@ class ChatWindow(ctk.CTkToplevel):
             btn_frame = ctk.CTkFrame(inner, fg_color="transparent")
             btn_frame.pack(pady=(16, 0))
             ctk.CTkButton(
-                btn_frame, text="🔌 Отключиться", width=150, height=36,
+                btn_frame, text="Отключиться", width=150, height=36,
                 font=ctk.CTkFont(size=13),
                 fg_color="#3a3850", hover_color="#d3453f", text_color="#e0ddf0",
                 command=self._overlay_disconnect
             ).pack(side="left", padx=(0, 8))
             ctk.CTkButton(
-                btn_frame, text="🔄 Переподключиться", width=170, height=36,
+                btn_frame, text="Переподключиться", width=170, height=36,
                 font=ctk.CTkFont(size=13),
                 fg_color="#3a3850", hover_color="#5b8ef0", text_color="#e0ddf0",
                 command=self._overlay_reconnect
@@ -2950,7 +4264,7 @@ class ChatWindow(ctk.CTkToplevel):
         try:
             if label.winfo_exists():
                 label.configure(
-                    text=f"❌ {error_text}",
+                    text=f"{error_text}",
                     text_color="#d3453f"
                 )
         except Exception:
@@ -2971,10 +4285,10 @@ class ChatWindow(ctk.CTkToplevel):
         if label:
             try:
                 if label.winfo_exists():
-                    label.configure(text="🔴 Отключено", text_color="#d3453f")
+                    label.configure(text="Отключено", text_color="#d3453f")
             except Exception:
                 pass
-        self.log("🔴 Подключение прервано пользователем")
+        self.log("Ты сам отключился")
 
     def _overlay_reconnect(self):
         """Кнопка 'Переподключиться' в оверлее загрузки."""
@@ -2985,10 +4299,10 @@ class ChatWindow(ctk.CTkToplevel):
         if label:
             try:
                 if label.winfo_exists():
-                    label.configure(text="⏳ Подключение к чату...", text_color="#a8a4bd")
+                    label.configure(text="Подключение к чату...", text_color="#a8a4bd")
             except Exception:
                 pass
-        self.log("🔄 Ручное переподключение...")
+        self.log("Переподключаюсь вручную...")
         threading.Thread(target=self.run_relay, daemon=True).start()
 
     def _load_chat_loading_gif(self):
@@ -3044,7 +4358,7 @@ class ChatWindow(ctk.CTkToplevel):
     def _start_connection(self, run_diagnostics=True):
         first_time = not getattr(self.master, "_chat_init_log_shown", False)
         if first_time:
-            self.log(f"🔍 Инициализация чата в режиме: {self.mode} (комната «{self.room}»)")
+            self.log(f"Запускаю чат, режим: {self.mode} (комната «{self.room}»)")
             if run_diagnostics:
                 threading.Thread(target=self.run_diagnostics, daemon=True).start()
         threading.Thread(target=self.run_relay, daemon=True).start()
@@ -3068,19 +4382,20 @@ class ChatWindow(ctk.CTkToplevel):
 
     def run_diagnostics(self):
         self.log("━" * 50)
-        self.log("🔧 ДИАГНОСТИКА СЕТИ:")
+        self.log("Что с сетью:")
         try:
             socket.gethostbyname('google.com')
-            self.log("✅ Интернет соединение: Есть")
+            self.log("Интернет соединение: Есть")
         except:
-            self.log("❌ Интернет соединение: Нет")
-        self.log(f"🌐 Релей: {self.relay_url}")
-        self.log(f"🚪 Комната: {self.room}")
+            self.log("Интернет соединение: Нет")
+        self.log(f"Релей: {self.relay_url}")
+        self.log(f"Комната: {self.room}")
         self.log("━" * 50)
 
     def restore_chat_only(self, event=None):
         self.deiconify()
         self.lift()
+        _reapply_cursor_after_show(self)
         try:
 
             self.attributes("-topmost", True)
@@ -3112,6 +4427,7 @@ class ChatWindow(ctk.CTkToplevel):
     def on_restore(self, event):
         if event.widget is not self:
             return
+        _apply_cursor_to_window(self)
         self.is_minimized = False
         self.unread_count = 0
         self.update_title()
@@ -3243,7 +4559,7 @@ class ChatWindow(ctk.CTkToplevel):
                 "unread": False,
             })
             save_launcher_settings(settings)
-            self.log(f"➕ «{suggested_name}» автоматически добавлен(а) в «Чаты» — писать можно в любое время")
+            self.log(f"«{suggested_name}» автоматически добавлен(а) в «Чаты» — писать можно в любое время")
 
             try:
                 if not hasattr(self.master, "active_chat_windows"):
@@ -3302,7 +4618,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.personal_contact = new_contact
         self.muted = bool(new_contact.get("muted", False))
         try:
-            self.mute_btn.configure(text="🔕 Без звука" if self.muted else "🔔 Уведомления")
+            self.mute_btn.configure(text="Без звука" if self.muted else "🔔 Уведомления")
         except Exception:
             pass
 
@@ -3346,11 +4662,11 @@ class ChatWindow(ctk.CTkToplevel):
 
         try:
             if hasattr(self, "connection_info_label"):
-                self.connection_info_label.configure(text=f"🔗 Комната: {self.room}")
+                self.connection_info_label.configure(text=f"Комната: {self.room}")
         except Exception:
             pass
         try:
-            self.status_label.configure(text="🔴 Ожидание", text_color="#d3453f")
+            self.status_label.configure(text="Ждём", text_color="#d3453f")
         except Exception:
             pass
 
@@ -3574,7 +4890,7 @@ class ChatWindow(ctk.CTkToplevel):
 
     def open_chat_settings(self):
         dialog = ctk.CTkToplevel(self)
-        dialog.title("⚙️ Настройки чата")
+        dialog.title("Настройки чата")
         dialog.geometry("420x360")
         dialog.resizable(False, False)
         dialog.transient(self)
@@ -3590,7 +4906,7 @@ class ChatWindow(ctk.CTkToplevel):
         main = ctk.CTkFrame(dialog, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(main, text="⚙️ Настройки уведомлений чата",
+        ctk.CTkLabel(main, text="Настройки уведомлений чата",
                      font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 15))
 
         notif_switch_var = ctk.BooleanVar(value=self.notifications_enabled)
@@ -3611,7 +4927,7 @@ class ChatWindow(ctk.CTkToplevel):
 
         size_header = ctk.CTkFrame(main, fg_color="transparent")
         size_header.pack(fill="x")
-        ctk.CTkLabel(size_header, text="📏 Размер уведомлений",
+        ctk.CTkLabel(size_header, text="Размер уведомлений",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
         size_value_label = ctk.CTkLabel(size_header, text=f"{self.notification_size}%",
                                         font=ctk.CTkFont(size=13, weight="bold"), text_color="#6d92ff")
@@ -3641,7 +4957,7 @@ class ChatWindow(ctk.CTkToplevel):
 
         size_slider.bind("<ButtonRelease-1>", on_slider_release)
 
-        preview_btn = make_sound_button(main, text="👁️ Показать пример уведомления",
+        preview_btn = make_sound_button(main, text="Показать пример уведомления",
                                         command=lambda: self.show_notification(
                                             "Вот так будут выглядеть уведомления в чате",
                                             "Тест", title="🔔 Пример уведомления", force=True),
@@ -3654,7 +4970,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._save_chat_settings()
             dialog.destroy()
 
-        close_btn = make_sound_button(main, text="✅ Готово", command=close_dialog,
+        close_btn = make_sound_button(main, text="Готово", command=close_dialog,
                                       fg_color="#6fce7f", hover_color="#5cb56c",
                                       text_color="#16141f", height=40,
                                       font=ctk.CTkFont(size=13, weight="bold"))
@@ -3667,10 +4983,10 @@ class ChatWindow(ctk.CTkToplevel):
             self.clipboard_clear()
             self.clipboard_append(ip)
             play_click()
-            self._mb.showinfo("Скопировано", f"Скопировано в буфер обмена:\n{ip}")
+            self._mb.showinfo("Скопировано", f"Скопировал:\n{ip}")
         except:
             play_error()
-            self._mb.showerror("Ошибка", "Не скопировалось")
+            self._mb.showerror("Не вышло", "Не скопировалось")
 
     def open_emoji_picker(self):
         EmojiPicker(self, self.insert_emoji)
@@ -3721,7 +5037,7 @@ class ChatWindow(ctk.CTkToplevel):
         right_header = ctk.CTkFrame(header_frame, fg_color="transparent")
         right_header.pack(side="right")
 
-        self.status_label = ctk.CTkLabel(right_header, text="🔴 Ожидание",
+        self.status_label = ctk.CTkLabel(right_header, text="Ждём",
                                          font=ctk.CTkFont(size=14, weight="bold"),
                                          text_color="#d3453f")
         self.status_label.pack(side="left")
@@ -3786,12 +5102,12 @@ class ChatWindow(ctk.CTkToplevel):
 
             self._chat_menu = tk.Menu(self, tearoff=0, bg="#201d30", fg="#e5e2f0",
                                       activebackground="#6d92ff", activeforeground="#16141f", bd=0)
-            self._chat_menu.add_command(label="📋 Скопировать выделенное", command=self.copy_selection)
-            self._chat_menu.add_command(label="📋 Скопировать весь чат", command=self.copy_all)
-            self._chat_menu.add_command(label="📋 Скопировать последнее сообщение", command=self.copy_last_message)
+            self._chat_menu.add_command(label="Скопировать выделенное", command=self.copy_selection)
+            self._chat_menu.add_command(label="Скопировать весь чат", command=self.copy_all)
+            self._chat_menu.add_command(label="Скопировать последнее сообщение", command=self.copy_last_message)
             self._chat_menu.add_separator()
-            self._chat_menu.add_command(label="🔍 Найти в чате (Ctrl+F)", command=self.open_search)
-            self._chat_menu.add_command(label="📖 Что тут умеет чат", command=self.show_chat_help)
+            self._chat_menu.add_command(label="Найти в чате (Ctrl+F)", command=self.open_search)
+            self._chat_menu.add_command(label="Что тут умеет чат", command=self.show_chat_help)
             self.chat_display._textbox.bind("<Button-3>", self._show_chat_menu)
         except Exception as _e:
 
@@ -3804,7 +5120,7 @@ class ChatWindow(ctk.CTkToplevel):
         info_frame.pack(fill="x", pady=(0, 10))
 
         if self.mode == "server":
-            self.connection_info_label = ctk.CTkLabel(info_frame, text=f"🔗 Комната: {self.room}",
+            self.connection_info_label = ctk.CTkLabel(info_frame, text=f"Комната: {self.room}",
                                                       font=ctk.CTkFont(size=13), text_color="#6d92ff")
             self.connection_info_label.pack(side="left")
             self.connection_status_label = ctk.CTkLabel(info_frame, text=f"👤 Ожидание подключения...",
@@ -3813,7 +5129,7 @@ class ChatWindow(ctk.CTkToplevel):
             self.connection_status_label.bind("<Button-1>", lambda e: self.show_room_members())
             self.connection_status_label.configure(cursor="hand2")
         else:
-            ctk.CTkLabel(info_frame, text=f"🚪 Комната: {self.room}",
+            ctk.CTkLabel(info_frame, text=f"Комната: {self.room}",
                          font=ctk.CTkFont(size=13), text_color="#6d92ff").pack(side="left")
             ctk.CTkLabel(info_frame, text=f"👤 {self.username}",
                          font=ctk.CTkFont(size=13), text_color="#6fce7f").pack(side="right")
@@ -3824,7 +5140,7 @@ class ChatWindow(ctk.CTkToplevel):
         room_text = f"🚪 Код комнаты: {self.room}   |   🌐 Релей: {self.relay_url}"
         ctk.CTkLabel(ip_frame, text=room_text,
                      font=ctk.CTkFont(size=12), text_color="#d9622f").pack(side="left")
-        copy_btn = make_sound_button(ip_frame, text="📋 Копировать код",
+        copy_btn = make_sound_button(ip_frame, text="Копировать код",
                                      command=lambda: self.copy_ip_to_clipboard(self.room),
                                      width=150, height=30,
                                      fg_color="#6d92ff", hover_color="#5a7dd8",
@@ -3845,7 +5161,7 @@ class ChatWindow(ctk.CTkToplevel):
                                       font=ctk.CTkFont(size=16))
         emoji_btn.pack(side="left", padx=2)
 
-        search_btn = make_sound_button(format_frame, text="🔍 Поиск",
+        search_btn = make_sound_button(format_frame, text="Поиск",
                                        command=self.open_search,
                                        width=100, height=30,
                                        fg_color="#4a4666", hover_color="#3d3a52",
@@ -3853,14 +5169,14 @@ class ChatWindow(ctk.CTkToplevel):
         search_btn.pack(side="left", padx=2)
 
         self.mute_btn = make_sound_button(format_frame,
-                                          text="🔕 Без звука" if self.muted else "🔔 Уведомления",
+                                          text="Без звука" if self.muted else "🔔 Уведомления",
                                           command=self.toggle_mute,
                                           width=150, height=30,
                                           fg_color="#4a4666", hover_color="#3d3a52",
                                           font=ctk.CTkFont(size=12))
         self.mute_btn.pack(side="left", padx=2)
 
-        help_btn = make_sound_button(format_frame, text="❓ Команды",
+        help_btn = make_sound_button(format_frame, text="Команды",
                                      command=self.show_chat_help,
                                      width=110, height=30,
                                      fg_color="#4a4666", hover_color="#3d3a52",
@@ -3886,42 +5202,42 @@ class ChatWindow(ctk.CTkToplevel):
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(fill="x", pady=(10, 0))
 
-        clear_btn = make_sound_button(btn_frame, text="🗑️ Очистить чат",
+        clear_btn = make_sound_button(btn_frame, text="Очистить чат",
                                       command=self.clear_chat,
                                       fg_color="#d9622f", hover_color="#c14f26",
                                       text_color="#16141f", height=35,
                                       font=ctk.CTkFont(size=12))
         clear_btn.pack(side="left", padx=(0, 10))
 
-        export_btn = make_sound_button(btn_frame, text="💾 Экспорт",
+        export_btn = make_sound_button(btn_frame, text="Экспорт",
                                        command=self.export_chat,
                                        fg_color="#6d92ff", hover_color="#5a7dd8",
                                        height=35,
                                        font=ctk.CTkFont(size=12))
         export_btn.pack(side="left", padx=(0, 10))
 
-        settings_btn = make_sound_button(btn_frame, text="⚙️ Настройки",
+        settings_btn = make_sound_button(btn_frame, text="Настройки",
                                          command=self.open_chat_settings,
                                          fg_color="#4a4666", hover_color="#3d3a52",
                                          height=35,
                                          font=ctk.CTkFont(size=12))
         settings_btn.pack(side="left", padx=(0, 10))
 
-        reconnect_btn = make_sound_button(btn_frame, text="🔄 Переподключиться",
+        reconnect_btn = make_sound_button(btn_frame, text="Переподключиться",
                                           command=self.reconnect,
                                           fg_color="#6fce7f", hover_color="#5cb56c",
                                           text_color="#16141f", height=35,
                                           font=ctk.CTkFont(size=12))
         reconnect_btn.pack(side="left", padx=(0, 10))
 
-        leave_room_btn = make_sound_button(btn_frame, text="🚪 Выйти из комнаты",
+        leave_room_btn = make_sound_button(btn_frame, text="Выйти из комнаты",
                                            command=self.leave_room,
                                            fg_color="#d9622f", hover_color="#c14f26",
                                            text_color="#16141f", height=35,
                                            font=ctk.CTkFont(size=12))
         leave_room_btn.pack(side="right", padx=(0, 10))
 
-        close_btn = make_sound_button(btn_frame, text="❌ Закрыть чат",
+        close_btn = make_sound_button(btn_frame, text="Закрыть чат",
                                       command=self.on_close,
                                       fg_color="#d3453f", hover_color="#b83530",
                                       height=35,
@@ -3952,7 +5268,7 @@ class ChatWindow(ctk.CTkToplevel):
                 delete_chat_history(self.personal_contact.get("id"))
             if self._search_visible:
                 self._run_search()
-            self.log("🗑️ Чат очищен")
+            self.log("Чат очищен")
 
     def export_chat(self):
         if not self.message_history:
@@ -3976,10 +5292,10 @@ class ChatWindow(ctk.CTkToplevel):
                 for msg in self.message_history:
                     f.write(msg + "\n")
             play_click()
-            self._mb.showinfo("Успешно", f"Сохранил чат сюда:\n{file_path}")
+            self._mb.showinfo("Готово", f"Сохранил чат сюда:\n{file_path}")
         except Exception as e:
             play_error()
-            self._mb.showerror("Ошибка", f"Чат не сохранился:\n{e}")
+            self._mb.showerror("Не вышло", f"Чат не сохранился:\n{e}")
 
     def update_msg_count(self):
         if threading.current_thread() is not threading.main_thread():
@@ -4086,10 +5402,10 @@ class ChatWindow(ctk.CTkToplevel):
         first_time = not getattr(self.master, "_chat_init_log_shown", False)
         try:
             if first_time:
-                self.log(f"🌐 Подключаюсь к релею {self.relay_url}...")
-                self.log(f"🚪 Комната: {self.room}, роль: {role_text}")
+                self.log(f"Подключаюсь к релею {self.relay_url}...")
+                self.log(f"Комната: {self.room}, роль: {role_text}")
             else:
-                self.log(f"🌐 Подключаюсь к комнате «{self.room}»...")
+                self.log(f"Подключаюсь к комнате «{self.room}»...")
             self.client_socket = ws_client.create_connection(self.relay_url, timeout=15, sslopt=_ws_sslopt())
             if not self.running:
 
@@ -4110,28 +5426,28 @@ class ChatWindow(ctk.CTkToplevel):
             self.connected = True
             self._reconnect_attempts = 0
             self.after(0, self._hide_chat_loading_overlay)
-            self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
+            self.safe_update_widget(self.status_label, text="Онлайн", text_color="#6fce7f")
             self.safe_update_widget(self.send_btn, state="normal")
             self.participant_count = 1
             self.update_participant_status()
             if first_time:
-                self.log(f"✅ Подключено к релею! Комната: {self.room}")
+                self.log(f"Подключился к релею. Комната: {self.room}")
                 try:
                     self.master._chat_init_log_shown = True
                 except Exception:
                     pass
             else:
-                self.log(f"✅ Подключено (комната «{self.room}»)")
+                self.log(f"Подключился (комната «{self.room}»)")
             self._broadcast_dm_identity()
             threading.Thread(target=self.receive_messages_thread, daemon=True).start()
         except Exception as e:
-            self.log(f"❌ Не удалось подключиться к релею: {e}")
-            self.log("💡 ПРОВЕРЬТЕ:")
+            self.log(f"Не получилось подключиться к релею: {e}")
+            self.log("Проверь:")
             self.log("  1. Есть интернет?")
             self.log("  2. Релей-сервер сейчас работает (не уснул на бесплатном хостинге)?")
             self.log("  3. Код комнаты совпадает у обоих игроков?")
             self.connected = False
-            self.safe_update_widget(self.status_label, text="🔴 Ожидание", text_color="#d3453f")
+            self.safe_update_widget(self.status_label, text="Ждём", text_color="#d3453f")
             # Показываем текст ошибки в оверлее загрузки
             err_short = str(e)
             if len(err_short) > 80:
@@ -4144,7 +5460,7 @@ class ChatWindow(ctk.CTkToplevel):
             return
         self._reconnect_attempts = getattr(self, "_reconnect_attempts", 0) + 1
         delay = min(4 * self._reconnect_attempts + 2, 25)
-        self.log(f"🔄 Повторная попытка через {delay} сек... (попытка {self._reconnect_attempts})")
+        self.log(f"Пробую снова через {delay} сек... (попытка {self._reconnect_attempts})")
 
         def _retry():
             if not self.running or not self.winfo_exists() or self.connected:
@@ -4154,7 +5470,7 @@ class ChatWindow(ctk.CTkToplevel):
             if label:
                 try:
                     if label.winfo_exists():
-                        label.configure(text="⏳ Подключение к чату...", text_color="#a8a4bd")
+                        label.configure(text="Подключение к чату...", text_color="#a8a4bd")
                 except Exception:
                     pass
             threading.Thread(target=self.run_relay, daemon=True).start()
@@ -4165,7 +5481,7 @@ class ChatWindow(ctk.CTkToplevel):
         self._reconnect_attempts = 0
         if self.connected:
             self.disconnect()
-        self.log("🔄 Попытка переподключения...")
+        self.log("Пробую переподключиться...")
 
         threading.Thread(target=self.run_relay, daemon=True).start()
 
@@ -4177,7 +5493,7 @@ class ChatWindow(ctk.CTkToplevel):
                 try:
                     message = self.client_socket.recv()
                     if not message:
-                        self.log("⚠️ Соединение с релеем закрыто")
+                        self.log("Соединение с релеем закрыто")
                         self.after(0, self.disconnect)
                         break
                     if isinstance(message, bytes):
@@ -4190,7 +5506,7 @@ class ChatWindow(ctk.CTkToplevel):
                             _, username, b64_data = message.split(":", 2)
                             self.receive_skin_file(username, b64_data)
                         except Exception as e:
-                            self.log(f"❌ Битые данные скина: {e}")
+                            self.log(f"Битые данные скина: {e}")
                     elif message.startswith("{"):
                         self.handle_control_message(message)
                     else:
@@ -4199,12 +5515,12 @@ class ChatWindow(ctk.CTkToplevel):
                     continue
                 except ws_client.WebSocketConnectionClosedException:
                     if self.running:
-                        self.log("⚠️ Соединение с релеем разорвано")
+                        self.log("Соединение с релеем разорвано")
                         self.after(0, self.disconnect)
                     break
             except Exception as e:
                 if self.running:
-                    self.log(f"❌ Ошибка в потоке: {e}")
+                    self.log(f"Сломался поток: {e}")
                     self.after(0, self.disconnect)
                 break
             time.sleep(0.01)
@@ -4230,7 +5546,7 @@ class ChatWindow(ctk.CTkToplevel):
                 self.log(f"💬 {message}")
 
                 if self._mentions_me(text):
-                    self.show_notification(text, sender, title="📣 Тебя позвали")
+                    self.show_notification(text, sender, title="Тебя позвали")
                 else:
                     self.show_notification(text, sender)
                 self._update_personal_preview(text, mine=False)
@@ -4238,9 +5554,9 @@ class ChatWindow(ctk.CTkToplevel):
                 self.log(f"🔔 {message}")
                 body = message.lstrip("👤 ").strip()
                 if "присоединился" in message:
-                    self.show_notification(body, title="🟢 Участник присоединился")
+                    self.show_notification(body, title="Участник присоединился")
                 elif "покинул" in message:
-                    self.show_notification(body, title="🔴 Участник покинул чат")
+                    self.show_notification(body, title="Участник покинул чат")
         except:
             pass
 
@@ -4271,7 +5587,7 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
 
         popup = ctk.CTkToplevel(self)
-        popup.title("👥 Участники комнаты")
+        popup.title("Участники комнаты")
         popup.geometry("340x420")
         popup.resizable(False, False)
         popup.transient(self)
@@ -4286,7 +5602,7 @@ class ChatWindow(ctk.CTkToplevel):
         main = ctk.CTkFrame(popup, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        ctk.CTkLabel(main, text=f"👥 Комната «{self.room}»",
+        ctk.CTkLabel(main, text=f"Комната «{self.room}»",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(0, 4))
 
         self._members_count_label = ctk.CTkLabel(
@@ -4296,7 +5612,7 @@ class ChatWindow(ctk.CTkToplevel):
         self._members_scroll = ctk.CTkScrollableFrame(main, fg_color="#100e1a", corner_radius=10)
         self._members_scroll.pack(fill="both", expand=True)
 
-        close_btn = make_sound_button(main, text="✅ Закрыть", command=popup.destroy,
+        close_btn = make_sound_button(main, text="Закрыть", command=popup.destroy,
                                       fg_color="#6fce7f", hover_color="#5cb56c",
                                       text_color="#16141f", height=36,
                                       font=ctk.CTkFont(size=13, weight="bold"))
@@ -4516,7 +5832,7 @@ class ChatWindow(ctk.CTkToplevel):
             return
         if username in self._muted_members:
             self._muted_members.discard(username)
-            self.log(f"🔊 «{username}» разглушён")
+            self.log(f"«{username}» разглушён")
             self.send_message_raw(f"👤 {username} был(а) разглушён(а) создателем комнаты")
             try:
                 self._socket_send(json.dumps({
@@ -4528,7 +5844,7 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
         else:
             self._muted_members.add(username)
-            self.log(f"🔇 «{username}» заглушён")
+            self.log(f"«{username}» заглушён")
             self.send_message_raw(f"👤 {username} был(а) заглушён(а) создателем комнаты")
             try:
                 self._socket_send(json.dumps({
@@ -4554,9 +5870,9 @@ class ChatWindow(ctk.CTkToplevel):
                 "by": self.username,
             }))
         except Exception as e:
-            self.log(f"❌ Не удалось отправить команду исключения: {e}")
+            self.log(f"Не получилось отправить команду исключения: {e}")
             return
-        self.log(f"🚫 Исключил(а) «{username}» из комнаты")
+        self.log(f"Выгнал(а) «{username}» из комнаты")
         self.send_message_raw(f"👤 {username} был(а) исключён(а) из комнаты создателем")
         self._muted_members.discard(username)
         self.after(400, self._refresh_members_popup)
@@ -4574,16 +5890,16 @@ class ChatWindow(ctk.CTkToplevel):
                 "by": self.username,
             }))
         except Exception as e:
-            self.log(f"❌ Не удалось передать права администратора: {e}")
+            self.log(f"Не получилось передать права администратора: {e}")
             return
         self.role = "viewer"
         self.mode = "client"
         if hasattr(self, "_mode_label"):
             try:
-                self._mode_label.configure(text=f"💻 Гость - {self.username}", text_color="#6d92ff")
+                self._mode_label.configure(text=f"Гость - {self.username}", text_color="#6d92ff")
             except Exception:
                 pass
-        self.log(f"👑 Права создателя комнаты переданы «{username}»")
+        self.log(f"Права создателя передали «{username}»")
         self.send_message_raw(f"👑 {username} теперь создатель (админ) комнаты")
         self._refresh_members_popup()
 
@@ -4592,13 +5908,13 @@ class ChatWindow(ctk.CTkToplevel):
             self.after(0, lambda: self._handle_kicked(by_username))
             return
         by_text = f" (создатель: {by_username})" if by_username else ""
-        self.log(f"🚫 Вас исключили из комнаты «{self.room}»{by_text}")
+        self.log(f"Тебя выгнали из комнаты «{self.room}»{by_text}")
         self.running = False
         self.disconnect()
         try:
             self._mb.showinfo(
-                "Исключили из комнаты",
-                f"Создатель комнаты исключил вас из «{self.room}»."
+                "Тебя выгнали",
+                f"Создатель комнаты выгнал тебя из «{self.room}»."
             )
         except Exception:
             pass
@@ -4612,15 +5928,15 @@ class ChatWindow(ctk.CTkToplevel):
         self.mode = "server"
         if hasattr(self, "_mode_label"):
             try:
-                self._mode_label.configure(text=f"🖥️ Хост комнаты - {self.username}", text_color="#6fce7f")
+                self._mode_label.configure(text=f"Хост комнаты - {self.username}", text_color="#6fce7f")
             except Exception:
                 pass
         by_text = f" от «{by_username}»" if by_username else ""
-        self.log(f"👑 Вам переданы права создателя комнаты{by_text}")
+        self.log(f"Тебе передали права создателя комнаты{by_text}")
         try:
             self._mb.showinfo(
                 "Права переданы",
-                f"Теперь вы — создатель (админ) комнаты «{self.room}»."
+                f"Теперь ты создатель (админ) комнаты «{self.room}»."
             )
         except Exception:
             pass
@@ -4654,7 +5970,7 @@ class ChatWindow(ctk.CTkToplevel):
         msg_type = data.get("type")
         if msg_type == "error" and data.get("reason") == "room_full":
             max_size = data.get("max", self.max_room_size)
-            self.log(f"❌ Комната «{self.room}» заполнена ({max_size}/{max_size})")
+            self.log(f"Комната «{self.room}» заполнена ({max_size}/{max_size})")
             self.connected = False
             self.after(0, lambda: self._mb.showerror(
                 "Комната заполнена",
@@ -4665,7 +5981,7 @@ class ChatWindow(ctk.CTkToplevel):
             new_username = data.get("username")
             if new_username:
                 if new_username != self._desired_username and new_username != self.username:
-                    self.log(f"ℹ️ Ник «{self._desired_username}» уже занят в комнате — вам присвоен ник «{new_username}»")
+                    self.log(f"Ник «{self._desired_username}» уже занят в комнате, так что теперь ты «{new_username}»")
                     self.username = new_username
                     self.after(0, lambda: self._mb.showinfo(
                         "Ник изменён",
@@ -4675,7 +5991,7 @@ class ChatWindow(ctk.CTkToplevel):
                     self._schedule_username_reclaim()
                 else:
                     if new_username == self._desired_username and self._reclaim_attempts > 0:
-                        self.log(f"✅ Исходный ник «{self._desired_username}» снова свободен и закреплён за вами")
+                        self.log(f"Исходный ник «{self._desired_username}» снова свободен и закреплён за тобой")
                         self._reclaim_attempts = 0
                     self.username = new_username
                 self.send_message_raw(f"👤 {self.username} присоединился к комнате!")
@@ -4744,18 +6060,18 @@ class ChatWindow(ctk.CTkToplevel):
             if data.get("target") != self.username:
                 return
             by = data.get("by", "")
-            self.log(f"🔇 Вы были заглушены создателем комнаты{(' — ' + by) if by else ''}")
+            self.log(f"Создатель комнаты тебя заглушил{(' — ' + by) if by else ''}")
             self.after(0, lambda by_=by: self._mb.showinfo(
                 "Заглушён",
-                f"Создатель комнаты «{self.room}» заглушил вас.\nВаши сообщения не будут видны другим."
+                f"Создатель комнаты «{self.room}» заглушил тебя.\nТвои сообщения другие не увидят."
             ))
         elif msg_type == "unmute_user":
             if data.get("target") != self.username:
                 return
             by = data.get("by", "")
-            self.log(f"🔊 Вы были разглушены создателем комнаты{(' — ' + by) if by else ''}")
+            self.log(f"Создатель комнаты снова разрешил тебе писать{(' — ' + by) if by else ''}")
         else:
-            self.log(f"ℹ️ Служебное сообщение от релея: {message}")
+            self.log(f"Служебное сообщение от релея: {message}")
 
     def send_message(self):
         message = self.message_entry.get().strip()
@@ -4772,7 +6088,7 @@ class ChatWindow(ctk.CTkToplevel):
             return
 
         if not self.connected or self.client_socket is None:
-            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            self.log("Связи с чатом пока нет — подожди, пока подключится")
             return
 
         if message.startswith("&&download-all-file-start="):
@@ -4839,7 +6155,7 @@ class ChatWindow(ctk.CTkToplevel):
 
     def _send_line(self, full_message):
         if not self.connected or self.client_socket is None:
-            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            self.log("Связи с чатом пока нет — подожди, пока подключится")
             return False
         self.send_message_raw(full_message)
         return True
@@ -4857,7 +6173,7 @@ class ChatWindow(ctk.CTkToplevel):
 
         if action is None:
             play_error()
-            self.log(f"⚠️ Команды /{name} у меня нет. Всё, что умею, — в /help. "
+            self.log(f"Команды /{name} у меня нет. Всё, что умею, — в /help. "
                      f"А если хотел просто написать текст со «/» в начале — поставь «//».")
             return True
 
@@ -4867,7 +6183,7 @@ class ChatWindow(ctk.CTkToplevel):
             spec = parse_roll_spec(arg)
             if spec is None:
                 self.log(
-                    "⚠️ Не понял, что кидать. Попробуй /roll, /roll 20 или /roll 2d6 (кубиков до 20, граней до 1000)")
+                    "Не понял, что кидать. Попробуй /roll, /roll 20 или /roll 2d6 (кубиков до 20, граней до 1000)")
                 return True
             count, sides = spec
             rolls, total = roll_dice(count, sides)
@@ -4881,12 +6197,12 @@ class ChatWindow(ctk.CTkToplevel):
             sep = "|" if "|" in arg else ","
             options = [o.strip() for o in arg.split(sep) if o.strip()][:20]
             if len(options) < 2:
-                self.log("⚠️ Из чего выбирать-то? Дай хотя бы два варианта: /choose пицца | суши")
+                self.log("Из чего выбирать-то? Дай хотя бы два варианта: /choose пицца | суши")
                 return True
             self._send_as_user(f"🎯 выбрал: {random.choice(options)} (из: {', '.join(options)})")
         elif action == "me":
             if not arg:
-                self.log("⚠️ А что сделал-то? Например: /me пошёл за едой")
+                self.log("А что сделал-то? Например: /me пошёл за едой")
                 return True
             self._send_line(f"* {self.username} {arg}")
         elif action == "shrug":
@@ -4899,7 +6215,7 @@ class ChatWindow(ctk.CTkToplevel):
             result = convert_coords(arg)
             if result is None:
                 self.log(
-                    "⚠️ С координатами что-то не так. Пример: /coords 100 64 -200 (в конце можно дописать «незер» или «энд»)")
+                    "С координатами что-то не так. Пример: /coords 100 64 -200 (в конце можно дописать «незер» или «энд»)")
                 return True
             self._send_as_user(result)
         elif action == "search":
@@ -4958,18 +6274,18 @@ class ChatWindow(ctk.CTkToplevel):
     def request_screen_share(self, target_username):
         target_username = (target_username or "").strip()
         if not target_username:
-            self.log("⚠️ Укажи ник: &&screen-share-Ник")
+            self.log("Укажи ник: &&screen-share-Ник")
             return
         if not self.connected or self.client_socket is None:
-            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            self.log("Связи с чатом пока нет — подожди, пока подключится")
             return
         if target_username == self.username:
             play_error()
-            self.log("⚠️ Нельзя запросить трансляцию у самого себя")
+            self.log("Нельзя запросить трансляцию у самого себя")
             return
         if self._screen_share.get("state"):
             play_error()
-            self.log("⚠️ Уже есть активный запрос/сессия трансляции — сначала останови её (&&screen-share-stop)")
+            self.log("Уже есть активный запрос/сессия трансляции — сначала останови её (&&screen-share-stop)")
             return
         if not self._screen_share_libs_ok():
             return
@@ -4984,7 +6300,7 @@ class ChatWindow(ctk.CTkToplevel):
                 "to": target_username,
             }))
         except Exception as e:
-            self.log(f"❌ Не удалось отправить запрос: {e}")
+            self.log(f"Не получилось отправить запрос: {e}")
             self._screen_share = {}
             return
 
@@ -4996,7 +6312,7 @@ class ChatWindow(ctk.CTkToplevel):
     def _screen_share_request_timeout(self, request_id):
         if self._screen_share.get("id") == request_id and self._screen_share.get("state") == "pending_out":
             peer = self._screen_share.get("peer")
-            self.log(f"⌛ «{peer}» не ответил(а) на запрос трансляции вовремя — запрос отменён")
+            self.log(f"«{peer}» не ответил(а) на запрос трансляции вовремя — запрос отменён")
             self._screen_share = {}
 
     def prompt_screen_share_request(self, requester, request_id):
@@ -5014,12 +6330,12 @@ class ChatWindow(ctk.CTkToplevel):
             pass
 
         accepted = self._mb.askyesno(
-            "🖥️ Запрос на трансляцию экрана",
+            "Запрос на трансляцию экрана",
             f"Игрок «{requester}» просит разрешение посмотреть твой экран "
             f"и управлять мышью и клавиатурой.\n\n"
-            f"⚠️ Пока трансляция включена, «{requester}» сможет кликать и печатать "
+            f"Пока трансляция включена, «{requester}» сможет кликать и печатать "
             f"на твоём компьютере так, будто сидит за ним.\n"
-            f"Остановить можно в любой момент — кнопкой «⏹ Стоп» на плашке или "
+            f"Остановить можно в любой момент — кнопкой «Стоп» на плашке или "
             f"командой &&screen-share-stop.\n\n"
             f"Разрешить «{requester}» доступ к экрану и управлению?"
         )
@@ -5028,7 +6344,7 @@ class ChatWindow(ctk.CTkToplevel):
             self._start_screen_share_host(requester, request_id)
         else:
             play_error()
-            self.log(f"🚫 Отклонил(а) запрос «{requester}» на трансляцию экрана")
+            self.log(f"Отклонил(а) запрос «{requester}» на трансляцию экрана")
 
     def _send_screen_share_response(self, requester, request_id, accepted, reason=None):
         if not self.client_socket or not self.connected:
@@ -5045,7 +6361,7 @@ class ChatWindow(ctk.CTkToplevel):
         try:
             self._socket_send(json.dumps(payload))
         except Exception as e:
-            self.log(f"❌ Не удалось ответить на запрос трансляции: {e}")
+            self.log(f"Не получилось ответить на запрос трансляции: {e}")
 
     def _on_screen_share_response(self, data):
         session = self._screen_share
@@ -5055,18 +6371,18 @@ class ChatWindow(ctk.CTkToplevel):
         if data.get("accepted"):
             self._screen_share = {"role": "viewer", "peer": peer, "id": data.get("request_id"), "state": "active"}
             play_click()
-            self.log(f"✅ «{peer}» разрешил(а) — открываю трансляцию его(её) экрана")
+            self.log(f"«{peer}» разрешил(а) — открываю трансляцию его(её) экрана")
             self._remote_screen_window = RemoteScreenWindow(self, peer, data.get("request_id"))
         else:
             reason = data.get("reason")
             self._screen_share = {}
             play_error()
             if reason == "busy":
-                self.log(f"🚫 «{peer}» сейчас занят(а) другой трансляцией")
+                self.log(f"«{peer}» сейчас занят(а) другой трансляцией")
             elif reason == "missing_libs":
-                self.log(f"🚫 У «{peer}» не установлены нужные библиотеки для трансляции")
+                self.log(f"У «{peer}» не установлены нужные библиотеки для трансляции")
             else:
-                self.log(f"🚫 «{peer}» отклонил(а) запрос на трансляцию экрана")
+                self.log(f"«{peer}» отклонил(а) запрос на трансляцию экрана")
 
     def _start_screen_share_host(self, viewer_username, request_id):
         self._screen_share = {"role": "host", "peer": viewer_username, "id": request_id, "state": "active"}
@@ -5074,7 +6390,7 @@ class ChatWindow(ctk.CTkToplevel):
 
         self._screen_frame_queue = _queue_module.Queue(maxsize=2)
         self._screen_share_banner = None
-        self.log(f"📺 Начал(а) трансляцию своего экрана для «{viewer_username}» (остановить: &&screen-share-stop)")
+        self.log(f"Начал(а) трансляцию своего экрана для «{viewer_username}» (остановить: &&screen-share-stop)")
 
         threading.Thread(target=self._screen_capture_loop, args=(viewer_username, request_id), daemon=True).start()
         threading.Thread(target=self._screen_frame_sender_loop, args=(viewer_username, request_id), daemon=True).start()
@@ -5112,7 +6428,7 @@ class ChatWindow(ctk.CTkToplevel):
                 consecutive_send_errors += 1
                 if consecutive_send_errors >= 6:
                     self.after(0, lambda: self.log(
-                        "⏹ Отправка кадров зависла — трансляцию остановил(а) автоматически"
+                        "Отправка кадров зависла — трансляцию остановил(а) автоматически"
                     ))
                     self._screen_share_streaming = False
                     self.after(0, lambda: self.stop_screen_share(notify=True))
@@ -5169,10 +6485,10 @@ class ChatWindow(ctk.CTkToplevel):
                         consecutive_errors += 1
                         now = time.time()
                         if now - last_error_log > 5:
-                            self.log(f"⚠️ Ошибка захвата экрана: {e}")
+                            self.log(f"Не вышло захватить экран: {e}")
                             last_error_log = now
                         if consecutive_errors >= SCREEN_SHARE_MAX_CONSECUTIVE_ERRORS:
-                            self.log("⏹ Слишком много ошибок подряд — трансляцию остановил(а) автоматически")
+                            self.log("Слишком много ошибок подряд — трансляцию остановил(а) автоматически")
                             break
 
                     elapsed = time.time() - frame_start
@@ -5180,7 +6496,7 @@ class ChatWindow(ctk.CTkToplevel):
                     if sleep_left > 0:
                         time.sleep(sleep_left)
         except Exception as e:
-            self.after(0, lambda: self.log(f"❌ Трансляция экрана прервана: {e}"))
+            self.after(0, lambda: self.log(f"Трансляция экрана прервана: {e}"))
         finally:
 
             if self._screen_share.get("id") == request_id and self._screen_share.get("role") == "host":
@@ -5246,7 +6562,7 @@ class ChatWindow(ctk.CTkToplevel):
         session = self._screen_share
         if not session.get("state") or session.get("peer") != peer:
             return
-        self.log(f"⏹ «{peer}» завершил(а) трансляцию экрана")
+        self.log(f"«{peer}» завершил(а) трансляцию экрана")
         self.stop_screen_share(notify=False)
 
     def send_remote_input(self, target_username, request_id, extra):
@@ -5267,7 +6583,7 @@ class ChatWindow(ctk.CTkToplevel):
     def stop_screen_share(self, notify=True):
         session = self._screen_share
         if not session.get("state"):
-            self.log("ℹ️ Сейчас нет активной трансляции экрана")
+            self.log("Сейчас нет активной трансляции экрана")
             return
 
         peer = session.get("peer")
@@ -5304,7 +6620,7 @@ class ChatWindow(ctk.CTkToplevel):
                 pass
 
         play_click()
-        self.log(f"⏹ Трансляция экрана с «{peer}» остановлена" if peer else "⏹ Трансляция остановлена")
+        self.log(f"Трансляция экрана с «{peer}» остановлена" if peer else "Трансляция остановлена")
 
     def _append_plain_lines(self, lines):
         try:
@@ -5375,10 +6691,10 @@ class ChatWindow(ctk.CTkToplevel):
             except Exception:
                 pass
         try:
-            self.mute_btn.configure(text="🔕 Без звука" if self.muted else "🔔 Уведомления")
+            self.mute_btn.configure(text="Без звука" if self.muted else "🔔 Уведомления")
         except Exception:
             pass
-        self.log("🔕 Всё, этот чат теперь молчит" if self.muted
+        self.log("Всё, этот чат теперь молчит" if self.muted
                  else "🔔 Ок, уведомления снова включены")
 
     def _bind_chat_links(self):
@@ -5425,7 +6741,7 @@ class ChatWindow(ctk.CTkToplevel):
         if not url.lower().startswith(("http://", "https://")):
             return
         if self._mb.askyesno(
-                "🔗 Открыть ссылку?",
+                "Открыть ссылку?",
                 f"Открыть эту ссылку в браузере?\n\n{url}\n\n"
                 f"Что там внутри, я не проверяю — так что смотри сам."
         ):
@@ -5539,10 +6855,10 @@ class ChatWindow(ctk.CTkToplevel):
             self.clipboard_clear()
             self.clipboard_append(value)
             play_click()
-            self.log(f"📋 Готово, скопировал: {what}")
+            self.log(f"Готово, скопировал: {what}")
         except Exception as e:
             play_error()
-            self.log(f"❌ Не получилось скопировать: {e}")
+            self.log(f"Не получилось скопировать: {e}")
 
     def copy_selection(self):
         try:
@@ -5550,7 +6866,7 @@ class ChatWindow(ctk.CTkToplevel):
         except tk.TclError:
             value = ""
         if not value.strip():
-            self.log("ℹ️ Сначала выдели что-нибудь в чате")
+            self.log("Сначала выдели что-нибудь в чате")
             return
         self._copy_to_clipboard(value, "выделенное")
 
@@ -5561,21 +6877,21 @@ class ChatWindow(ctk.CTkToplevel):
 
     def copy_last_message(self):
         if not self.message_history:
-            self.log("ℹ️ Пока и копировать нечего — сообщений нет")
+            self.log("Пока и копировать нечего — сообщений нет")
             return
         last = self.message_history[-1]
         self._copy_to_clipboard(last.split(": ", 1)[1] if ": " in last else last, "последнее сообщение")
 
     def offer_file_to_room(self, url, auto_launch=False):
         if not self.connected or self.client_socket is None:
-            self.log("⚠️ Связи с чатом пока нет — подожди, пока подключится")
+            self.log("Связи с чатом пока нет — подожди, пока подключится")
             return
 
         if not (url.startswith("http://") or url.startswith("https://")):
             play_error()
             self._mb.showwarning(
-                "Некорректная ссылка",
-                "Ссылка на файл должна начинаться с http:// или https://"
+                "Ссылка кривая",
+                "Ссылка должна начинаться с http:// или https://"
             )
             return
 
@@ -5589,7 +6905,7 @@ class ChatWindow(ctk.CTkToplevel):
         )
 
         if not self._mb.askyesno(
-                "📎 Поделиться файлом",
+                "Поделиться файлом",
                 f"Предложить всем в комнате «{self.room}» скачать файл?\n\n"
                 f"Имя: {filename}\n"
                 f"Ссылка: {url}"
@@ -5613,11 +6929,11 @@ class ChatWindow(ctk.CTkToplevel):
             self._update_personal_preview(f"📎 Файл: {filename}", mine=True)
             play_click()
         except Exception as e:
-            self.log(f"❌ Не удалось отправить предложение файла: {e}")
+            self.log(f"Не получилось отправить предложение файла: {e}")
             self.disconnect()
 
     def prompt_file_offer(self, sender, url, filename, auto_launch=False):
-        self.log(f"📥 «{sender}» хочет поделиться файлом «{filename}»"
+        self.log(f"«{sender}» хочет поделиться файлом «{filename}»"
                  + (" (с запуском после скачивания)" if auto_launch else ""))
         self.show_notification(f"«{sender}» хочет поделиться файлом «{filename}»", "📎 Файл от игрока")
         self._update_personal_preview(f"📎 Файл: {filename}", mine=False)
@@ -5638,7 +6954,7 @@ class ChatWindow(ctk.CTkToplevel):
         )
 
         accept = self._mb.askyesno(
-            "📎 Игрок хочет поделиться файлом",
+            "Игрок хочет поделиться файлом",
             f"Игрок «{sender}» хочет поделиться файлом:\n\n"
             f"Имя: {filename}\n"
             f"Ссылка: {url}\n\n"
@@ -5646,11 +6962,11 @@ class ChatWindow(ctk.CTkToplevel):
             f"{warn}{launch_notice}"
         )
         if not accept:
-            self.log(f"🚫 Отклонил файл «{filename}» от «{sender}»")
+            self.log(f"Отклонил файл «{filename}» от «{sender}»")
             return
 
         play_click()
-        self.log(f"⏳ Скачиваю «{filename}» от «{sender}»...")
+        self.log(f"Скачиваю «{filename}» от «{sender}»...")
         threading.Thread(
             target=self._download_offered_file,
             args=(sender, url, filename),
@@ -5660,10 +6976,10 @@ class ChatWindow(ctk.CTkToplevel):
 
     def _prompt_launch_file(self, dest_path, filename):
         if self._mb.askyesno(
-                "🚀 Запустить файл?",
+                "Запустить файл?",
                 f"Файл «{filename}» успешно скачан.\n\n"
                 f"Запустить его прямо сейчас?\n\n"
-                f"⚠️ Запускайте файлы только от тех, кому полностью доверяете."
+                f"Запускайте файлы только от тех, кому полностью доверяете."
         ):
             try:
                 if sys.platform == "win32":
@@ -5672,13 +6988,13 @@ class ChatWindow(ctk.CTkToplevel):
                     subprocess.Popen(["open", dest_path])
                 else:
                     subprocess.Popen(["xdg-open", dest_path])
-                self.log(f"🚀 Файл «{filename}» запущен")
+                self.log(f"Файл «{filename}» запущен")
                 play_click()
             except Exception as e:
                 play_error()
-                self._mb.showerror("Ошибка запуска", f"Не удалось запустить файл «{filename}»:\n{e}")
+                self._mb.showerror("Не запустилось", f"Не удалось запустить файл «{filename}»:\n{e}")
         else:
-            self.log(f"🚫 Запуск файла «{filename}» отменён пользователем")
+            self.log(f"Запуск файла «{filename}» отменён пользователем")
 
     def _download_offered_file(self, sender, url, filename, auto_launch=False):
         MAX_SIZE = 500 * 1024 * 1024
@@ -5724,7 +7040,7 @@ class ChatWindow(ctk.CTkToplevel):
                             return
                         f.write(chunk)
 
-            self.log(f"✅ Файл «{filename}» от «{sender}» скачан: {dest_path}")
+            self.log(f"Файл «{filename}» от «{sender}» скачан: {dest_path}")
             self.after(0, lambda: self.show_notification(
                 f"Файл «{filename}» от «{sender}» сохранён в папку download", "✅ Файл скачан"
             ))
@@ -5734,10 +7050,10 @@ class ChatWindow(ctk.CTkToplevel):
                 self.after(300, lambda: self._prompt_launch_file(_path, _name))
         except Exception as e:
             error_text = str(e)
-            self.log(f"❌ Не удалось скачать файл «{filename}»: {error_text}")
+            self.log(f"Не получилось скачать файл «{filename}»: {error_text}")
             self.after(0, lambda: (play_error(), self._mb.showerror(
-                "Ошибка скачивания",
-                f"Не удалось скачать файл «{filename}»:\n{error_text}"
+                "Не скачалось",
+                f"Не получилось скачать файл «{filename}»:\n{error_text}"
             )))
 
     def _socket_send(self, payload):
@@ -5760,7 +7076,7 @@ class ChatWindow(ctk.CTkToplevel):
                     self._update_personal_preview(text, mine=True)
 
         except Exception as e:
-            self.log(f"❌ Ошибка отправки: {e}")
+            self.log(f"Не отправилось: {e}")
             self.disconnect()
 
     def send_skin_file(self, username, file_path):
@@ -5770,7 +7086,7 @@ class ChatWindow(ctk.CTkToplevel):
             with open(file_path, 'rb') as f:
                 raw = f.read()
             if len(raw) > 5 * 1024 * 1024:
-                self.log("❌ Скин слишком большой для отправки (>5 МБ)")
+                self.log("Скин слишком большой для отправки (>5 МБ)")
                 return False
             b64 = base64.b64encode(raw).decode('ascii')
             payload = f"SKIN:{username}:{b64}"
@@ -5778,7 +7094,7 @@ class ChatWindow(ctk.CTkToplevel):
             self.log(f"📤 Отправил скин для ника '{username}' собеседнику")
             return True
         except Exception as e:
-            self.log(f"❌ Не удалось отправить скин: {e}")
+            self.log(f"Не получилось отправить скин: {e}")
             return False
 
     def receive_skin_file(self, username, b64_data):
@@ -5792,13 +7108,13 @@ class ChatWindow(ctk.CTkToplevel):
             self.log(f"🎨 Получил скин для ника '{username}' — сохранил локально")
             self.show_notification(f"Прислал(а) скин для ника «{username}»", "🎨 Скин")
         except Exception as e:
-            self.log(f"❌ Не удалось сохранить присланный скин: {e}")
+            self.log(f"Не получилось сохранить присланный скин: {e}")
 
     def update_status(self):
         if self.connected and self.client_socket:
-            self.safe_update_widget(self.status_label, text="🟢 Онлайн", text_color="#6fce7f")
+            self.safe_update_widget(self.status_label, text="Онлайн", text_color="#6fce7f")
         else:
-            self.safe_update_widget(self.status_label, text="🔴 Офлайн", text_color="#d3453f")
+            self.safe_update_widget(self.status_label, text="Офлайн", text_color="#d3453f")
 
     def disconnect(self):
         if self._screen_share.get("state"):
@@ -5817,7 +7133,7 @@ class ChatWindow(ctk.CTkToplevel):
             self.safe_update_widget(self.send_btn, state="disabled")
             self.update_status()
             self._refresh_members_popup()
-            self.log("🔴 Отключено от чата")
+            self.log("Отключено от чата")
             try:
                 if self.client_socket:
                     self.client_socket.close()
@@ -5852,20 +7168,119 @@ class ChatWindow(ctk.CTkToplevel):
                         "by": self.username,
                     }))
                     self.send_message_raw(f"👑 {next_member} теперь создатель (админ) комнаты")
-                    self.log(f"👑 Права автоматически переданы «{next_member}» при выходе")
+                    self.log(f"Права автоматически переданы «{next_member}» при выходе")
                 except Exception as e:
-                    self.log(f"⚠️ Не удалось передать права при выходе: {e}")
-        self.log(f"🚪 Выходим из комнаты «{self.room}»...")
+                    self.log(f"Не получилось передать права при выходе: {e}")
+        self.log(f"Выходим из комнаты «{self.room}»...")
         self.running = False
         self.disconnect()
         self._close_chat_window()
 
 
+
+class DirectMessageWindow(ctk.CTkToplevel):
+    """Настоящий личный чат 1-на-1. Никаких room-кодов и общего группового канала."""
+    def __init__(self, master, contact):
+        super().__init__(master)
+        self.master = master
+        self.contact = dict(contact or {})
+        self.contact_id = str(self.contact.get("id") or "").strip().upper()
+        self.contact_name = str(self.contact.get("name") or self.contact_id or "Друг")
+        self.title(f"💬 {self.contact_name}")
+        self.geometry("620x700")
+        self.minsize(480, 520)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(14, 8))
+        ctk.CTkLabel(header, image=make_avatar_image(self.contact_name, 42), text="").pack(side="left", padx=(0, 10))
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(title_box, text=self.contact_name,
+                     font=ctk.CTkFont(size=18, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_box, text="🔒 Личная переписка 1-на-1",
+                     text_color="#8b87a3", font=ctk.CTkFont(size=11), anchor="w").pack(anchor="w")
+
+        self.display = ctk.CTkTextbox(self, wrap="word", font=ctk.CTkFont(size=13))
+        self.display.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        self.display.configure(state="disabled")
+
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.pack(fill="x", padx=14, pady=(0, 14))
+        self.entry = ctk.CTkEntry(bottom, placeholder_text="Написать сообщение…", height=42)
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.entry.bind("<Return>", self._send_event)
+        make_sound_button(bottom, text="➤", command=self.send_message,
+                          width=48, height=42, fg_color="#6d92ff", hover_color="#5a7dd8").pack(side="right")
+
+        self._load_history()
+        self.after(100, self.entry.focus_set)
+
+    def _append(self, text, mine=False, timestamp=None):
+        try:
+            dt = datetime.fromtimestamp(float(timestamp)) if timestamp else datetime.now()
+            stamp = dt.strftime("%H:%M")
+        except Exception:
+            stamp = datetime.now().strftime("%H:%M")
+        prefix = "Вы" if mine else self.contact_name
+        self.display.configure(state="normal")
+        self.display.insert("end", f"[{stamp}] {prefix}: {text}\n")
+        self.display.see("end")
+        self.display.configure(state="disabled")
+
+    def _load_history(self):
+        try:
+            entries = load_chat_history(self.contact_id)
+            for item in entries:
+                self._append(item.get("text", ""), bool(item.get("mine")), item.get("ts"))
+        except Exception:
+            pass
+
+    def receive_message(self, text, timestamp=None):
+        text = str(text or "").strip()
+        if not text:
+            return
+        self._append(text, False, timestamp)
+        append_chat_history(self.contact_id, text, False)
+        self.master._update_personal_chat_preview(self.contact_id, text, False)
+
+    def send_message(self):
+        text = self.entry.get().strip()
+        if not text:
+            return
+        if not self.contact_id:
+            return
+        ok = self.master._send_friend_direct_message(self.contact_id, text)
+        if not ok:
+            play_error()
+            show_error_toast(self, "Не отправлено", "Нет соединения с сервером друзей.")
+            return
+        self.entry.delete(0, "end")
+        self._append(text, True, time.time())
+        append_chat_history(self.contact_id, text, True)
+        self.master._update_personal_chat_preview(self.contact_id, text, True)
+
+    def _send_event(self, event=None):
+        self.send_message()
+        return "break"
+
+    def _close(self):
+        try:
+            if getattr(self.master, "active_direct_chat_windows", {}).get(self.contact_id) is self:
+                self.master.active_direct_chat_windows.pop(self.contact_id, None)
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
 class EmojiPicker(ctk.CTkToplevel):
     def __init__(self, master, callback):
         super().__init__(master)
         self.callback = callback
-        self.title("😊 Выберите эмодзи")
+        self.title("Выбери эмодзи")
         self.geometry("500x400")
         self.resizable(False, False)
         self.grab_set()
@@ -5899,7 +7314,7 @@ class EmojiPicker(ctk.CTkToplevel):
                 col = 0
                 row += 1
 
-        close_btn = make_sound_button(main_frame, text="❌ Закрыть",
+        close_btn = make_sound_button(main_frame, text="Закрыть",
                                       command=self.destroy,
                                       fg_color="#d3453f", hover_color="#b83530",
                                       height=35)
@@ -5924,8 +7339,8 @@ class GameConsoleWindow(ctk.CTkToplevel):
 
         header = ctk.CTkFrame(main_frame, fg_color="transparent")
         header.pack(fill="x", pady=(0, 5))
-        ctk.CTkLabel(header, text="🎮 Логи запущенной игры", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-        clear_btn = make_sound_button(header, text="🗑️ Очистить", command=self.clear, height=28, width=90,
+        ctk.CTkLabel(header, text="Логи запущенной игры", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        clear_btn = make_sound_button(header, text="Очистить", command=self.clear, height=28, width=90,
                                       fg_color="#d3453f", hover_color="#b83530", font=ctk.CTkFont(size=11))
         clear_btn.pack(side="right")
 
@@ -6111,7 +7526,7 @@ class SearchableComboBox(ctk.CTkFrame):
 
         self._search_var = tk.StringVar()
         search_entry = ctk.CTkEntry(container, height=30, corner_radius=4,
-                                    placeholder_text="🔍 Поиск установленных версий",
+                                    placeholder_text="Поиск установленных версий",
                                     textvariable=self._search_var)
         search_entry.pack(fill="x", padx=6, pady=(6, 4))
         search_entry.bind("<KeyRelease>", lambda e: self._on_search())
@@ -6225,6 +7640,707 @@ class SearchableComboBox(ctk.CTkFrame):
             self._popup_buttons = []
 
 
+from collections import deque
+
+
+# =============================================================================
+#  ЯРЛЫК ЗАПУСКА ИГРЫ (без окна лаунчера)
+#
+#  Как это работает:
+#    1. В «Установке» жмёшь «Создать ярлык запуска игры» — create_game_shortcut()
+#       кладёт .lnk, который запускает этот же файл с ключами `--play <версия> --account <ник>`.
+#    2. Ключи ловятся в самом начале файла (_SHORTCUT_LAUNCH): окно лаунчера
+#       вообще не создаётся, а стартовый сплеш превращается в сплеш игры.
+#    3. GameShortcutRunner готовит команду, запускает Minecraft без консоли,
+#       показывает на сплеше прогресс и закрывает его, когда появилось окно игры.
+# =============================================================================
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CSIDL_PROGRAMS = 0x0002
+_CSIDL_DESKTOPDIRECTORY = 0x0010
+
+
+class _ShortcutError(Exception):
+    """Ожидаемая проблема запуска — текст уже написан для человека."""
+
+
+def _get_shell_folder(csidl):
+    """Реальный путь к папке Windows (рабочий стол с переносом в OneDrive тоже находится)."""
+    import ctypes
+    buf = ctypes.create_unicode_buffer(1024)
+    if ctypes.windll.shell32.SHGetFolderPathW(0, csidl, 0, 0, buf) != 0:
+        raise OSError("Windows не сказала, где лежит нужная папка")
+    return buf.value
+
+
+def _find_mine_icon():
+    """Ищет mine.ico: внутри exe (PyInstaller), в resources и рядом с лаунчером."""
+    candidates = [
+        resource_path("mine.ico"),
+        resource_path(os.path.join("resources", "mine.ico")),
+        os.path.join(get_launcher_dir(), "mine.ico"),
+        os.path.join(get_launcher_dir(), "resources", "mine.ico"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def ensure_game_shortcut_icon():
+    """Возвращает путь к .ico для ярлыка: сначала mine.ico, если её нет — рисует блок земли с травой.
+    mine.ico копируем в папку данных лаунчера: из временной папки exe иконка бы пропала после закрытия."""
+    icon_dir = os.path.join(os.path.dirname(SETTINGS_FILE), "shortcut_icons")
+    os.makedirs(icon_dir, exist_ok=True)
+
+    mine_src = _find_mine_icon()
+    if mine_src:
+        mine_dst = os.path.join(icon_dir, "mine.ico")
+        try:
+            if (not os.path.exists(mine_dst)
+                    or os.path.getsize(mine_dst) != os.path.getsize(mine_src)):
+                shutil.copyfile(mine_src, mine_dst)
+            return mine_dst
+        except OSError:
+            return mine_src
+
+    icon_path = os.path.join(icon_dir, "minecraft_block.ico")
+    if os.path.exists(icon_path):
+        return icon_path
+
+    rnd = random.Random(67)
+    grass = [(106, 176, 76), (92, 158, 64), (120, 190, 88)]
+    dirt = [(134, 96, 67), (121, 85, 58), (147, 108, 76), (105, 74, 50)]
+    img = Image.new("RGBA", (16, 16))
+    for y in range(16):
+        for x in range(16):
+            palette = grass if (y < 4 or (y < 6 and rnd.random() < 0.4)) else dirt
+            img.putpixel((x, y), rnd.choice(palette) + (255,))
+    img = img.resize((256, 256), Image.NEAREST)
+    img.save(icon_path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    return icon_path
+
+
+def _ps_quote(value):
+    """Строка в одинарных кавычках PowerShell.
+    PowerShell считает кавычками ещё и ‘ ’ ‚ ‛, поэтому экранируем (удваиваем) их все."""
+    text = str(value)
+    for quote in "'\u2018\u2019\u201a\u201b":
+        text = text.replace(quote, quote * 2)
+    return "'" + text + "'"
+
+
+def create_game_shortcut(version, account, name, also_start_menu=False):
+    """Создаёт ярлык, который сразу запускает игру (без окна лаунчера).
+    Возвращает список путей к созданным .lnk, при неудаче кидает RuntimeError."""
+    if sys.platform != "win32":
+        raise RuntimeError("Ярлыки я умею делать только в Windows")
+
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", name).strip().strip(".") or f"Minecraft {version}"
+    folders = [_get_shell_folder(_CSIDL_DESKTOPDIRECTORY)]
+    if also_start_menu:
+        folders.append(_get_shell_folder(_CSIDL_PROGRAMS))
+    lnk_paths = [os.path.join(folder, safe_name + ".lnk") for folder in folders]
+
+    play_args = ["--play", version, "--account", account]
+    if getattr(sys, "frozen", False):
+        target = sys.executable
+        arguments = subprocess.list2cmdline(play_args)
+    else:
+        # pythonw — это тот же Python, только без чёрного окна консоли
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        target = pythonw if os.path.exists(pythonw) else sys.executable
+        arguments = subprocess.list2cmdline([os.path.abspath(__file__)] + play_args)
+
+    try:
+        icon = ensure_game_shortcut_icon() + ",0"
+    except Exception:
+        icon = target + ",0"
+
+    description = f"Minecraft {version} — запуск без лаунчера"
+    lines = ["$ErrorActionPreference = 'Stop'", "$shell = New-Object -ComObject WScript.Shell"]
+    for lnk in lnk_paths:
+        lines += [
+            f"$s = $shell.CreateShortcut({_ps_quote(lnk)})",
+            f"$s.TargetPath = {_ps_quote(target)}",
+            f"$s.Arguments = {_ps_quote(arguments)}",
+            f"$s.WorkingDirectory = {_ps_quote(get_launcher_dir())}",
+            f"$s.IconLocation = {_ps_quote(icon)}",
+            f"$s.Description = {_ps_quote(description)}",
+            "$s.Save()",
+        ]
+    # EncodedCommand (UTF-16 в base64) — чтобы русские буквы и кавычки в путях ничего не ломали
+    encoded = base64.b64encode("\n".join(lines).encode("utf-16-le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-EncodedCommand", encoded],
+        capture_output=True, timeout=30, creationflags=_CREATE_NO_WINDOW)
+
+    if result.returncode != 0 or not all(os.path.exists(p) for p in lnk_paths):
+        details = (result.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(details or "PowerShell не смог создать ярлык")
+    return lnk_paths
+
+
+def create_exe_shortcut(exe_path, name):
+    """Кладёт на рабочий стол ярлык, который просто запускает указанный .exe
+    (иконка и рабочая папка — самого exe). Возвращает путь к .lnk или кидает RuntimeError."""
+    if sys.platform != "win32":
+        raise RuntimeError("Ярлыки я умею делать только в Windows")
+    if not os.path.isfile(exe_path):
+        raise RuntimeError("Файл игры не найден")
+
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", name).strip().strip(".") or "Game"
+    lnk = os.path.join(_get_shell_folder(_CSIDL_DESKTOPDIRECTORY), safe_name + ".lnk")
+
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$shell = New-Object -ComObject WScript.Shell",
+        f"$s = $shell.CreateShortcut({_ps_quote(lnk)})",
+        f"$s.TargetPath = {_ps_quote(exe_path)}",
+        f"$s.WorkingDirectory = {_ps_quote(os.path.dirname(exe_path))}",
+        f"$s.IconLocation = {_ps_quote(exe_path + ',0')}",
+        f"$s.Description = {_ps_quote(name)}",
+        "$s.Save()",
+    ]
+    encoded = base64.b64encode("\n".join(lines).encode("utf-16-le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-EncodedCommand", encoded],
+        capture_output=True, timeout=30, creationflags=_CREATE_NO_WINDOW)
+
+    if result.returncode != 0 or not os.path.exists(lnk):
+        details = (result.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(details or "PowerShell не смог создать ярлык")
+    return lnk
+
+
+def _apply_game_dir(settings):
+    """Те же пути, что выставляет LauncherApp._finish_startup, только без окна лаунчера."""
+    global MINECRAFT_DIR, GAME_DIR, ACCOUNTS_FILE, PROFILES_FILE, LAUNCHER_PROFILES_FILE
+    GAME_DIR = settings.get("game_dir", DEFAULT_GAME_DIR)
+    MINECRAFT_DIR = GAME_DIR
+    ACCOUNTS_FILE = os.path.join(MINECRAFT_DIR, "accounts.json")
+    PROFILES_FILE = os.path.join(MINECRAFT_DIR, "profile.json")
+    LAUNCHER_PROFILES_FILE = os.path.join(MINECRAFT_DIR, "launcher_profiles.json")
+
+
+def _list_visible_windows():
+    """{hwnd: (pid, заголовок)} для всех видимых окон верхнего уровня."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    found = {}
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _on_window(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                found[hwnd] = (pid.value, buf.value)
+        return True
+
+    user32.EnumWindows(_on_window, 0)
+    return found
+
+
+# Что пишет игра в лог -> насколько заполнить полоску и что показать на сплеше.
+# Проценты только растут, порядок строк в логе значения не имеет.
+_GAME_LOG_STAGES = (
+    (("loading", "mods"), 88, "Подгружаю моды..."),
+    (("setting user",), 90, "Захожу в игру под твоим ником..."),
+    (("lwjgl",), 92, "Включаю графику..."),
+    (("reloading resourcemanager",), 94, "Загружаю ресурсы..."),
+    (("openal",), 95, "Настраиваю звук..."),
+    (("atlas",), 96, "Собираю текстуры..."),
+)
+
+
+class GameShortcutRunner:
+    """Запуск игры по ярлыку: сплеш с прогрессом, без окна лаунчера и без консоли.
+
+    Вся подготовка (Java, токены, команда) идёт в фоновом потоке, а сплеш живёт в главном
+    и раз в 60 мс забирает от потока сообщения. Вывод игры пишется в файл-лог, а не в трубу:
+    так сплеш может читать его для статуса, а после появления окна игры лаунчер спокойно
+    закрывается, и игре не приходится писать в закрытую трубу."""
+
+    WINDOW_WAIT_LIMIT = 180  # сек. ждём окно игры, потом всё равно закрываем сплеш
+    PREPARE_LIMIT = 120  # сек. на подготовку (Java, токены), иначе считаем, что всё повисло
+
+    def __init__(self, version, account_name):
+        self.version = version
+        self.account_name = account_name
+        self.root = _boot_root
+        self.events = _queue_module.Queue()
+        self.phase = "preparing"  # preparing -> waiting -> done
+        self.proc = None
+        self.log_path = None
+        self.log_pos = 0
+        self.log_partial = ""
+        self.log_tail = deque(maxlen=40)
+        self.windows_before = {}
+        self.started_at = 0.0
+        self.ticks = 0
+        self.stage_floor = 0
+        self.target = 20.0
+        self.shown = float(_boot_state["value"])
+        self.exit_code = 0
+        self.created_at = time.time()
+
+    # ---------- подготовка (фоновый поток) ----------
+
+    def _say(self, percent, text):
+        self.events.put(("say", percent, text))
+
+    def _find_account(self, settings):
+        accounts = load_accounts()
+        by_name = {acc.get("username"): acc for acc in accounts}
+        for wanted in (self.account_name, settings.get("last_account")):
+            if wanted in by_name:
+                return by_name[wanted], wanted
+        if accounts:
+            return accounts[0], accounts[0].get("username", "Player")
+        return None, self.account_name or "Player"
+
+    def _auth_args(self, account_data, username):
+        """Аргументы входа для нужного типа аккаунта. Возвращает (аргументы, путь к authlib-injector)."""
+        kind = (account_data or {}).get("type")
+        if kind == "microsoft":
+            self._say(62, "Обновляю вход в Microsoft...(НЕ КРАЖА ДАННЫХ)")
+            refreshed = refresh_microsoft_account(account_data)
+            login = refreshed if refreshed else account_data
+            return ["--username", login["name"] if refreshed else login["username"],
+                    "--uuid", login["id"] if refreshed else login["uuid"],
+                    "--accessToken", login["access_token"],
+                    "--userType", "msa"], None
+        if kind == "elyby":
+            self._say(62, "Обновляю вход в Ely.by...")
+            refreshed = refresh_elyby_account(account_data)
+            login = refreshed if refreshed else account_data
+            args = ["--username", login["name"] if refreshed else login["username"],
+                    "--uuid", login["id"] if refreshed else login["uuid"],
+                    "--accessToken", login["access_token"],
+                    "--userType", "mojang"]
+            self._say(68, "Подключаю скины Ely.by...")
+            return args, ensure_authlib_injector()
+        return ["--username", username,
+                "--uuid", "00000000-0000-0000-0000-000000000000",
+                "--accessToken", "0",
+                "--userType", "mojang"], None
+
+    def _prepare(self):
+        try:
+            self._say(24, "Читаю настройки...")
+            settings = load_launcher_settings()
+            _apply_game_dir(settings)
+            ram = settings.get("ram", "2G")
+
+            self._say(32, "Ищу твой аккаунт...(вычесляю по ip)")
+            account_data, username = self._find_account(settings)
+
+            self._say(40, "Проверяю, что версия на месте...")
+            if not os.path.isdir(os.path.join(MINECRAFT_DIR, "versions", self.version)):
+                raise _ShortcutError(f"Версии {self.version} больше нет. Открой лаунчер, поставь её заново "
+                                     f"и пересоздай ярлык.")
+            if not resolve_version_jar_path(self.version, MINECRAFT_DIR):
+                raise _ShortcutError(f"У версии {self.version} нет .jar — похоже, установка не докачалась. "
+                                     f"Поставь её заново в лаунчере.")
+
+            self._say(50, "Ищу подходящую Java...")
+            java_path = get_java_for_version(self.version)
+
+            auth_args, injector_path = self._auth_args(account_data, username)
+
+            self._say(76, "Собираю команду запуска...")
+            jvm_args = [f"-Xmx{ram}"]
+            if injector_path:
+                jvm_args.append(f"-javaagent:{injector_path}=ely.by")
+            options = mll.utils.generate_test_options()
+            options["jvmArguments"] = jvm_args
+            if java_path != "java":
+                options["executablePath"] = java_path
+            command = mll.command.get_minecraft_command(
+                version=self.version, minecraft_directory=MINECRAFT_DIR, options=options)
+
+            # Те же приёмы, что в launch_game: вырезаем тестовые данные входа и ставим свои
+            cleaned, i = [], 0
+            while i < len(command):
+                if command[i] in ("--username", "--uuid", "--accessToken", "--userType"):
+                    i += 2
+                    continue
+                cleaned.append(command[i])
+                i += 1
+            command = cleaned + auth_args
+
+            self._say(84, "Запускаю Minecraft...")
+            logs_dir = os.path.join(MINECRAFT_DIR, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            self.log_path = os.path.join(logs_dir, "67launcher_shortcut.log")
+            windows_before = _list_visible_windows()
+            with open(self.log_path, "wb") as log_out:
+                try:
+                    proc = subprocess.Popen(
+                        command, cwd=MINECRAFT_DIR, stdin=subprocess.DEVNULL,
+                        stdout=log_out, stderr=subprocess.STDOUT,
+                        creationflags=_CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP)
+                except FileNotFoundError:
+                    raise _ShortcutError("Не нашёл Java)(. Поставь её или укажи путь к ней "
+                                         "в настройках лаунчера.")
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+            except Exception:
+                pass
+            self.events.put(("started", proc, windows_before))
+        except _ShortcutError as e:
+            self.events.put(("error", str(e)))
+        except Exception as e:
+            self.events.put(("error", f"Что-то пошло не так: {e}"))
+
+    # ---------- сплеш (главный поток) ----------
+
+    def _set_status(self, text, color=None):
+        try:
+            _boot_status_label.configure(text=text, **({"fg": color} if color else {}))
+        except Exception:
+            pass
+
+    def _drain_events(self):
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except _queue_module.Empty:
+                return
+            kind = event[0]
+            if kind == "say":
+                self.target = max(self.target, float(event[1]))
+                self._set_status(f"⏳ {event[2]}")
+            elif kind == "started":
+                _, self.proc, self.windows_before = event
+                self.started_at = time.time()
+                self.phase = "waiting"
+                self.target = max(self.target, 86.0)
+                self._set_status("⏳ ПОДОЖЖДИ КАКАЯ-ТА ФИГНЯ МАЙНА ГРУЗИТСЯ")
+            elif kind == "error":
+                self._fail(event[1])
+                return
+
+    def _read_new_log_lines(self):
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(self.log_pos)
+                chunk = f.read()
+                self.log_pos = f.tell()
+        except OSError:
+            return []
+        *lines, self.log_partial = (self.log_partial + chunk.decode("utf-8", "ignore")).split("\n")
+        return [line.strip() for line in lines if line.strip()]
+
+    def _apply_stage(self, line):
+        low = line.lower()
+        for needles, percent, text in _GAME_LOG_STAGES:
+            if percent > self.stage_floor and all(n in low for n in needles):
+                self.stage_floor = percent
+                self.target = max(self.target, float(percent))
+                self._set_status(f"⏳ {text}")
+                return
+
+    def _game_window_is_open(self):
+        me = os.getpid()
+        for hwnd, (pid, title) in _list_visible_windows().items():
+            if hwnd in self.windows_before or pid == me:
+                continue
+            if pid == self.proc.pid or title.lower().startswith("minecraft"):
+                return True
+        return False
+
+    def _watch_game(self):
+        self.ticks += 1
+        for line in self._read_new_log_lines():
+            self.log_tail.append(line)
+            self._apply_stage(line)
+
+        code = self.proc.poll()
+        if code is not None:
+            if code == 0:
+                self._finish_ok()
+            else:
+                tail = "\n".join(list(self.log_tail)[-12:]) or "(игра ничего не написала возможно она ваас нелюбит("
+                self._fail(f"Игра закрылась ещё до того, как открылось окно (код {code}).\n\n"
+                           f"Последние строки:\n{tail}\n\nПолный лог: {self.log_path}", "Игра вылетела")
+            return
+        if self.ticks % 4 == 0 and self._game_window_is_open():
+            self._finish_ok()
+        elif time.time() - self.started_at > self.WINDOW_WAIT_LIMIT:
+            self._finish_ok()
+        else:
+            # Пока игра грузится, медленно ползём к 97%, чтобы полоска не стояла на месте
+            self.target = min(97.0, self.target + 0.04)
+
+    def _record_launch(self):
+        try:
+            stats = load_stats()
+            stats["launches"] = stats.get("launches", 0) + 1
+            stats["last_launch"] = datetime.now().isoformat()
+            history = stats.setdefault("launch_history", [])
+            history.append({"time": datetime.now().isoformat(), "version": self.version})
+            stats["launch_history"] = history[-100:]
+            save_stats(stats)
+        except Exception:
+            pass
+
+    def _finish_ok(self):
+        self.phase = "done"
+        self._record_launch()
+        _boot_bar["value"] = 100
+        self._set_status("✅ Готово, игра открывается!", "#6fce7f")
+        self.root.after(600, self.root.destroy)
+
+    def _fail(self, message, title="Minecraft не запустился"):
+        self.phase = "done"
+        self.exit_code = 1
+        try:
+            self.root.withdraw()
+            messagebox.showerror(title, message)
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _pump(self):
+        try:
+            self._drain_events()
+            if self.phase == "done":
+                return
+            if self.phase == "preparing" and time.time() - self.created_at > self.PREPARE_LIMIT:
+                self._fail("Подготовка слишком затянулась — скорее всего, не отвечает интернет или сервер "
+                           "входа. Проверь соединение и попробуй ещё раз. спс что подождали)")
+                return
+            if self.phase == "waiting":
+                self._watch_game()
+                if self.phase == "done":
+                    return
+            if self.shown < self.target:
+                self.shown = min(self.target, self.shown + max(0.15, (self.target - self.shown) * 0.18))
+                _boot_bar["value"] = self.shown
+        except Exception as e:
+            if self.phase != "done":
+                self._fail(f"Что-то пошло не так(ошибка): {e}")
+            return
+        self.root.after(60, self._pump)
+
+    def run(self):
+        threading.Thread(target=self._prepare, daemon=True).start()
+        self.root.after(60, self._pump)
+        self.root.mainloop()
+        return self.exit_code
+
+
+def run_game_shortcut(version, account):
+    """Точка входа режима ярлыка. Возвращает код выхода процесса."""
+    return GameShortcutRunner(version, account).run()
+
+
+
+# ============================================================
+#                 АККАУНТ 67LAUNCHER — GOOGLE
+# ============================================================
+# ВАЖНО: это отдельный аккаунт 67Launcher. Он НЕ является ником
+# Microsoft/Minecraft и не меняет лицензионные аккаунты.
+# Google OAuth для 67Launcher. Для desktop-приложений Google не считает
+# client_secret конфиденциальным: его нельзя надёжно скрыть внутри клиента.
+GOOGLE_CLIENT_ID = "969544058989-tui0i56edd6feotcup5u3luugveqvg20.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "СКРЫТО"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+GOOGLE_SCOPE = "openid email profile"
+
+
+def get_google_client_id():
+    # Client ID встроен в лаунчер — внешние файлы/env больше не нужны.
+    return GOOGLE_CLIENT_ID
+
+
+def get_google_client_secret():
+    # Для desktop OAuth secret нельзя считать настоящим секретом: приложение
+    # распространяется пользователям и значение можно извлечь из клиента.
+    return GOOGLE_CLIENT_SECRET
+
+
+def launcher_google_user_id(google_sub):
+    """Короткий стабильный ID 67Launcher из Google subject.
+    Сам Google sub наружу друзьям не показываем.
+    """
+    raw = str(google_sub or "").strip()
+    if not raw:
+        return ""
+    return "G" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:11].upper()
+
+
+def _google_token_request(data):
+    response = requests.post(GOOGLE_TOKEN_URL, data=data, timeout=20)
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    if response.status_code != 200:
+        reason = payload.get("error_description") or payload.get("error") or f"HTTP {response.status_code}"
+        raise RuntimeError(f"Google: {reason}")
+    return payload
+
+
+def google_refresh_session(refresh_token, client_id):
+    if not refresh_token or not client_id:
+        return None
+    _secret = get_google_client_secret()
+    _refresh_data = {
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    if _secret:
+        _refresh_data["client_secret"] = _secret
+    data = _google_token_request(_refresh_data)
+    access_token = str(data.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Google не вернул access_token")
+    userinfo = requests.get(
+        GOOGLE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
+    )
+    if userinfo.status_code != 200:
+        raise RuntimeError("Не удалось получить профиль Google")
+    profile = userinfo.json()
+    sub = str(profile.get("sub") or "").strip()
+    if not sub:
+        raise RuntimeError("Google не вернул идентификатор аккаунта")
+    return {
+        "sub": sub,
+        "email": str(profile.get("email") or "").strip(),
+        "name": str(profile.get("name") or profile.get("email") or "Аккаунт Google").strip()[:80],
+        "refresh_token": refresh_token,
+        "access_token": access_token,
+    }
+
+
+def google_interactive_login(client_id):
+    if not client_id:
+        raise RuntimeError(
+            "Google OAuth Client ID не настроен в лаунчере."
+        )
+
+    state = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode("ascii")).digest()
+    ).decode("ascii").rstrip("=")
+
+    result = {}
+    event = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                query = urllib.parse.parse_qs(parsed.query)
+                if query.get("state", [""])[0] != state:
+                    result["error"] = "Неверный state OAuth"
+                elif query.get("error"):
+                    result["error"] = query.get("error_description", [query["error"][0]])[0]
+                else:
+                    result["code"] = query.get("code", [""])[0]
+            except Exception as exc:
+                result["error"] = str(exc)
+            body = """<!doctype html><html><head><meta charset='utf-8'><title>67Launcher</title></head>
+            <body style='font-family:Segoe UI,sans-serif;background:#16141f;color:#e5e2f0;text-align:center;padding:60px'>
+            <h2>67Launcher</h2><p>Вход выполнен. Это окно можно закрыть.</p></body></html>"""
+            data = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            event.set()
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), CallbackHandler)
+    server.timeout = 0.5
+    port = server.server_address[1]
+    redirect_uri = f"http://127.0.0.1:{port}/oauth2callback"
+
+    auth_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": GOOGLE_SCOPE,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
+    try:
+        if not webbrowser.open(url):
+            raise RuntimeError("Не удалось открыть браузер")
+        deadline = time.time() + 180
+        while time.time() < deadline and not event.is_set():
+            server.handle_request()
+        if not result.get("code"):
+            raise RuntimeError(result.get("error") or "Вход в Google отменён или истёк по времени")
+        _secret = get_google_client_secret()
+        _token_data = {
+            "client_id": client_id,
+            "code": result["code"],
+            "code_verifier": code_verifier,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }
+        if _secret:
+            _token_data["client_secret"] = _secret
+        tokens = _google_token_request(_token_data)
+        access_token = str(tokens.get("access_token") or "").strip()
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("Google не вернул access_token")
+        if not refresh_token:
+            raise RuntimeError("Google не вернул refresh_token. Попробуй войти ещё раз.")
+        userinfo = requests.get(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+        if userinfo.status_code != 200:
+            raise RuntimeError("Не удалось получить профиль Google")
+        profile = userinfo.json()
+        sub = str(profile.get("sub") or "").strip()
+        if not sub:
+            raise RuntimeError("Google не вернул идентификатор аккаунта")
+        return {
+            "sub": sub,
+            "email": str(profile.get("email") or "").strip(),
+            "name": str(profile.get("name") or profile.get("email") or "Аккаунт Google").strip()[:80],
+            "refresh_token": refresh_token,
+            "access_token": access_token,
+        }
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+
 class LauncherApp(ctk.CTk):
     instance = None
 
@@ -6265,9 +8381,9 @@ class LauncherApp(ctk.CTk):
 
         splash_inner = ctk.CTkFrame(self._splash, fg_color="transparent")
         splash_inner.grid(row=0, column=0)
-        ctk.CTkLabel(splash_inner, text="⚡ 67Launcher", font=ctk.CTkFont(size=30, weight="bold"),
+        ctk.CTkLabel(splash_inner, text="67Launcher", font=ctk.CTkFont(size=30, weight="bold"),
                      text_color="#6d92ff").pack(pady=(0, 14))
-        self._splash_status = ctk.CTkLabel(splash_inner, text="⏳ Загрузка... бабайка.ехе",
+        self._splash_status = ctk.CTkLabel(splash_inner, text="Загрузка... бабайка.ехе",
                                            font=ctk.CTkFont(size=15), text_color="#a8a4bd")
         self._splash_status.pack()
         splash_inner.lift()
@@ -6379,19 +8495,168 @@ class LauncherApp(ctk.CTk):
         self._splash_gif_index = (self._splash_gif_index + 1) % len(self._splash_gif_frames)
         self.after(duration, self._animate_splash_gif)
 
+    def _save_google_profile(self, profile):
+        sub = str(profile.get("sub") or "").strip()
+        if not sub:
+            raise RuntimeError("У Google нет идентификатора аккаунта")
+        self.settings["launcher_google_sub"] = sub
+        self.settings["launcher_google_email"] = str(profile.get("email") or "").strip()[:160]
+        self.settings["launcher_google_name"] = str(profile.get("name") or "Аккаунт Google").strip()[:80]
+        refresh = str(profile.get("refresh_token") or "").strip()
+        access = str(profile.get("access_token") or "").strip()
+        if refresh:
+            self.settings["launcher_google_refresh_token"] = refresh
+        self._google_access_token = access
+        self.settings["user_id"] = launcher_google_user_id(sub)
+        save_launcher_settings(self.settings)
+
+    def _open_google_login_browser(self, dialog, client_id):
+        def worker():
+            try:
+                profile = google_interactive_login(client_id)
+                self.after(0, lambda p=profile: self._google_login_success(dialog, p))
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._google_login_failed(dialog, e))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _google_login_success(self, dialog, profile):
+        try:
+            self._save_google_profile(profile)
+            if dialog.winfo_exists():
+                dialog.destroy()
+        except Exception as exc:
+            self._google_login_failed(dialog, str(exc))
+
+    def _google_login_failed(self, dialog, error):
+        try:
+            if dialog.winfo_exists():
+                dialog.status.configure(text=f"❌ {error}", text_color="#d3453f")
+                dialog.login_btn.configure(state="normal", text="Войти через Google")
+        except Exception:
+            pass
+
+    def _ensure_google_login(self):
+        client_id = get_google_client_id()
+        refresh = str(self.settings.get("launcher_google_refresh_token") or "").strip()
+
+        # Сначала тихо восстанавливаем сессию по refresh token.
+        if client_id and refresh:
+            try:
+                profile = google_refresh_session(refresh, client_id)
+                self._save_google_profile(profile)
+                return True
+            except Exception as exc:
+                self.log(f"Google-сессия истекла: {exc}")
+                self.settings["launcher_google_refresh_token"] = ""
+                self._google_access_token = ""
+                save_launcher_settings(self.settings)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("67Launcher — вход")
+        dialog.geometry("520x420")
+        dialog.minsize(520, 420)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=34, pady=34)
+        ctk.CTkLabel(frame, text="67Launcher", font=ctk.CTkFont(size=30, weight="bold"),
+                     text_color="#6d92ff").pack(pady=(4, 4))
+        ctk.CTkLabel(frame, text="Аккаунт 67Launcher", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(0, 12))
+        ctk.CTkLabel(frame,
+                     text="Войди через Google. Этот аккаунт нужен для друзей,\nличных сообщений и профиля 67Launcher.\nНик Minecraft и лицензионный аккаунт остаются отдельно.",
+                     justify="center", wraplength=440, text_color="#a8a4bd",
+                     font=ctk.CTkFont(size=13)).pack(pady=(0, 24))
+
+        dialog.status = ctk.CTkLabel(frame, text="Нажми кнопку — откроется браузер Google.",
+                                     wraplength=440, justify="center", text_color="#a8a4bd")
+        dialog.status.pack(pady=(0, 14))
+
+        dialog.login_btn = make_sound_button(
+            frame, text="Войти через Google",
+            command=lambda: self._open_google_login_browser(dialog, client_id),
+            height=46, fg_color="#6d92ff", hover_color="#5a7dd8",
+            font=ctk.CTkFont(size=15, weight="bold"))
+        dialog.login_btn.pack(fill="x", pady=(0, 12))
+
+        # OAuth-данные встроены в лаунчер, поэтому отдельные файлы не нужны.
+
+        def cancel():
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            finally:
+                self.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        ctk.CTkLabel(frame, text="Требуется вход для использования 67Launcher.",
+                     text_color="#8b87a3", font=ctk.CTkFont(size=11)).pack(side="bottom", pady=(16, 0))
+        self.wait_window(dialog)
+        return bool(self.settings.get("launcher_google_sub"))
+
+    def _open_launcher_account_window(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Аккаунт 67Launcher")
+        win.geometry("500x330")
+        win.resizable(False, False)
+        win.transient(self)
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=28, pady=28)
+        name = self.settings.get("launcher_google_name") or "Аккаунт Google"
+        email = self.settings.get("launcher_google_email") or ""
+        uid = ensure_user_id(self.settings)
+        ctk.CTkLabel(body, text="Аккаунт 67Launcher", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(0, 14))
+        ctk.CTkLabel(body, text=f"👤 {name}", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=3)
+        ctk.CTkLabel(body, text=email or "Google", text_color="#a8a4bd").pack(pady=3)
+        ctk.CTkLabel(body, text=f"ID: {uid}", text_color="#8b87a3").pack(pady=(3, 20))
+        make_sound_button(body, text="Выйти из аккаунта", command=lambda: self._logout_google_account(win),
+                          height=40, fg_color="#d3453f", hover_color="#b83530").pack(fill="x")
+
+    def _logout_google_account(self, win=None):
+        self.settings["launcher_google_sub"] = ""
+        self.settings["launcher_google_email"] = ""
+        self.settings["launcher_google_name"] = ""
+        self.settings["launcher_google_refresh_token"] = ""
+        self.settings["user_id"] = ""
+        save_launcher_settings(self.settings)
+        self._dm_inbox_running = False
+        try:
+            ws = getattr(self, "_friend_presence_ws", None)
+            if ws:
+                ws.close()
+        except Exception:
+            pass
+        try:
+            if win and win.winfo_exists():
+                win.destroy()
+        except Exception:
+            pass
+        messagebox.showinfo("Выход", "Ты вышел из аккаунта 67Launcher. Перезапусти лаунчер для нового входа.")
+        self.destroy()
+
     def _finish_startup(self):
         global MINECRAFT_DIR, GAME_DIR, ACCOUNTS_FILE, PROFILES_FILE, LAUNCHER_PROFILES_FILE
 
         LauncherApp.setup_tray_icons(self)
         self.settings = load_launcher_settings()
         _apply_button_color_overrides(self.settings.get("custom_button_colors", {}))
+        _apply_custom_variables(self.settings.get("custom_variables", {}))
+        self._set_splash_status("🔐 Проверяем аккаунт 67Launcher...")
+        if not self._ensure_google_login():
+            return
         ensure_user_id(self.settings)
         self.settings.setdefault("personal_chats", [])
+        self.settings.setdefault("friends", {})
+        self.settings.setdefault("friend_requests", {})
+        self.settings.setdefault("outgoing_friend_requests", {})
         self.stats = load_stats()
         self._secret_launcher = None
         self.game_console = None
         self.active_chat_window = None
         self.active_chat_windows = {}
+        self.active_direct_chat_windows = {}
+        self._friend_send_lock = threading.Lock()
         self.chats_list_refresh_callback = None
         self._chat_init_log_shown = False
 
@@ -6437,6 +8702,8 @@ class LauncherApp(ctk.CTk):
         self.launch_success = False
         self.timer_running = False
         self.timer_seconds = 0
+        self._real_start_epoch = None
+        self._session_licensed = None
         self.available_versions = []
         self.available_versions_full = []
 
@@ -6457,12 +8724,11 @@ class LauncherApp(ctk.CTk):
 
         threading.Thread(target=self.load_available_versions, daemon=True).start()
         self.refresh_resourcepacks()
-        self.refresh_skins()
 
         self.restore_last_selection()
 
-        self.log(f"📁 Папка игры: {MINECRAFT_DIR}")
-        self.log(f"📊 Запусков игры: {self.stats.get('launches', 0)}")
+        self.log(f"Папка игры: {MINECRAFT_DIR}")
+        self.log(f"Запусков игры: {self.stats.get('launches', 0)}")
 
         self.start_idle_timer()
 
@@ -6471,6 +8737,17 @@ class LauncherApp(ctk.CTk):
             self._splash.destroy()
         except Exception:
             pass
+
+        # К этому моменту весь основной интерфейс уже создан.
+        # Устанавливаем курсор после создания дочерних HWND, иначе они
+        # могли перехватить WM_SETCURSOR своим курсором.
+        try:
+            _set_cursor_mode(self.settings.get("cursor_mode", "custom"))
+            _install_custom_cursor(self)
+            # Каждый раз, когда окно снова показывают (из трея, после сворачивания) — ставим курсор заново
+            self.bind("<Map>", lambda e: _apply_cursor_to_window(self) if e.widget is self else None, add="+")
+        except Exception as exc:
+            print(f"[cursor] post-startup install failed: {exc}")
 
     def create_emoji_icon(emoji_text="💬"):
         img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
@@ -6513,7 +8790,12 @@ class LauncherApp(ctk.CTk):
         chat_icon = pystray.Icon("67_chat", LauncherApp.create_emoji_icon("💬"), "Чат 67Launcher", chat_menu)
 
         def show_launcher_only(icon, item):
-            launcher_app.after(0, lambda: (launcher_app.deiconify(), launcher_app.lift(), launcher_app.focus_force()))
+            def _show():
+                launcher_app.deiconify()
+                launcher_app.lift()
+                launcher_app.focus_force()
+                _reapply_cursor_after_show(launcher_app)
+            launcher_app.after(0, _show)
 
         def quit_app(icon, item):
             chat_icon.stop()
@@ -6545,7 +8827,7 @@ class LauncherApp(ctk.CTk):
     def open_chat_from_tray(self, icon=None, show_all=False):
         windows = self._live_chat_windows()
         if not windows:
-            self.log("ℹ️ Нажали на иконку чата, но открытых чатов нет")
+            self.log("Нажали на иконку чата, но открытых чатов нет")
             try:
                 if icon is not None:
                     icon.notify("Чат сейчас не запущен. Открой его в лаунчере кнопкой «Чат».",
@@ -6564,7 +8846,7 @@ class LauncherApp(ctk.CTk):
             try:
                 w.restore_chat_only()
             except Exception as e:
-                self.log(f"❌ Чат из трея не открылся: {e}")
+                self.log(f"Чат из трея не открылся: {e}")
 
     def hide_chats_from_tray(self):
         for w in self._live_chat_windows():
@@ -6613,7 +8895,15 @@ class LauncherApp(ctk.CTk):
         save_launcher_settings(self.settings)
         play_click()
         self.update_combo_text_color()
-        self.log(f"🔶 Золотая тема лицензионных аккаунтов: {'включена' if enabled else 'выключена'} (сохранено)")
+        self.log(f"Золотая тема лицензионных аккаунтов: {'включена' if enabled else 'выключена'} (сохранено)")
+
+    def toggle_cursor_setting(self):
+        mode = "custom" if self.cursor_switch.get() == 1 else "classic"
+        self.settings["cursor_mode"] = mode
+        save_launcher_settings(self.settings)
+        _set_cursor_mode(mode)
+        play_click()
+        self.log(f"Курсор: {'свой, лаунчерский' if mode == 'custom' else 'обычный виндовый'} (сохранено)")
 
     def get_theme_colors(self):
         if self.settings.get("theme", "dark") == "light":
@@ -6716,39 +9006,77 @@ class LauncherApp(ctk.CTk):
     def update_stats_display(self):
         stats = load_stats()
         self.stats = stats
-        launches = stats.get("launches", 0)
-        play_time = stats.get("total_play_time", 0)
-        last_launch = stats.get("last_launch", "Никогда")
+        launches = lb_safe_int(stats.get("launches", 0))
+        play_time = lb_safe_int(stats.get("total_play_time", 0))
+
+        # Защита от накрутки: показываем предупреждение если время подозрительно велико
+        max_possible = launches * 86400 if launches > 0 else 86400
+        cheat_warning = ""
+        if play_time > max_possible:
+            cheat_warning = "\n⚠️ Время превышает возможное — возможна накрутка!\n"
+
+        licensed_book = stats.get("licensed_play")
+        if isinstance(licensed_book, dict):
+            licensed_time = sum(
+                lb_safe_int(rec.get("seconds")) for rec in licensed_book.values()
+                if isinstance(rec, dict)
+            )
+        else:
+            licensed_time = 0
+
+        last_launch = stats.get("last_launch") or "Никогда"
         if last_launch and last_launch != "Никогда":
             try:
                 dt = datetime.fromisoformat(last_launch)
                 last_launch = dt.strftime("%d.%m.%Y %H:%M:%S")
-            except:
+            except Exception:
                 pass
+
         history = stats.get("launch_history", [])
-        history_text = ""
+        if not isinstance(history, list):
+            history = []
         if history:
             history_text = "\n".join(
-                [f"  • {h.get('time', '')[:16]} - {h.get('version', 'unknown')}" for h in history[-10:]])
-        stats_text = f"""
-📊 СТАТИСТИКА:
+                [f"  • {h.get('time', '')[:16]} - {h.get('version', 'unknown')}"
+                 for h in history[-10:] if isinstance(h, dict)]
+            )
+        else:
+            history_text = "  Нет записей"
 
-🚀 Всего запусков игры: {launches}
-⏱ Общее время игры: {self.format_time(play_time)}
-🕐 Последний запуск: {last_launch}
+        # Информация о лицензионных аккаунтах в рейтинге
+        licensed_detail = ""
+        if isinstance(licensed_book, dict) and licensed_book:
+            lines = []
+            for uid, rec in list(licensed_book.items())[:5]:
+                if isinstance(rec, dict):
+                    name = rec.get("name") or uid[:8]
+                    secs = lb_safe_int(rec.get("seconds"))
+                    lines.append(f"  • {name}: {self.format_time(secs)}")
+            if lines:
+                licensed_detail = "\n🎮 Время по аккаунтам:\n" + "\n".join(lines)
 
-📋 Последние запуски:
-{history_text if history_text else "  Нет записей"}
-
-📊 Запусков лаунчера: {self.settings.get('launch_count', 0)}
-"""
-        self.stats_text.delete("1.0", "end")
-        self.stats_text.insert("1.0", stats_text)
+        stats_text = (
+            f"\n📊 СТАТИСТИКА:\n"
+            f"{cheat_warning}"
+            f"\n🚀 Всего запусков игры: {launches}"
+            f"\n⏱ Общее время игры: {self.format_time(play_time)}"
+            f"\n🔷 Из них на лицензионных аккаунтах: {self.format_time(licensed_time)}"
+            f"{licensed_detail}"
+            f"\n🕐 Последний запуск: {last_launch}"
+            f"\n\n📋 Последние запуски:\n{history_text}"
+            f"\n\n📊 Запусков лаунчера: {self.settings.get('launch_count', 0)}\n"
+        )
+        try:
+            self.stats_text.delete("1.0", "end")
+            self.stats_text.insert("1.0", stats_text)
+        except Exception:
+            pass
 
     def update_info_display(self):
         stats = load_stats()
         self.stats = stats
         self.update_stats_display()
+        self.update_subtitle()
 
     def update_subtitle(self):
         launches = self.stats.get("launches", 0)
@@ -6789,17 +9117,17 @@ class LauncherApp(ctk.CTk):
 
     def load_available_versions(self):
         try:
-            self.log("🔄 Загрузка списка версий...")
+            self.log("Гружу список версий...")
             versions = mll.utils.get_available_versions(MINECRAFT_DIR)
 
             self.available_versions_full = [
                 {"id": v["id"], "type": v.get("type", "release")} for v in versions
             ]
             self.available_versions = [v["id"] for v in self.available_versions_full if v["type"] != "snapshot"]
-            self.log(f"✅ Загружено {len(self.available_versions_full)} версий "
+            self.log(f"Загружено {len(self.available_versions_full)} версий "
                      f"(релизов: {len(self.available_versions)})")
         except Exception as e:
-            self.log(f"❌ Ошибка загрузки версий: {e}")
+            self.log(f"Не загрузился список версий: {e}")
             self.available_versions_full = []
             self.available_versions = []
         try:
@@ -6831,18 +9159,18 @@ class LauncherApp(ctk.CTk):
 
     def select_optifine_file(self):
         file_path = filedialog.askopenfilename(
-            title="Выберите установщик OptiFine (.jar)",
+            title="Выбери установщик OptiFine (.jar)",
             filetypes=[("JAR файлы", "*.jar"), ("Все файлы", "*.*")]
         )
         if file_path:
             if file_path.lower().endswith('.exe'):
                 play_error()
-                show_error_toast(self, "Ошибка", "OptiFine ставится только из .jar — экзешник сюда не годится")
+                show_error_toast(self, "Не вышло", "OptiFine ставится только из .jar — экзешник сюда не годится")
                 return
             self.selected_installer_path = file_path
-            self.install_file_label.configure(text=f"✅ Файл выбран: {os.path.basename(file_path)}",
+            self.install_file_label.configure(text=f"Файл выбран: {os.path.basename(file_path)}",
                                               text_color="#6fce7f")
-            self.log(f"📂 Выбран файл OptiFine: {file_path}")
+            self.log(f"Выбран файл OptiFine: {file_path}")
             play_click()
 
     def show_download_panel(self, show=True):
@@ -6881,11 +9209,11 @@ class LauncherApp(ctk.CTk):
     def download_with_progress(self, url, filepath, description="Скачивание"):
         try:
             self.after(0, lambda: self.show_download_panel(True))
-            self.log(f"📥 {description}...")
+            self.log(f"{description}...")
             if hasattr(self, 'download_spinner'):
                 self.download_spinner.start()
             if hasattr(self, 'download_status_label'):
-                self.download_status_label.configure(text=f"⏳ {description}...", text_color="#d9622f")
+                self.download_status_label.configure(text=f"{description}...", text_color="#d9622f")
             if hasattr(self, 'download_progressbar'):
                 self.download_progressbar.start_animation()
             response = requests.get(url, stream=True, timeout=30)
@@ -6904,7 +9232,7 @@ class LauncherApp(ctk.CTk):
                             if hasattr(self, 'download_progressbar'):
                                 self.download_progressbar.set_progress(percent)
                             if percent % 10 == 0:
-                                self.log(f"📊 {description}: {percent}%")
+                                self.log(f"{description}: {percent}%")
             if hasattr(self, 'download_progressbar'):
                 self.download_progressbar.stop_animation()
                 self.download_progressbar.set(1.0)
@@ -6912,16 +9240,16 @@ class LauncherApp(ctk.CTk):
             if hasattr(self, 'download_spinner'):
                 self.download_spinner.stop()
             if hasattr(self, 'download_status_label'):
-                self.download_status_label.configure(text=f"✅ {description} завершено!", text_color="#6fce7f")
-            self.log(f"✅ {description} завершено!")
+                self.download_status_label.configure(text=f"{description} завершено!", text_color="#6fce7f")
+            self.log(f"{description} завершено!")
             self.after(2000, lambda: self.show_download_panel(False))
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка скачивания: {e}")
+            self.log(f"Не скачалось: {e}")
             if hasattr(self, 'download_spinner'):
                 self.download_spinner.stop()
             if hasattr(self, 'download_status_label'):
-                self.download_status_label.configure(text=f"❌ Ошибка: {e}", text_color="#d3453f")
+                self.download_status_label.configure(text=f"Ошибка: {e}", text_color="#d3453f")
             if hasattr(self, 'download_progressbar'):
                 self.download_progressbar.stop_animation()
                 self.download_progressbar.set(0.3)
@@ -6934,7 +9262,7 @@ class LauncherApp(ctk.CTk):
         self.settings["ram"] = self.ram_var.get()
         save_launcher_settings(self.settings)
         play_click()
-        self.log(f"💾 RAM по умолчанию: {self.settings['ram']} (сохранено)")
+        self.log(f"RAM по умолчанию: {self.settings['ram']} (сохранено)")
 
     def browse_game_dir(self):
         chosen = filedialog.askdirectory(title="Выбери папку игры",
@@ -6947,12 +9275,12 @@ class LauncherApp(ctk.CTk):
         new_dir = self.game_dir_entry.get().strip()
         if not new_dir:
             play_error()
-            show_error_toast(self, "Ошибка", "Путь не может быть пустым")
+            show_error_toast(self, "Не вышло", "Путь не может быть пустым")
             return
         self.settings["game_dir"] = new_dir
         save_launcher_settings(self.settings)
         play_click()
-        self.log(f"📁 Папка игры изменена на {new_dir} — перезапусти лаунчер")
+        self.log(f"Папка игры изменена на {new_dir} — перезапусти лаунчер")
         show_info_toast(self, "Сохранено", "Папка игры сохранена. Перезапусти лаунчер, чтобы применить.")
 
     def browse_java_path(self):
@@ -6967,7 +9295,7 @@ class LauncherApp(ctk.CTk):
         self.settings["java_path"] = new_path
         save_launcher_settings(self.settings)
         play_click()
-        self.log(f"☕ Путь к Java: {new_path or 'автоопределение'} (сохранено)")
+        self.log(f"Путь к Java: {new_path or 'автоопределение'} (сохранено)")
         show_info_toast(self, "Сохранено", "Путь к Java сохранён")
 
     def reset_java_path(self):
@@ -6975,20 +9303,20 @@ class LauncherApp(ctk.CTk):
         self.settings["java_path"] = ""
         save_launcher_settings(self.settings)
         play_click()
-        self.log("☕ Путь к Java сброшен — снова автоопределение")
+        self.log("Путь к Java сброшен — снова автоопределение")
 
     def toggle_game_logs(self):
         enabled = bool(self.game_logs_switch.get())
         self.settings["show_game_logs"] = enabled
         save_launcher_settings(self.settings)
-        self.log(f"🎮 Логи игры: {'включены' if enabled else 'выключены'}")
+        self.log(f"Логи игры: {'включены' if enabled else 'выключены'}")
 
     def save_ms_settings(self):
         self.settings["ms_client_id"] = self.ms_client_id_entry.get().strip() or DEFAULT_MS_CLIENT_ID
         self.settings["ms_redirect_uri"] = self.ms_redirect_entry.get().strip()
         save_launcher_settings(self.settings)
         play_click()
-        self.log("🔷 Настройки Microsoft-входа сохранены")
+        self.log("Настройки Microsoft-входа сохранены")
         show_info_toast(self, "Готово", "Настройки Microsoft-входа сохранены")
 
     def show_support_dialog(self):
@@ -7024,7 +9352,7 @@ class LauncherApp(ctk.CTk):
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(pady=(10, 5))
 
-        donate_btn = make_sound_button(btn_frame, text="💝 Поддержать",
+        donate_btn = make_sound_button(btn_frame, text="Поддержать",
                                        command=lambda: webbrowser.open("https://www.donationalerts.com/r/ionux"),
                                        width=170, height=50, fg_color="#d9622f", hover_color="#c14f26",
                                        font=ctk.CTkFont(size=15, weight="bold"))
@@ -7037,7 +9365,7 @@ class LauncherApp(ctk.CTk):
 
     def add_elyby_account_dialog(self):
         dialog = ctk.CTkToplevel(self)
-        dialog.title("🟢 Вход через Ely.by")
+        dialog.title("Вход через Ely.by")
         dialog.geometry("420x320")
         dialog.resizable(False, False)
         dialog.grab_set()
@@ -7046,7 +9374,7 @@ class LauncherApp(ctk.CTk):
         main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(main_frame, text="🟢 Вход через Ely.by", font=ctk.CTkFont(size=18, weight="bold"),
+        ctk.CTkLabel(main_frame, text="Вход через Ely.by", font=ctk.CTkFont(size=18, weight="bold"),
                      text_color="#6fce7f").pack(pady=(0, 10))
         ctk.CTkLabel(main_frame,
                      text="Ник или e-mail, и пароль от ely.by. Если у тебя уже\n"
@@ -7074,7 +9402,7 @@ class LauncherApp(ctk.CTk):
                 return
 
             final_password = f"{password}:{totp}" if totp else password
-            status_label.configure(text="⏳ Вход...", text_color="#d9622f")
+            status_label.configure(text="Вход...", text_color="#d9622f")
             dialog.update_idletasks()
 
             def worker():
@@ -7105,11 +9433,11 @@ class LauncherApp(ctk.CTk):
                 play_error()
                 status_label.configure(text=msg, text_color="#d3453f")
 
-        make_sound_button(main_frame, text="✅ Войти", command=do_submit,
+        make_sound_button(main_frame, text="Войти", command=do_submit,
                           fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=40).pack(
             fill="x", pady=(4, 8))
 
-        make_sound_button(main_frame, text="🌐 Открыть ely.by (регистрация / загрузка скина)",
+        make_sound_button(main_frame, text="Открыть ely.by (регистрация / загрузка скина)",
                           command=lambda: webbrowser.open("https://ely.by/skins"),
                           fg_color="#2b2840", hover_color="#3d3a52", height=32).pack(fill="x")
 
@@ -7117,7 +9445,7 @@ class LauncherApp(ctk.CTk):
         mods_path = os.path.join(MINECRAFT_DIR, "mods")
         os.makedirs(mods_path, exist_ok=True)
         os.startfile(mods_path)
-        self.log(f"📂 Открыта папка mods")
+        self.log(f"Открыта папка mods")
         play_click()
 
     def refresh_accounts(self):
@@ -7223,7 +9551,7 @@ class LauncherApp(ctk.CTk):
             username = entry.get().strip()
             if not username:
                 play_error()
-                show_error_toast(self, "Ошибка", "Имя пустым быть не может — придумай хоть что-нибудь")
+                show_error_toast(self, "Не вышло", "Имя пустым быть не может — придумай хоть что-нибудь")
                 return
             success, msg = add_account(username)
             if success:
@@ -7231,10 +9559,10 @@ class LauncherApp(ctk.CTk):
                 self.refresh_accounts_listbox()
                 dialog.destroy()
                 play_click()
-                show_info_toast(self, "Успешно", msg)
+                show_info_toast(self, "Готово", msg)
             else:
                 play_error()
-                show_error_toast(self, "Ошибка", msg)
+                show_error_toast(self, "Не вышло", msg)
 
         make_sound_button(dialog, text="Добавить", command=confirm,
                           fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f").pack(pady=10)
@@ -7250,11 +9578,11 @@ class LauncherApp(ctk.CTk):
             login_url, state, code_verifier = mll.microsoft_account.get_secure_login_data(client_id, redirect_uri)
         except Exception as e:
             play_error()
-            show_error_toast(self, "Ошибка", f"Не получилось построить ссылку входа:\n{e}")
+            show_error_toast(self, "Не вышло", f"Не получилось построить ссылку входа:\n{e}")
             return
 
         dialog = ctk.CTkToplevel(self)
-        dialog.title("🔷 Вход через Microsoft")
+        dialog.title("Вход через Microsoft")
         dialog.geometry("420x170")
         dialog.resizable(False, False)
         dialog.grab_set()
@@ -7263,9 +9591,9 @@ class LauncherApp(ctk.CTk):
         main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ctk.CTkLabel(main_frame, text="🔷 Вход через Microsoft", font=ctk.CTkFont(size=18, weight="bold"),
+        ctk.CTkLabel(main_frame, text="Вход через Microsoft", font=ctk.CTkFont(size=18, weight="bold"),
                      text_color="#6d92ff").pack(pady=(0, 10))
-        status_label = ctk.CTkLabel(main_frame, text="⏳ Открываю окно входа...",
+        status_label = ctk.CTkLabel(main_frame, text="Открываю окно входа...",
                                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", wraplength=360, justify="left")
         status_label.pack(pady=(0, 10))
 
@@ -7385,25 +9713,25 @@ class LauncherApp(ctk.CTk):
     def delete_selected_account(self):
         if not self._accounts_order:
             play_error()
-            show_error_toast(self, "Ошибка", "Удалять нечего, аккаунтов нет")
+            show_error_toast(self, "Не вышло", "Удалять нечего, аккаунтов нет")
             return
         if not self._selected_account_username:
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала кликни по аккаунту в списке, который хочешь удалить")
+            show_error_toast(self, "Не вышло", "Сначала кликни по аккаунту в списке, который хочешь удалить")
             return
 
         username = self._selected_account_username
-        if messagebox.askyesno("Подтверждение", f"Удалить аккаунт '{username}'?"):
+        if messagebox.askyesno("Точно?", f"Удалить аккаунт '{username}'?"):
             success, msg = delete_account(username)
             if success:
                 self._selected_account_username = None
                 self.refresh_accounts()
                 self.refresh_accounts_listbox()
                 play_click()
-                show_info_toast(self, "Успешно", msg)
+                show_info_toast(self, "Готово", msg)
             else:
                 play_error()
-                show_error_toast(self, "Ошибка", msg)
+                show_error_toast(self, "Не вышло", msg)
 
     def refresh_mods_list(self):
         self.installed_listbox.delete(0, "end")
@@ -7418,20 +9746,20 @@ class LauncherApp(ctk.CTk):
         selection = self.installed_listbox.curselection()
         if not selection:
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала ткни в мод, который хочешь удалить")
+            show_error_toast(self, "Не вышло", "Сначала ткни в мод, который хочешь удалить")
             return
         mod_name = self.installed_listbox.get(selection[0])
         if "Моды не установлены" in mod_name:
             return
         mod_name = mod_name.replace("📦 ", "").strip()
-        if messagebox.askyesno("Подтверждение", f"Удалить мод '{mod_name}'?"):
+        if messagebox.askyesno("Точно?", f"Удалить мод '{mod_name}'?"):
             if delete_mod(mod_name):
                 self.refresh_mods_list()
                 play_click()
-                show_info_toast(self, "Успешно", "Готово, мода больше нет")
+                show_info_toast(self, "Готово", "Готово, мода больше нет")
             else:
                 play_error()
-                show_error_toast(self, "Ошибка", "Мод не удалился, что-то пошло не так")
+                show_error_toast(self, "Не вышло", "Мод не удалился, что-то пошло не так")
 
     def read_pack_meta(self, pack_path):
         info = {"description": "Без описания", "pack_format": "неизвестно"}
@@ -7494,7 +9822,7 @@ class LauncherApp(ctk.CTk):
 
     def install_resourcepack(self):
         file_path = filedialog.askopenfilename(
-            title="Выберите ресурспак (.zip или папка)",
+            title="Выбери ресурспак (.zip или папка)",
             filetypes=[("ZIP архивы", "*.zip"), ("Все файлы", "*.*")]
         )
         if not file_path:
@@ -7508,19 +9836,19 @@ class LauncherApp(ctk.CTk):
                 shutil.copy2(file_path, dest_path)
             else:
                 shutil.copytree(file_path, dest_path, dirs_exist_ok=True)
-            self.log(f"✅ Ресурспак установлен: {filename}")
+            self.log(f"Ресурспак встал: {filename}")
             play_click()
-            show_info_toast(self, "Успешно", f"Ресурспак '{filename}' на месте")
+            show_info_toast(self, "Готово", f"Ресурспак '{filename}' на месте")
             self.refresh_resourcepacks()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка установки ресурспака: {e}")
+            self.log(f"Ресурспак не встал: {e}")
             play_error()
-            show_error_toast(self, "Ошибка", f"Ресурспак не встал:\n{e}")
+            show_error_toast(self, "Не вышло", f"Ресурспак не встал:\n{e}")
             return False
 
     def delete_resourcepack(self, pack_name):
-        if not messagebox.askyesno("Подтверждение", f"Удалить ресурспак '{pack_name}'?"):
+        if not messagebox.askyesno("Точно?", f"Удалить ресурспак '{pack_name}'?"):
             return False
         packs_path = os.path.join(MINECRAFT_DIR, "resourcepacks")
         pack_path = os.path.join(packs_path, pack_name)
@@ -7529,22 +9857,22 @@ class LauncherApp(ctk.CTk):
                 shutil.rmtree(pack_path)
             elif os.path.isfile(pack_path):
                 os.remove(pack_path)
-            self.log(f"🗑️ Ресурспак удален: {pack_name}")
+            self.log(f"Ресурспак удален: {pack_name}")
             play_click()
-            show_info_toast(self, "Успешно", f"Ресурспак '{pack_name}' снесён")
+            show_info_toast(self, "Готово", f"Ресурспак '{pack_name}' снесён")
             self.refresh_resourcepacks()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка удаления ресурспака: {e}")
+            self.log(f"Ресурспак не удалился: {e}")
             play_error()
-            show_error_toast(self, "Ошибка", f"Не вышло удалить ресурспак:\n{e}")
+            show_error_toast(self, "Не вышло", f"Не вышло удалить ресурспак:\n{e}")
             return False
 
     def delete_selected_resourcepack(self):
         selection = self.resourcepacks_listbox.curselection()
         if not selection:
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала выбери ресурспак")
+            show_error_toast(self, "Не вышло", "Сначала выбери ресурспак")
             return
         selected_text = self.resourcepacks_listbox.get(selection[0])
         if "📭" in selected_text:
@@ -7585,7 +9913,7 @@ class LauncherApp(ctk.CTk):
 
     def import_skin(self):
         file_path = filedialog.askopenfilename(
-            title="Выберите скин (PNG или JPG)",
+            title="Выбери скин (PNG или JPG)",
             filetypes=[("PNG изображения", "*.png"), ("JPG изображения", "*.jpg"), ("Все файлы", "*.*")]
         )
         if not file_path:
@@ -7594,44 +9922,44 @@ class LauncherApp(ctk.CTk):
         filename = os.path.basename(file_path)
         dest_path = os.path.join(skins_path, filename)
         if os.path.exists(dest_path):
-            if not messagebox.askyesno("Файл существует", f"Скин '{filename}' уже существует.\n\nЗаменить?"):
+            if not messagebox.askyesno("Уже есть такой файл", f"Скин '{filename}' уже есть.\n\nЗаменить?"):
                 return False
         try:
             shutil.copy2(file_path, dest_path)
-            self.log(f"✅ Скин импортирован: {filename}")
+            self.log(f"Скин импортирован: {filename}")
             play_click()
-            show_info_toast(self, "Успешно", f"Скин '{filename}' добавлен")
+            show_info_toast(self, "Готово", f"Скин '{filename}' добавлен")
             self.refresh_skins()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка импорта скина: {e}")
+            self.log(f"Скин не импортировался: {e}")
             play_error()
-            show_error_toast(self, "Ошибка", f"Скин не добавился:\n{e}")
+            show_error_toast(self, "Не вышло", f"Скин не добавился:\n{e}")
             return False
 
     def delete_skin(self, skin_name):
-        if not messagebox.askyesno("Подтверждение", f"Удалить скин '{skin_name}'?"):
+        if not messagebox.askyesno("Точно?", f"Удалить скин '{skin_name}'?"):
             return False
         skins_path = get_skins_folder()
         skin_path = os.path.join(skins_path, skin_name)
         try:
             os.remove(skin_path)
-            self.log(f"🗑️ Скин удален: {skin_name}")
+            self.log(f"Скин удален: {skin_name}")
             play_click()
-            show_info_toast(self, "Успешно", f"Скин '{skin_name}' снесён")
+            show_info_toast(self, "Готово", f"Скин '{skin_name}' снесён")
             self.refresh_skins()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка удаления скина: {e}")
+            self.log(f"Скин не удалился: {e}")
             play_error()
-            show_error_toast(self, "Ошибка", f"Скин не удалился:\n{e}")
+            show_error_toast(self, "Не вышло", f"Скин не удалился:\n{e}")
             return False
 
     def delete_selected_skin(self):
         selection = self.skins_listbox.curselection()
         if not selection:
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала выбери скин")
+            show_error_toast(self, "Не вышло", "Сначала выбери скин")
             return
         selected_text = self.skins_listbox.get(selection[0])
         if "📭" in selected_text:
@@ -7655,7 +9983,7 @@ class LauncherApp(ctk.CTk):
         skin_path = os.path.join(skins_path, skin_name)
         if not os.path.exists(skin_path):
             play_error()
-            show_error_toast(self, "Ошибка", f"Скин '{skin_name}' куда-то делся")
+            show_error_toast(self, "Не вышло", f"Скин '{skin_name}' куда-то делся")
             return
         try:
             image = Image.open(skin_path)
@@ -7693,12 +10021,12 @@ class LauncherApp(ctk.CTk):
             preview_window.protocol("WM_DELETE_WINDOW", on_close)
         except Exception as e:
             play_error()
-            show_error_toast(self, "Ошибка", f"Скин не открылся:\n{e}")
+            show_error_toast(self, "Не вышло", f"Скин не открылся:\n{e}")
 
     def open_skins_folder(self):
         skins_path = get_skins_folder()
         os.startfile(skins_path)
-        self.log(f"📂 Открыта папка скинов")
+        self.log(f"Открыта папка скинов")
         play_click()
 
     def show_skin_info(self, skin_name):
@@ -7740,7 +10068,7 @@ class LauncherApp(ctk.CTk):
         pack = self.installed_rp_packs[index]
 
         self.rp_desc_title.configure(text=pack['name'])
-        self.rp_desc_meta.configure(text=f"💾 {pack['size']}   🔧 Pack format: {pack['pack_format']}")
+        self.rp_desc_meta.configure(text=f"{pack['size']}   Pack format: {pack['pack_format']}")
 
         self.rp_desc_text.configure(state="normal")
         self.rp_desc_text.delete("1.0", "end")
@@ -7771,19 +10099,27 @@ class LauncherApp(ctk.CTk):
 
         title_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
         title_frame.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_frame, text="⚡ 67Launcher", font=ctk.CTkFont(size=28, weight="bold"),
+        ctk.CTkLabel(title_frame, text="67Launcher", font=ctk.CTkFont(size=28, weight="bold"),
                      text_color="#6d92ff").pack(side="left")
         launch_display = self.settings.get('launch_count', 0)
         launch_text = "обнулен" if launch_display == 0 else str(launch_display)
-        self.subtitle_label = ctk.CTkLabel(title_frame, text=f"📁 {MINECRAFT_DIR} | Запуск #{launch_text}",
+        self.subtitle_label = ctk.CTkLabel(title_frame, text=f"{MINECRAFT_DIR} | Запуск #{launch_text}",
                                            font=ctk.CTkFont(size=11), text_color="#a8a4bd", cursor="hand2")
         self.subtitle_label.pack(side="left", padx=(10, 0))
         self.subtitle_label.bind("<Button-1>", lambda e: self.copy_game_path())
 
+        self.google_account_btn = make_sound_button(
+            top_frame,
+            text=f"👤 {str(self.settings.get('launcher_google_name') or 'Аккаунт')[:22]}",
+            command=self._open_launcher_account_window,
+            width=180, height=35, fg_color="#2b2840", hover_color="#3d3a52",
+            font=ctk.CTkFont(size=12, weight="bold"))
+        self.google_account_btn.grid(row=0, column=1, sticky="e", padx=(10, 0))
+
         chat_btn = make_sound_button(top_frame, text="💬 Чат", command=self.open_chat_window,
                                      width=100, height=35, fg_color="#6d92ff", hover_color="#5a7dd8",
                                      font=ctk.CTkFont(size=13, weight="bold"))
-        chat_btn.grid(row=0, column=1, sticky="e", padx=(10, 0))
+        chat_btn.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         self.tab_view = ctk.CTkTabview(self.main_container, command=close_all_toasts)
         self.tab_view.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
@@ -7791,8 +10127,8 @@ class LauncherApp(ctk.CTk):
         self.tab_view.add("📦 Установка")
         self.tab_view.add("👤 Аккаунты")
         self.tab_view.add("📦 Моды")
-        self.tab_view.add("🎨 Скины")
         self.tab_view.add("📦 Ресурспаки")
+        self.tab_view.add("🔆 Шейдеры")
         self.tab_view.add("⚙️ Настройки")
         self.tab_view.add("📊 Статистика")
 
@@ -7800,8 +10136,8 @@ class LauncherApp(ctk.CTk):
         self.create_install_tab()
         self.create_accounts_tab()
         self.create_mods_tab()
-        self.create_skins_tab()
         self.create_resourcepacks_tab()
+        self.create_shaders_tab()
         self.create_settings_tab()
         self.create_stats_tab()
         self.create_download_panel()
@@ -7832,13 +10168,13 @@ class LauncherApp(ctk.CTk):
         header_frame.grid(row=0, column=0, sticky="ew", pady=(5, 0))
         header_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(header_frame, text="📋 Консоль", font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0,
+        ctk.CTkLabel(header_frame, text="Консоль", font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0,
                                                                                                     sticky="w", padx=5)
-        copy_btn = make_sound_button(header_frame, text="📄 Копировать", command=self.copy_console_log,
+        copy_btn = make_sound_button(header_frame, text="Копировать", command=self.copy_console_log,
                                      fg_color="#6d92ff", hover_color="#5a7dd8", height=25, width=100,
                                      font=ctk.CTkFont(size=11))
         copy_btn.grid(row=0, column=1, padx=5)
-        clear_btn = make_sound_button(header_frame, text="🗑️ Очистить", command=self.clear_console, fg_color="#d3453f",
+        clear_btn = make_sound_button(header_frame, text="Очистить", command=self.clear_console, fg_color="#d3453f",
                                       hover_color="#b83530", height=25, width=80, font=ctk.CTkFont(size=11))
         clear_btn.grid(row=0, column=2, padx=5)
 
@@ -7854,7 +10190,7 @@ class LauncherApp(ctk.CTk):
         main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
         main_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(main_frame, text="🎮 Запуск игры", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0,
+        ctk.CTkLabel(main_frame, text="Запуск игры", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0,
                                                                                                       pady=(0, 20))
         ctk.CTkLabel(main_frame, text="👤 Аккаунт:", font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="w")
         self.account_combo = ctk.CTkComboBox(
@@ -7876,7 +10212,7 @@ class LauncherApp(ctk.CTk):
                                                 max_visible_items=10, command=self.on_version_combo_change)
         self.version_combo.grid(row=4, column=0, sticky="w", pady=(0, 15))
 
-        ctk.CTkLabel(main_frame, text="💾 RAM:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
+        ctk.CTkLabel(main_frame, text="RAM:", font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="w")
         self.ram_var = ctk.StringVar(value=self.settings.get("ram", "2G"))
         ram_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         ram_frame.grid(row=6, column=0, sticky="w", pady=(0, 20))
@@ -7884,18 +10220,18 @@ class LauncherApp(ctk.CTk):
             ctk.CTkRadioButton(ram_frame, text=ram, variable=self.ram_var, value=ram,
                               command=self.save_ram_setting).pack(side="left", padx=5)
 
-        self.launch_status_label = ctk.CTkLabel(main_frame, text="✅ Погнали", font=ctk.CTkFont(size=13))
+        self.launch_status_label = ctk.CTkLabel(main_frame, text="Погнали", font=ctk.CTkFont(size=13))
         self.launch_status_label.grid(row=7, column=0, sticky="w", pady=(0, 10))
 
         self.launch_progressbar = AnimatedProgressBar(main_frame, width=300, height=15)
         self.launch_progressbar.grid(row=8, column=0, sticky="ew", pady=(0, 15))
 
-        self.launch_btn = make_sound_button(main_frame, text="🚀 ЗАПУСТИТЬ ИГРУ", command=self.launch_game, height=50,
+        self.launch_btn = make_sound_button(main_frame, text="ЗАПУСТИТЬ ИГРУ", command=self.launch_game, height=50,
                                             font=ctk.CTkFont(size=16, weight="bold"), fg_color="#7896f7",
                                             hover_color="#5f7fe0")
         self.launch_btn.grid(row=9, column=0, sticky="ew", pady=(0, 10))
 
-        self.timer_label = ctk.CTkLabel(main_frame, text="⏱ Время игры: 0с", font=ctk.CTkFont(size=13))
+        self.timer_label = ctk.CTkLabel(main_frame, text="Время игры: 0с", font=ctk.CTkFont(size=13))
         self.timer_label.grid(row=10, column=0, sticky="w")
 
     def create_install_tab(self):
@@ -7956,11 +10292,11 @@ class LauncherApp(ctk.CTk):
         self.version_results_frame.grid_columnconfigure(0, weight=1)
         self.version_result_widgets = []
 
-        self.install_file_label = ctk.CTkLabel(main_frame, text="❌ Файл не выбран (только для OptiFine)",
+        self.install_file_label = ctk.CTkLabel(main_frame, text="Файл не выбран (только для OptiFine)",
                                                text_color="#d3453f")
         self.install_file_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
 
-        select_file_btn = make_sound_button(main_frame, text="📂 Выбрать файл OptiFine",
+        select_file_btn = make_sound_button(main_frame, text="Выбрать файл OptiFine",
                                             command=self.select_optifine_file, fg_color="#d9622f",
                                             hover_color="#c14f26", text_color="#16141f")
         select_file_btn.grid(row=6, column=0, sticky="w", pady=(0, 12))
@@ -7971,17 +10307,130 @@ class LauncherApp(ctk.CTk):
         self.install_progressbar = AnimatedProgressBar(main_frame, width=300, height=15)
         self.install_progressbar.grid(row=9, column=0, sticky="ew", pady=(0, 12))
 
-        self.install_btn = make_sound_button(main_frame, text="📥 УСТАНОВИТЬ", command=self.install_selected_client,
+        self.install_btn = make_sound_button(main_frame, text="УСТАНОВИТЬ", command=self.install_selected_client,
                                              height=35, font=ctk.CTkFont(size=16, weight="bold"), fg_color="#6fce7f",
                                              hover_color="#5cb56c", text_color="#16141f")
         self.install_btn.grid(row=7, column=0, sticky="ew")
 
+        self.shortcut_btn = make_sound_button(main_frame, text="Создать ярлык запуска игры",
+                                              command=self.open_game_shortcut_dialog, height=35,
+                                              fg_color="#2b2840", hover_color="#3d3a52",
+                                              text_color="#e0ddf0")
+        self.shortcut_btn.grid(row=10, column=0, sticky="ew", pady=(0, 4))
+        ctk.CTkLabel(main_frame, text="Ярлык на рабочем столе запускает игру сразу, без окна лаунчера",
+                     font=ctk.CTkFont(size=11), text_color="#a8a4bd").grid(row=11, column=0, sticky="w")
+
         self.show_install_versions_placeholder()
+
+    def open_game_shortcut_dialog(self):
+        installed = [v["id"] for v in scan_versions()]
+        if not installed:
+            play_error()
+            show_error_toast(self, "Не вышло", "Версий пока нет — сначала поставь хотя бы одну")
+            return
+        accounts = [acc["username"] for acc in load_accounts() if acc.get("username")]
+        if not accounts:
+            play_error()
+            show_error_toast(self, "Не вышло", "Аккаунта нет — сначала создай")
+            return
+
+        # Сначала берём версию, которую человек только что выбрал/вписал в установке,
+        # потом ту, что стоит в главном окне, иначе первую из установленных
+        typed = self.version_search_entry.get().strip()
+        current = self.version_combo.get()
+        default_version = next((v for v in (typed, current) if v in installed), installed[0])
+        current_account = self.account_combo.get()
+        default_account = current_account if current_account in accounts else accounts[0]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Ярлык запуска игры")
+        dialog.geometry("440x470")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.focus_force()
+
+        ctk.CTkLabel(dialog, text="Ярлык запуска игры", font=ctk.CTkFont(size=18, weight="bold")).pack(
+            pady=(18, 4))
+        ctk.CTkLabel(dialog, text="Лаунчер при этом не откроется: мелькнёт сплеш с прогрессом "
+                                  "и сразу запустится Minecraft.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", wraplength=380,
+                     justify="center").pack(pady=(0, 12))
+
+        ctk.CTkLabel(dialog, text="📦 Версия:", font=ctk.CTkFont(size=13), anchor="w").pack(fill="x", padx=30)
+        version_box = ctk.CTkComboBox(dialog, values=installed, state="readonly", height=35)
+        version_box.set(default_version)
+        version_box.pack(fill="x", padx=30, pady=(2, 10))
+
+        ctk.CTkLabel(dialog, text="👤 Аккаунт:", font=ctk.CTkFont(size=13), anchor="w").pack(fill="x", padx=30)
+        account_box = ctk.CTkComboBox(dialog, values=accounts, state="readonly", height=35)
+        account_box.set(default_account)
+        account_box.pack(fill="x", padx=30, pady=(2, 10))
+
+        ctk.CTkLabel(dialog, text="Название ярлыка:", font=ctk.CTkFont(size=13), anchor="w").pack(
+            fill="x", padx=30)
+        name_entry = ctk.CTkEntry(dialog, height=35)
+        name_entry.insert(0, f"Minecraft {default_version}")
+        name_entry.pack(fill="x", padx=30, pady=(2, 10))
+
+        def on_version_change(choice):
+            # Название подстраиваем под версию, только если человек его сам не менял
+            auto_names = {f"Minecraft {v}" for v in installed}
+            if name_entry.get().strip() in auto_names or not name_entry.get().strip():
+                name_entry.delete(0, "end")
+                name_entry.insert(0, f"Minecraft {choice}")
+
+        version_box.configure(command=on_version_change)
+
+        start_menu_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(dialog, text="Ещё добавить в меню «Пуск»", variable=start_menu_var,
+                        font=ctk.CTkFont(size=12)).pack(anchor="w", padx=30, pady=(0, 14))
+
+        def finish(paths, error):
+            try:
+                if not dialog.winfo_exists():
+                    return
+            except Exception:
+                return
+            if error:
+                create_btn.configure(state="normal", text="Создать ярлык")
+                play_error()
+                show_error_toast(self, "Не вышло", f"Не вышло создать ярлык: {error}")
+                return
+            self.log(f"Ярлык создан: {', '.join(paths)}")
+            dialog.destroy()
+            show_info_toast(self, "Готово", "Готово! Ярлык лежит на рабочем столе — жми и играй")
+
+        def confirm():
+            version, account, name = version_box.get(), account_box.get(), name_entry.get().strip()
+            if not name:
+                play_error()
+                show_error_toast(self, "Не вышло", "Назови ярлык хоть как-нибудь")
+                return
+            create_btn.configure(state="disabled", text="Создаю...")
+            with_start_menu = bool(start_menu_var.get())
+
+            def worker():
+                try:
+                    paths, error = create_game_shortcut(version, account, name, with_start_menu), None
+                except Exception as e:
+                    paths, error = [], str(e)
+                self.after(0, lambda: finish(paths, error))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        create_btn = make_sound_button(dialog, text="Создать ярлык", command=confirm, height=38,
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f")
+        create_btn.pack(fill="x", padx=30, pady=(0, 8))
+        make_sound_button(dialog, text="Отмена", command=dialog.destroy, height=32,
+                          fg_color="#2b2840", hover_color="#3d3a52", text_color="#e0ddf0").pack(
+            fill="x", padx=30)
 
     def show_install_versions_placeholder(self):
         for widget in self.version_results_frame.winfo_children():
             widget.destroy()
-        ctk.CTkLabel(self.version_results_frame, text="⏳ Список версий ещё грузится...",
+        ctk.CTkLabel(self.version_results_frame, text="Список версий ещё грузится...",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").pack(pady=15)
 
     def refresh_available_versions(self):
@@ -8113,19 +10562,19 @@ class LauncherApp(ctk.CTk):
         btn_frame.grid_columnconfigure(0, weight=1)
         btn_frame.grid_columnconfigure(1, weight=1)
 
-        add_btn = make_sound_button(btn_frame, text="➕ Добавить", command=self.add_account_dialog, fg_color="#6fce7f",
+        add_btn = make_sound_button(btn_frame, text="Добавить", command=self.add_account_dialog, fg_color="#6fce7f",
                                     hover_color="#5cb56c", text_color="#16141f")
         add_btn.grid(row=0, column=0, padx=5)
-        delete_btn = make_sound_button(btn_frame, text="🗑️ Удалить", command=self.delete_selected_account,
+        delete_btn = make_sound_button(btn_frame, text="Удалить", command=self.delete_selected_account,
                                        fg_color="#d3453f", hover_color="#b83530")
         delete_btn.grid(row=0, column=1, padx=5)
 
-        ms_btn = make_sound_button(left_frame, text="🔷 Добавить лицензионный (Microsoft)",
+        ms_btn = make_sound_button(left_frame, text="Добавить лицензионный (Microsoft)",
                                    command=self.add_microsoft_account_dialog,
                                    fg_color="#2b2840", hover_color="#3d3a52")
         ms_btn.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
-        elyby_btn = make_sound_button(left_frame, text="🟢 Добавить Ely.by",
+        elyby_btn = make_sound_button(left_frame, text="Добавить Ely.by",
                                       command=self.add_elyby_account_dialog,
                                       fg_color="#2b2840", hover_color="#3d3a52")
         elyby_btn.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -8135,7 +10584,7 @@ class LauncherApp(ctk.CTk):
         right_frame.grid_columnconfigure(0, weight=1)
         right_frame.grid_rowconfigure(0, weight=1)
 
-        ctk.CTkLabel(right_frame, text="ℹ️ Информация", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0,
+        ctk.CTkLabel(right_frame, text="Информация", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0,
                                                                                                        pady=(0, 10))
         info_text = """📌 Как это работает:
 
@@ -8164,17 +10613,17 @@ class LauncherApp(ctk.CTk):
         left_frame.grid_columnconfigure(0, weight=1)
         left_frame.grid_rowconfigure(7, weight=1)
 
-        ctk.CTkLabel(left_frame, text="🔍 Поиск модов", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0,
+        ctk.CTkLabel(left_frame, text="Поиск модов", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0,
                                                                                                       pady=(0, 10))
 
-        ctk.CTkLabel(left_frame, text="🎮 Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(row=1,
+        ctk.CTkLabel(left_frame, text="Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(row=1,
                                                                                                             column=0,
                                                                                                             sticky="w")
         self.mod_version_entry = ctk.CTkEntry(left_frame, placeholder_text="1.20.4", height=32)
         self.mod_version_entry.insert(0, "1.20.1")
         self.mod_version_entry.grid(row=2, column=0, sticky="w", pady=(0, 5))
 
-        ctk.CTkLabel(left_frame, text="🔧 Загрузчик:", font=ctk.CTkFont(size=13, weight="bold")).grid(row=3, column=0,
+        ctk.CTkLabel(left_frame, text="Загрузчик:", font=ctk.CTkFont(size=13, weight="bold")).grid(row=3, column=0,
                                                                                                      sticky="w")
         self.mod_loader_var = ctk.StringVar(value="fabric")
         loader_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
@@ -8183,11 +10632,11 @@ class LauncherApp(ctk.CTk):
             ctk.CTkRadioButton(loader_frame, text=text, variable=self.mod_loader_var, value=value).pack(side="left",
                                                                                                         padx=5)
 
-        self.mod_search_entry = ctk.CTkEntry(left_frame, placeholder_text="Введите название мода...", height=32)
+        self.mod_search_entry = ctk.CTkEntry(left_frame, placeholder_text="Название мода...", height=32)
         self.mod_search_entry.grid(row=5, column=0, sticky="ew", pady=(0, 5))
         self.mod_search_entry.bind("<Return>", lambda e: self.search_mods())
 
-        search_btn = make_sound_button(left_frame, text="🔍 Искать", command=self.search_mods, height=32,
+        search_btn = make_sound_button(left_frame, text="Искать", command=self.search_mods, height=32,
                                        fg_color="#6d92ff", hover_color="#5a7dd8")
         search_btn.grid(row=6, column=0, sticky="ew", pady=(0, 5))
 
@@ -8197,7 +10646,7 @@ class LauncherApp(ctk.CTk):
         self.mod_cards = []
         self.show_mod_results_placeholder()
 
-        self.install_mod_btn = make_sound_button(left_frame, text="📥 УСТАНОВИТЬ МОД", command=self.install_selected_mod,
+        self.install_mod_btn = make_sound_button(left_frame, text="УСТАНОВИТЬ МОД", command=self.install_selected_mod,
                                                  height=40, fg_color="#6fce7f", hover_color="#5cb56c",
                                                  text_color="#16141f", font=ctk.CTkFont(size=14, weight="bold"),
                                                  state="disabled")
@@ -8229,15 +10678,15 @@ class LauncherApp(ctk.CTk):
         btn_frame.grid_columnconfigure(0, weight=1)
         btn_frame.grid_columnconfigure(1, weight=1)
 
-        refresh_btn = make_sound_button(btn_frame, text="🔄 Обновить", command=self.refresh_mods_list, height=35,
+        refresh_btn = make_sound_button(btn_frame, text="Обновить", command=self.refresh_mods_list, height=35,
                                         fg_color="#6d92ff", hover_color="#5a7dd8")
         refresh_btn.grid(row=0, column=0, padx=5)
 
-        delete_mod_btn = make_sound_button(btn_frame, text="🗑️ Удалить", command=self.delete_selected_mod, height=35,
+        delete_mod_btn = make_sound_button(btn_frame, text="Удалить", command=self.delete_selected_mod, height=35,
                                            fg_color="#d3453f", hover_color="#b83530")
         delete_mod_btn.grid(row=0, column=1, padx=5)
 
-        ctk.CTkLabel(right_frame, text="ℹ️ О выбранном моде", font=ctk.CTkFont(size=16, weight="bold")).grid(
+        ctk.CTkLabel(right_frame, text="О выбранном моде", font=ctk.CTkFont(size=16, weight="bold")).grid(
             row=3, column=0, sticky="w", pady=(15, 5))
 
         self.mod_desc_card = ctk.CTkFrame(right_frame, fg_color=self.get_theme_colors()["card_bg"], corner_radius=10)
@@ -8262,7 +10711,7 @@ class LauncherApp(ctk.CTk):
         self.mod_desc_text.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=15, pady=(0, 15))
         self.mod_desc_text.configure(state="disabled")
 
-        self.mod_desc_open_btn = make_sound_button(self.mod_desc_card, text="🌐 Открыть на Modrinth",
+        self.mod_desc_open_btn = make_sound_button(self.mod_desc_card, text="Открыть на Modrinth",
                                                    command=self.open_selected_mod_page,
                                                    fg_color="#6d92ff", hover_color="#5a7dd8",
                                                    height=32, state="disabled")
@@ -8284,7 +10733,7 @@ class LauncherApp(ctk.CTk):
         left_frame.grid_columnconfigure(0, weight=1)
         left_frame.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(left_frame, text="📋 Установленные скины", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0,
+        ctk.CTkLabel(left_frame, text="Установленные скины", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0,
                                                                                                               column=0,
                                                                                                               sticky="w",
                                                                                                               padx=10,
@@ -8305,22 +10754,22 @@ class LauncherApp(ctk.CTk):
         btn_frame.grid_columnconfigure(1, weight=1)
         btn_frame.grid_columnconfigure(2, weight=1)
 
-        import_btn = make_sound_button(btn_frame, text="📥 Добавить", command=self.import_skin, fg_color="#6fce7f",
+        import_btn = make_sound_button(btn_frame, text="Добавить", command=self.import_skin, fg_color="#6fce7f",
                                        hover_color="#5cb56c", text_color="#16141f", height=35)
         import_btn.grid(row=0, column=0, padx=2)
 
-        preview_btn = make_sound_button(btn_frame, text="👁️ Превью", command=self.preview_skin, fg_color="#6d92ff",
+        preview_btn = make_sound_button(btn_frame, text="Превью", command=self.preview_skin, fg_color="#6d92ff",
                                         hover_color="#5a7dd8", height=35)
         preview_btn.grid(row=0, column=1, padx=2)
 
-        delete_btn = make_sound_button(btn_frame, text="🗑️ Удалить", command=self.delete_selected_skin,
+        delete_btn = make_sound_button(btn_frame, text="Удалить", command=self.delete_selected_skin,
                                        fg_color="#d3453f", hover_color="#b83530", height=35)
         delete_btn.grid(row=0, column=2, padx=2)
 
         elyby_frame = ctk.CTkFrame(left_frame, fg_color="#201d30", corner_radius=8)
         elyby_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(10, 0))
 
-        ctk.CTkLabel(elyby_frame, text="🟢 Скин через Ely.by — без модов",
+        ctk.CTkLabel(elyby_frame, text="Скин через Ely.by — без модов",
                      font=ctk.CTkFont(size=13, weight="bold"), text_color="#6fce7f").pack(anchor="w", padx=12,
                                                                                           pady=(10, 2))
         ctk.CTkLabel(elyby_frame,
@@ -8337,12 +10786,12 @@ class LauncherApp(ctk.CTk):
         elyby_btn_row.grid_columnconfigure(0, weight=1)
         elyby_btn_row.grid_columnconfigure(1, weight=1)
 
-        elyby_upload_btn = make_sound_button(elyby_btn_row, text="🌐 Открыть ely.by и загрузить скин",
+        elyby_upload_btn = make_sound_button(elyby_btn_row, text="Открыть ely.by и загрузить скин",
                                              command=lambda: webbrowser.open("https://ely.by/skins"),
                                              fg_color="#2b2840", hover_color="#3d3a52", height=32)
         elyby_upload_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
-        elyby_login_btn = make_sound_button(elyby_btn_row, text="🟢 Войти через Ely.by",
+        elyby_login_btn = make_sound_button(elyby_btn_row, text="Войти через Ely.by",
                                             command=self.add_elyby_account_dialog,
                                             fg_color="#6fce7f", hover_color="#5cb56c",
                                             text_color="#16141f", height=32)
@@ -8353,7 +10802,7 @@ class LauncherApp(ctk.CTk):
         right_frame.grid_columnconfigure(0, weight=1)
         right_frame.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(right_frame, text="ℹ️ Информация о скине", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0,
+        ctk.CTkLabel(right_frame, text="Информация о скине", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0,
                                                                                                                column=0,
                                                                                                                sticky="w",
                                                                                                                padx=10,
@@ -8365,9 +10814,414 @@ class LauncherApp(ctk.CTk):
         self.skin_info.insert("1.0", "Тыкни в скин — покажу инфу")
         self.skin_info.configure(state="disabled")
 
-        open_folder_btn = make_sound_button(right_frame, text="📂 Открыть папку", command=self.open_skins_folder,
+        open_folder_btn = make_sound_button(right_frame, text="Открыть папку", command=self.open_skins_folder,
                                             fg_color="#d9622f", hover_color="#c14f26", text_color="#16141f", height=35)
         open_folder_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+
+
+    def create_shaders_tab(self):
+        tab = self.tab_view.tab("🔆 Шейдеры")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left_frame = ctk.CTkFrame(tab)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=20)
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(6, weight=1)
+
+        ctk.CTkLabel(left_frame, text="Поиск шейдеров",
+                     font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, pady=(0, 10))
+        ctk.CTkLabel(left_frame, text="Версия Minecraft:",
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=1, column=0, sticky="w")
+
+        self.shader_version_entry = ctk.CTkEntry(left_frame, placeholder_text="1.20.1", height=32)
+        self.shader_version_entry.insert(0, "1.20.1")
+        self.shader_version_entry.grid(row=2, column=0, sticky="w", pady=(0, 5))
+
+        self.shader_search_entry = ctk.CTkEntry(left_frame, placeholder_text="Название шейдера...", height=32)
+        self.shader_search_entry.grid(row=3, column=0, sticky="ew", pady=(0, 5))
+        self.shader_search_entry.bind("<Return>", lambda e: self.search_shaders_web())
+
+        make_sound_button(left_frame, text="Искать", command=self.search_shaders_web,
+                          height=32, fg_color="#6d92ff", hover_color="#5a7dd8").grid(
+                              row=4, column=0, sticky="ew", pady=(0, 5))
+
+        make_sound_button(left_frame, text="🔥 Популярные", command=lambda: self.search_shaders_web(popular=True), height=32, fg_color="#8b5cf6", hover_color="#7446d6").grid(row=5, column=0, sticky="ew", pady=(0, 5))
+
+        self.shader_results_frame = ctk.CTkScrollableFrame(
+            left_frame, fg_color="transparent", height=250)
+        self.shader_results_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 5))
+        self.shader_results_frame.grid_columnconfigure(0, weight=1)
+        self.shader_cards = []
+        self.shader_search_results = []
+        self.selected_shader_index = -1
+        self.show_shader_results_placeholder()
+
+        self.install_shader_web_btn = make_sound_button(
+            left_frame, text="УСТАНОВИТЬ ШЕЙДЕР", command=self.install_selected_shader_web,
+            height=40, fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+            font=ctk.CTkFont(size=14, weight="bold"), state="disabled")
+        self.install_shader_web_btn.grid(row=7, column=0, sticky="ew", pady=(0, 5))
+
+        self.shader_status_label = ctk.CTkLabel(
+            left_frame, text="Пиши название шейдера и жми «Искать»",
+            font=ctk.CTkFont(size=11), text_color="#6d92ff")
+        self.shader_status_label.grid(row=8, column=0, sticky="w")
+
+        right_frame = ctk.CTkFrame(tab)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=20)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(right_frame, text="🔆 Установленные шейдеры",
+                     font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, pady=(0, 10))
+
+        _c = self.get_theme_colors()
+        self.shaders_listbox = tk.Listbox(
+            right_frame, bg=_c["listbox_bg"], fg=_c["listbox_fg"],
+            selectbackground=_c["listbox_select"], font=("Consolas", 11),
+            height=12, relief="flat")
+        self.shaders_listbox.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        self.register_themed_widget(self.shaders_listbox)
+
+        btn_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew")
+        for col in range(3):
+            btn_frame.grid_columnconfigure(col, weight=1)
+
+        make_sound_button(btn_frame, text="Из файла", command=self.install_shader_from_file,
+                          fg_color="#6fce7f", hover_color="#5cb56c",
+                          text_color="#16141f").grid(row=0, column=0, padx=2, sticky="ew")
+        make_sound_button(btn_frame, text="Удалить", command=self.delete_selected_shader,
+                          fg_color="#d3453f", hover_color="#b83530").grid(
+                              row=0, column=1, padx=2, sticky="ew")
+        make_sound_button(btn_frame, text="Папка", command=self.open_shaderpacks_folder,
+                          fg_color="#6d92ff", hover_color="#5a7dd8").grid(
+                              row=0, column=2, padx=2, sticky="ew")
+
+        ctk.CTkLabel(right_frame, text="О выбранном шейдере",
+                     font=ctk.CTkFont(size=16, weight="bold")).grid(row=3, column=0, sticky="w", pady=(15, 5))
+
+        self.shader_desc_card = ctk.CTkFrame(
+            right_frame, fg_color=self.get_theme_colors()["card_bg"], corner_radius=10)
+        self.shader_desc_card.grid(row=4, column=0, sticky="nsew", pady=(0, 5))
+        self.shader_desc_card.grid_columnconfigure(1, weight=1)
+        right_frame.grid_rowconfigure(4, weight=1)
+
+        self.shader_desc_icon = ctk.CTkLabel(
+            self.shader_desc_card, text="🔆", font=ctk.CTkFont(size=28),
+            width=64, height=64, fg_color="transparent")
+        self.shader_desc_icon.grid(row=0, column=0, rowspan=2, padx=15, pady=15, sticky="n")
+
+        self.shader_desc_title = ctk.CTkLabel(
+            self.shader_desc_card, text="Тыкни в шейдер",
+            font=ctk.CTkFont(size=16, weight="bold"), anchor="w")
+        self.shader_desc_title.grid(row=0, column=1, sticky="w", padx=(0, 15), pady=(15, 0))
+
+        self.shader_desc_meta = ctk.CTkLabel(
+            self.shader_desc_card, text="", font=ctk.CTkFont(size=11),
+            text_color="#6d92ff", anchor="w")
+        self.shader_desc_meta.grid(row=1, column=1, sticky="w", padx=(0, 15), pady=(0, 15))
+
+        self.shader_desc_text = ctk.CTkTextbox(
+            self.shader_desc_card, font=ctk.CTkFont(size=13), wrap="word",
+            fg_color="transparent", height=130)
+        self.shader_desc_text.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=15, pady=(0, 15))
+        self.shader_desc_text.configure(state="disabled")
+
+        self.shader_desc_open_btn = make_sound_button(
+            self.shader_desc_card, text="Открыть на Modrinth",
+            command=self.open_selected_shader_page,
+            fg_color="#6d92ff", hover_color="#5a7dd8", height=32, state="disabled")
+        self.shader_desc_open_btn.grid(row=3, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 15))
+
+        self.refresh_shaders_list()
+
+
+    def show_shader_results_placeholder(self):
+        for widget in self.shader_results_frame.winfo_children():
+            widget.destroy()
+        placeholder = ctk.CTkFrame(self.shader_results_frame, fg_color="transparent")
+        placeholder.pack(fill="both", expand=True, pady=40)
+        ctk.CTkLabel(placeholder, text="🔍", font=ctk.CTkFont(size=36)).pack()
+        ctk.CTkLabel(placeholder, text="Пиши название шейдера и жми «Искать»",
+                     font=ctk.CTkFont(size=13), text_color="#6d92ff").pack(pady=(5, 0))
+
+
+    def search_shaders_web(self, popular=False):
+        query = self.shader_search_entry.get().strip()
+        if popular:
+            query = ""
+        elif not query:
+            play_error()
+            show_error_toast(self, "Не вышло", "Напиши, что искать")
+            return
+        version = self.shader_version_entry.get().strip() or "1.20.1"
+
+        for widget in self.shader_results_frame.winfo_children():
+            widget.destroy()
+        self.shader_cards = []
+        self.selected_shader_index = -1
+        self.install_shader_web_btn.configure(state="disabled")
+        ctk.CTkLabel(self.shader_results_frame, text=f"Ищу «{query}»...",
+                     font=ctk.CTkFont(size=13)).pack(pady=10)
+        self.shader_status_label.configure(text="Ищу...", text_color="#d9622f")
+        self.update_idletasks()
+
+        def do_search():
+            results = search_shaders(query, version, index="downloads" if popular else "relevance")
+            self.after(0, lambda: self.display_shader_search_results(results))
+        threading.Thread(target=do_search, daemon=True).start()
+
+
+    def display_shader_search_results(self, results):
+        for widget in self.shader_results_frame.winfo_children():
+            widget.destroy()
+        self.shader_search_results = results
+        self.selected_shader_index = -1
+        self.install_shader_web_btn.configure(state="disabled")
+        self.shader_cards = []
+        self.reset_shader_description()
+
+        if not results:
+            ctk.CTkLabel(self.shader_results_frame, text="Ничего не найдено",
+                         font=ctk.CTkFont(size=13)).pack(pady=10)
+            self.shader_status_label.configure(text="Шейдеры не найдены", text_color="#d3453f")
+            return
+
+        for i, shader in enumerate(results):
+            card = self.create_shader_card(self.shader_results_frame, shader, i)
+            card.pack(fill="x", padx=5, pady=3)
+            self.shader_cards.append(card)
+        self.shader_status_label.configure(
+            text=f"Найдено {len(results)} шейдеров", text_color="#6fce7f")
+
+
+    def create_shader_card(self, parent, shader, index):
+        title = shader.get("title", "Без названия")
+        author = shader.get("author", "неизвестен")
+        downloads = shader.get("downloads", 0)
+        icon_url = shader.get("icon_url")
+        colors = self.get_theme_colors()
+
+        card = ctk.CTkFrame(parent, fg_color=colors["card_bg"], corner_radius=8, cursor="hand2")
+        card.grid_columnconfigure(1, weight=1)
+        icon_label = ctk.CTkLabel(card, text="🔆", font=ctk.CTkFont(size=22),
+                                  width=48, height=48, fg_color="transparent")
+        icon_label.grid(row=0, column=0, rowspan=2, padx=10, pady=10)
+        if icon_url:
+            self.load_mod_icon_async(icon_url, icon_label)
+
+        title_label = ctk.CTkLabel(card, text=title,
+                                   font=ctk.CTkFont(size=14, weight="bold"),
+                                   anchor="w", cursor="hand2")
+        title_label.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(10, 0))
+
+        meta_label = ctk.CTkLabel(
+            card, text=f"👤 {author}   {downloads:,}".replace(",", " "),
+            font=ctk.CTkFont(size=11), text_color="#6d92ff", anchor="w", cursor="hand2")
+        meta_label.grid(row=1, column=1, sticky="w", padx=(0, 10), pady=(0, 10))
+
+        def on_click(event=None, idx=index):
+            self.select_shader_card(idx)
+        for widget in (card, icon_label, title_label, meta_label):
+            widget.bind("<Button-1>", on_click)
+        return card
+
+
+    def select_shader_card(self, index):
+        if index < 0 or index >= len(self.shader_search_results):
+            return
+        self.selected_shader_index = index
+        self.install_shader_web_btn.configure(state="normal")
+        play_click()
+        colors = self.get_theme_colors()
+        for i, card in enumerate(self.shader_cards):
+            try:
+                card.configure(fg_color=colors["card_bg_selected"] if i == index else colors["card_bg"])
+            except Exception:
+                pass
+        self.show_shader_description(index)
+
+
+    def show_shader_description(self, index):
+        if index < 0 or index >= len(self.shader_search_results):
+            return
+        shader = self.shader_search_results[index]
+        title = shader.get("title", "Без названия")
+        author = shader.get("author", "неизвестен")
+        description = shader.get("description", "Описание отсутствует")
+        downloads = shader.get("downloads", 0)
+        follows = shader.get("follows", 0)
+        categories = shader.get("categories", [])
+        icon_url = shader.get("icon_url")
+
+        self.shader_desc_title.configure(text=title)
+        meta = [f"👤 {author}", f"⬇️ {downloads:,}".replace(",", " "),
+                f"❤️ {follows:,}".replace(",", " ")]
+        if categories:
+            meta.append("🏷️ " + ", ".join(categories[:4]))
+        self.shader_desc_meta.configure(text="   ".join(meta))
+
+        self.shader_desc_text.configure(state="normal")
+        self.shader_desc_text.delete("1.0", "end")
+        self.shader_desc_text.insert("1.0", description or "Описание отсутствует")
+        self.shader_desc_text.configure(state="disabled")
+        self.shader_desc_icon.configure(text="🔆", image=None)
+        if icon_url:
+            self.load_mod_icon_async(icon_url, self.shader_desc_icon)
+        self.shader_desc_open_btn.configure(state="normal")
+
+
+    def open_selected_shader_page(self):
+        if self.selected_shader_index < 0 or self.selected_shader_index >= len(self.shader_search_results):
+            return
+        shader = self.shader_search_results[self.selected_shader_index]
+        slug = shader.get("slug") or shader.get("project_id")
+        if slug:
+            webbrowser.open(f"https://modrinth.com/shader/{slug}")
+            play_click()
+
+
+    def reset_shader_description(self):
+        self.shader_desc_title.configure(text="Тыкни в шейдер")
+        self.shader_desc_meta.configure(text="")
+        self.shader_desc_icon.configure(text="🔆", image=None)
+        self.shader_desc_text.configure(state="normal")
+        self.shader_desc_text.delete("1.0", "end")
+        self.shader_desc_text.configure(state="disabled")
+        self.shader_desc_open_btn.configure(state="disabled")
+
+
+    def install_selected_shader_web(self):
+        if self.selected_shader_index < 0 or self.selected_shader_index >= len(self.shader_search_results):
+            play_error()
+            show_error_toast(self, "Не вышло", "Сначала выбери шейдер из списка")
+            return
+        shader = self.shader_search_results[self.selected_shader_index]
+        project_id = shader.get("project_id") or shader.get("slug")
+        if not project_id:
+            play_error()
+            show_error_toast(self, "Не вышло", "У шейдера нет ID")
+            return
+
+        version = self.shader_version_entry.get().strip() or "1.20.1"
+        self.install_shader_web_btn.configure(state="disabled", text="СТАВЛЮ...")
+        self.shader_status_label.configure(text="Ставлю шейдер...", text_color="#d9622f")
+        self.update_idletasks()
+
+        def do_install():
+            success, result = install_shader(project_id, version)
+            self.after(0, lambda: self.install_shader_web_finish(success, result))
+        threading.Thread(target=do_install, daemon=True).start()
+
+
+    def install_shader_web_finish(self, success, result):
+        self.install_shader_web_btn.configure(state="normal", text="УСТАНОВИТЬ ШЕЙДЕР")
+        if success:
+            self.shader_status_label.configure(text=f"Шейдер встал: {result}", text_color="#6fce7f")
+            self.refresh_shaders_list()
+            play_click()
+            show_info_toast(self, "Готово", f"Шейдер '{result}' установлен")
+        else:
+            self.shader_status_label.configure(text=f"Ошибка: {result}", text_color="#d3453f")
+            play_error()
+            show_error_toast(self, "Не вышло", f"Шейдер не встал:\n{result}")
+
+
+    def list_shaders(self):
+        shader_path = get_shaderpacks_folder()
+        try:
+            return sorted(
+                [name for name in os.listdir(shader_path)
+                 if os.path.isfile(os.path.join(shader_path, name))
+                 and name.lower().endswith(".zip")],
+                key=str.lower)
+        except OSError:
+            return []
+
+
+    def refresh_shaders_list(self):
+        if not hasattr(self, "shaders_listbox"):
+            return
+        self.shaders_listbox.delete(0, "end")
+        shaders = self.list_shaders()
+        if not shaders:
+            self.shaders_listbox.insert("end", "📭 Шейдеры не установлены")
+            return
+        folder = get_shaderpacks_folder()
+        for name in shaders:
+            path = os.path.join(folder, name)
+            self.shaders_listbox.insert(
+                "end", f"🔆 {name} ({self.format_size(os.path.getsize(path))})")
+
+
+    def install_shader_from_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Выбери шейдерпак (.zip)",
+            filetypes=[("Шейдерпаки", "*.zip"), ("Все файлы", "*.*")]
+        )
+        if not file_path:
+            return
+        filename = os.path.basename(file_path)
+        if not filename.lower().endswith(".zip"):
+            play_error()
+            show_error_toast(self, "Не вышло", "Шейдерпак должен быть ZIP-архивом")
+            return
+
+        dest_path = os.path.join(get_shaderpacks_folder(), filename)
+        try:
+            if os.path.exists(dest_path) and not messagebox.askyesno(
+                "Уже есть такой файл",
+                f"Шейдер '{filename}' уже установлен.\n\nЗаменить?"
+            ):
+                return
+            shutil.copy2(file_path, dest_path)
+            self.log(f"Шейдер установлен из файла: {filename}")
+            self.refresh_shaders_list()
+            play_click()
+            show_info_toast(self, "Готово", f"Шейдер '{filename}' установлен")
+        except Exception as e:
+            self.log(f"Шейдер не установился: {e}")
+            play_error()
+            show_error_toast(self, "Не вышло", f"Шейдер не установился:\n{e}")
+
+
+    def delete_selected_shader(self):
+        selection = self.shaders_listbox.curselection()
+        if not selection:
+            play_error()
+            show_error_toast(self, "Не вышло", "Сначала выбери шейдер")
+            return
+        selected_text = self.shaders_listbox.get(selection[0])
+        if "📭" in selected_text:
+            return
+        name = selected_text.split("🔆 ", 1)[1].split(" (", 1)[0].strip()
+        if not messagebox.askyesno("Точно?", f"Удалить шейдер '{name}'?"):
+            return
+        path = os.path.join(get_shaderpacks_folder(), name)
+        try:
+            os.remove(path)
+            self.refresh_shaders_list()
+            self.log(f"Шейдер удален: {name}")
+            play_click()
+            show_info_toast(self, "Готово", f"Шейдер '{name}' удалён")
+        except Exception as e:
+            play_error()
+            show_error_toast(self, "Не вышло", f"Не вышло удалить шейдер:\n{e}")
+
+
+    def open_shaderpacks_folder(self):
+        shader_path = get_shaderpacks_folder()
+        try:
+            os.startfile(shader_path)
+        except AttributeError:
+            webbrowser.open(shader_path)
+        self.log("Открыта папка шейдеров")
+        play_click()
+
 
     def create_resourcepacks_tab(self):
         tab = self.tab_view.tab("📦 Ресурспаки")
@@ -8380,20 +11234,20 @@ class LauncherApp(ctk.CTk):
         left_frame.grid_columnconfigure(0, weight=1)
         left_frame.grid_rowconfigure(5, weight=1)
 
-        ctk.CTkLabel(left_frame, text="🔍 Поиск ресурспаков", font=ctk.CTkFont(size=18, weight="bold")).grid(
+        ctk.CTkLabel(left_frame, text="Поиск ресурспаков", font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, pady=(0, 10))
 
-        ctk.CTkLabel(left_frame, text="🎮 Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(
+        ctk.CTkLabel(left_frame, text="Версия Minecraft:", font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=1, column=0, sticky="w")
         self.rp_version_entry = ctk.CTkEntry(left_frame, placeholder_text="1.20.1", height=32)
         self.rp_version_entry.insert(0, "1.20.1")
         self.rp_version_entry.grid(row=2, column=0, sticky="w", pady=(0, 5))
 
-        self.rp_search_entry = ctk.CTkEntry(left_frame, placeholder_text="Введите название ресурспака...", height=32)
+        self.rp_search_entry = ctk.CTkEntry(left_frame, placeholder_text="Название ресурспака...", height=32)
         self.rp_search_entry.grid(row=3, column=0, sticky="ew", pady=(0, 5))
         self.rp_search_entry.bind("<Return>", lambda e: self.search_resourcepacks_web())
 
-        search_btn = make_sound_button(left_frame, text="🔍 Искать", command=self.search_resourcepacks_web,
+        search_btn = make_sound_button(left_frame, text="Искать", command=self.search_resourcepacks_web,
                                        height=32, fg_color="#6d92ff", hover_color="#5a7dd8")
         search_btn.grid(row=4, column=0, sticky="ew", pady=(0, 5))
 
@@ -8405,7 +11259,7 @@ class LauncherApp(ctk.CTk):
         self.selected_rp_index = -1
         self.show_rp_results_placeholder()
 
-        self.install_rp_web_btn = make_sound_button(left_frame, text="📥 УСТАНОВИТЬ РЕСУРСПАК",
+        self.install_rp_web_btn = make_sound_button(left_frame, text="УСТАНОВИТЬ РЕСУРСПАК",
                                                     command=self.install_selected_resourcepack_web,
                                                     height=40, fg_color="#6fce7f", hover_color="#5cb56c",
                                                     text_color="#16141f", font=ctk.CTkFont(size=14, weight="bold"),
@@ -8438,19 +11292,19 @@ class LauncherApp(ctk.CTk):
         btn_frame.grid_columnconfigure(1, weight=1)
         btn_frame.grid_columnconfigure(2, weight=1)
 
-        install_btn = make_sound_button(btn_frame, text="📂 Из файла", command=self.install_resourcepack,
+        install_btn = make_sound_button(btn_frame, text="Из файла", command=self.install_resourcepack,
                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f")
         install_btn.grid(row=0, column=0, padx=2)
 
-        delete_btn = make_sound_button(btn_frame, text="🗑️ Удалить", command=self.delete_selected_resourcepack,
+        delete_btn = make_sound_button(btn_frame, text="Удалить", command=self.delete_selected_resourcepack,
                                        fg_color="#d3453f", hover_color="#b83530")
         delete_btn.grid(row=0, column=1, padx=2)
 
-        open_folder_btn = make_sound_button(btn_frame, text="📂 Папка", command=self.open_resourcepacks_folder,
+        open_folder_btn = make_sound_button(btn_frame, text="Папка", command=self.open_resourcepacks_folder,
                                             fg_color="#6d92ff", hover_color="#5a7dd8")
         open_folder_btn.grid(row=0, column=2, padx=2)
 
-        ctk.CTkLabel(right_frame, text="ℹ️ О выбранном ресурспаке", font=ctk.CTkFont(size=16, weight="bold")).grid(
+        ctk.CTkLabel(right_frame, text="О выбранном ресурспаке", font=ctk.CTkFont(size=16, weight="bold")).grid(
             row=3, column=0, sticky="w", pady=(15, 5))
 
         self.rp_desc_card = ctk.CTkFrame(right_frame, fg_color=self.get_theme_colors()["card_bg"], corner_radius=10)
@@ -8475,7 +11329,7 @@ class LauncherApp(ctk.CTk):
         self.rp_desc_text.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=15, pady=(0, 15))
         self.rp_desc_text.configure(state="disabled")
 
-        self.rp_desc_open_btn = make_sound_button(self.rp_desc_card, text="🌐 Открыть на Modrinth",
+        self.rp_desc_open_btn = make_sound_button(self.rp_desc_card, text="Открыть на Modrinth",
                                                   command=self.open_selected_rp_page,
                                                   fg_color="#6d92ff", hover_color="#5a7dd8",
                                                   height=32, state="disabled")
@@ -8494,7 +11348,7 @@ class LauncherApp(ctk.CTk):
         query = self.rp_search_entry.get().strip()
         if not query:
             play_error()
-            show_error_toast(self, "Ошибка", "Напиши, что искать")
+            show_error_toast(self, "Не вышло", "Напиши, что искать")
             return
         version = self.rp_version_entry.get().strip()
         if not version:
@@ -8505,9 +11359,9 @@ class LauncherApp(ctk.CTk):
         self.rp_cards = []
         self.selected_rp_index = -1
         self.install_rp_web_btn.configure(state="disabled")
-        ctk.CTkLabel(self.rp_results_frame, text=f"⏳ Поиск «{query}»...",
+        ctk.CTkLabel(self.rp_results_frame, text=f"Ищу «{query}»...",
                      font=ctk.CTkFont(size=13)).pack(pady=10)
-        self.rp_status_label.configure(text="⏳ Поиск...", text_color="#d9622f")
+        self.rp_status_label.configure(text="Ищу...", text_color="#d9622f")
         self.update_idletasks()
 
         def do_search():
@@ -8526,9 +11380,9 @@ class LauncherApp(ctk.CTk):
         self.reset_rp_description()
 
         if not results:
-            ctk.CTkLabel(self.rp_results_frame, text="❌ Ничего не найдено",
+            ctk.CTkLabel(self.rp_results_frame, text="Ничего не найдено",
                          font=ctk.CTkFont(size=13)).pack(pady=10)
-            self.rp_status_label.configure(text="❌ Ресурспаки не найдены", text_color="#d3453f")
+            self.rp_status_label.configure(text="Ресурспаки не найдены", text_color="#d3453f")
             return
 
         for i, pack in enumerate(results):
@@ -8536,7 +11390,7 @@ class LauncherApp(ctk.CTk):
             card.pack(fill="x", padx=5, pady=3)
             self.rp_cards.append(card)
 
-        self.rp_status_label.configure(text=f"✅ Найдено {len(results)} ресурспаков", text_color="#6fce7f")
+        self.rp_status_label.configure(text=f"Найдено {len(results)} ресурспаков", text_color="#6fce7f")
 
     def create_rp_card(self, parent, pack, index):
         title = pack.get('title', 'Без названия')
@@ -8560,7 +11414,7 @@ class LauncherApp(ctk.CTk):
         title_label.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(10, 0))
 
         downloads_text = f"{downloads:,}".replace(",", " ")
-        meta_label = ctk.CTkLabel(card, text=f"👤 {author}   ⬇️ {downloads_text}", font=ctk.CTkFont(size=11),
+        meta_label = ctk.CTkLabel(card, text=f"👤 {author}   {downloads_text}", font=ctk.CTkFont(size=11),
                                   text_color="#6d92ff", anchor="w", cursor="hand2")
         meta_label.grid(row=1, column=1, sticky="w", padx=(0, 10), pady=(0, 10))
 
@@ -8634,20 +11488,20 @@ class LauncherApp(ctk.CTk):
     def install_selected_resourcepack_web(self):
         if self.selected_rp_index < 0 or self.selected_rp_index >= len(self.rp_search_results):
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала выбери ресурспак из списка")
+            show_error_toast(self, "Не вышло", "Сначала выбери ресурспак из списка")
             return
         pack = self.rp_search_results[self.selected_rp_index]
         project_id = pack.get('project_id') or pack.get('slug')
         if not project_id:
             play_error()
-            show_error_toast(self, "Ошибка", "У ресурспака нет ID, странно как-то")
+            show_error_toast(self, "Не вышло", "У ресурспака нет ID, странно как-то")
             return
         version = self.rp_version_entry.get().strip()
         if not version:
             version = "1.20.1"
 
-        self.install_rp_web_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
-        self.rp_status_label.configure(text="⏳ Установка ресурспака...", text_color="#d9622f")
+        self.install_rp_web_btn.configure(state="disabled", text="СТАВЛЮ...")
+        self.rp_status_label.configure(text="Ставлю ресурспак...", text_color="#d9622f")
         self.update_idletasks()
 
         def do_install():
@@ -8657,16 +11511,16 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=do_install, daemon=True).start()
 
     def install_rp_web_finish(self, success, result):
-        self.install_rp_web_btn.configure(state="normal", text="📥 УСТАНОВИТЬ РЕСУРСПАК")
+        self.install_rp_web_btn.configure(state="normal", text="УСТАНОВИТЬ РЕСУРСПАК")
         if success:
-            self.rp_status_label.configure(text=f"✅ Ресурспак установлен: {result}", text_color="#6fce7f")
+            self.rp_status_label.configure(text=f"Ресурспак встал: {result}", text_color="#6fce7f")
             self.refresh_resourcepacks()
             play_click()
-            show_info_toast(self, "Успешно", f"✅ Ресурспак '{result}' на месте")
+            show_info_toast(self, "Готово", f"Ресурспак '{result}' на месте")
         else:
-            self.rp_status_label.configure(text=f"❌ Ошибка: {result}", text_color="#d3453f")
+            self.rp_status_label.configure(text=f"Ошибка: {result}", text_color="#d3453f")
             play_error()
-            show_error_toast(self, "Ошибка", f"❌ Ресурспак не встал:\n{result}")
+            show_error_toast(self, "Не вышло", f"Ресурспак не встал:\n{result}")
 
     def create_settings_tab(self):
         tab = self.tab_view.tab("⚙️ Настройки")
@@ -8676,12 +11530,12 @@ class LauncherApp(ctk.CTk):
         main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
         main_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(main_frame, text="⚙️ Настройки лаунчера", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0,
+        ctk.CTkLabel(main_frame, text="Настройки лаунчера", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0,
                                                                                                               column=0,
                                                                                                               pady=(0,
                                                                                                                     20))
 
-        ctk.CTkLabel(main_frame, text="🎮 Логи игры", font=ctk.CTkFont(size=14, weight="bold")).grid(row=1,
+        ctk.CTkLabel(main_frame, text="Логи игры", font=ctk.CTkFont(size=14, weight="bold")).grid(row=1,
                                                                                                     column=0,
                                                                                                     sticky="w",
                                                                                                     pady=(0, 5))
@@ -8709,7 +11563,7 @@ class LauncherApp(ctk.CTk):
             self.theme_switch.deselect()
         self.theme_switch.pack(side="left")
 
-        ctk.CTkLabel(main_frame, text="🔶 Золотая тема аккаунта", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(main_frame, text="Золотая тема аккаунта", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=5, column=0, sticky="w", pady=(0, 5))
         golden_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         golden_frame.grid(row=6, column=0, sticky="w", pady=(0, 15))
@@ -8723,10 +11577,24 @@ class LauncherApp(ctk.CTk):
             self.golden_theme_switch.deselect()
         self.golden_theme_switch.pack(side="left")
 
-        ctk.CTkLabel(main_frame, text="🔷 Вход через Microsoft", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(main_frame, text="Курсор", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=7, column=0, sticky="w", pady=(0, 5))
+        cursor_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        cursor_frame.grid(row=8, column=0, sticky="w", pady=(0, 15))
+        self.cursor_switch = ctk.CTkSwitch(cursor_frame,
+                                           text="Свой курсор лаунчера (выключи — будет обычный виндовый)",
+                                           command=self.toggle_cursor_setting,
+                                           font=ctk.CTkFont(size=13))
+        if self.settings.get("cursor_mode", "custom") == "classic":
+            self.cursor_switch.deselect()
+        else:
+            self.cursor_switch.select()
+        self.cursor_switch.pack(side="left")
+
+        ctk.CTkLabel(main_frame, text="Вход через Microsoft", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=9, column=0, sticky="w", pady=(0, 5))
         ms_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        ms_frame.grid(row=8, column=0, sticky="ew", pady=(0, 15))
+        ms_frame.grid(row=10, column=0, sticky="ew", pady=(0, 15))
         ms_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(ms_frame, text="Client ID своего Azure-приложения (portal.azure.com):",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=0, column=0, sticky="w")
@@ -8742,32 +11610,32 @@ class LauncherApp(ctk.CTk):
         self.ms_redirect_entry.insert(0, self.settings.get(
             "ms_redirect_uri", "https://login.microsoftonline.com/common/oauth2/nativeclient"))
 
-        save_ms_btn = make_sound_button(ms_frame, text="💾 Сохранить", command=self.save_ms_settings,
+        save_ms_btn = make_sound_button(ms_frame, text="Сохранить", command=self.save_ms_settings,
                                         fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
         save_ms_btn.grid(row=4, column=0, sticky="w")
 
-        ctk.CTkLabel(main_frame, text="📁 Папка игры", font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=9, column=0, sticky="w", pady=(0, 5))
+        ctk.CTkLabel(main_frame, text="Папка игры", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=11, column=0, sticky="w", pady=(0, 5))
         gamedir_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        gamedir_frame.grid(row=10, column=0, sticky="ew", pady=(0, 15))
+        gamedir_frame.grid(row=12, column=0, sticky="ew", pady=(0, 15))
         gamedir_frame.grid_columnconfigure(0, weight=1)
         self.game_dir_entry = ctk.CTkEntry(gamedir_frame, height=32)
         self.game_dir_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.game_dir_entry.insert(0, self.settings.get("game_dir", DEFAULT_GAME_DIR))
-        browse_gamedir_btn = make_sound_button(gamedir_frame, text="📂 Обзор", command=self.browse_game_dir,
+        browse_gamedir_btn = make_sound_button(gamedir_frame, text="Обзор", command=self.browse_game_dir,
                                                width=110, height=32, fg_color="#2b2840", hover_color="#3d3a52")
         browse_gamedir_btn.grid(row=0, column=1)
-        save_gamedir_btn = make_sound_button(gamedir_frame, text="💾 Сохранить", command=self.save_game_dir,
+        save_gamedir_btn = make_sound_button(gamedir_frame, text="Сохранить", command=self.save_game_dir,
                                              fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                                              height=32, width=130)
         save_gamedir_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ctk.CTkLabel(gamedir_frame, text="⚠️ Применится после перезапуска лаунчера",
+        ctk.CTkLabel(gamedir_frame, text="Применится после перезапуска лаунчера",
                      font=ctk.CTkFont(size=11), text_color="#a8a4bd").grid(row=2, column=0, sticky="w", pady=(4, 0))
 
-        ctk.CTkLabel(main_frame, text="☕ Java", font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=11, column=0, sticky="w", pady=(0, 5))
+        ctk.CTkLabel(main_frame, text="Java", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=13, column=0, sticky="w", pady=(0, 5))
         java_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        java_frame.grid(row=12, column=0, sticky="ew", pady=(0, 15))
+        java_frame.grid(row=14, column=0, sticky="ew", pady=(0, 15))
         java_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(java_frame, text="Свой путь к java.exe (пусто — определится автоматически):",
                      font=ctk.CTkFont(size=12), text_color="#a8a4bd").grid(row=0, column=0, columnspan=2, sticky="w")
@@ -8775,40 +11643,51 @@ class LauncherApp(ctk.CTk):
                                             placeholder_text="например C:\\Program Files\\Java\\jdk-17\\bin\\java.exe")
         self.java_path_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 6))
         self.java_path_entry.insert(0, self.settings.get("java_path", ""))
-        browse_java_btn = make_sound_button(java_frame, text="📂 Обзор", command=self.browse_java_path,
+        browse_java_btn = make_sound_button(java_frame, text="Обзор", command=self.browse_java_path,
                                             width=110, height=32, fg_color="#2b2840", hover_color="#3d3a52")
         browse_java_btn.grid(row=1, column=1, pady=(2, 6))
         java_btns_frame = ctk.CTkFrame(java_frame, fg_color="transparent")
         java_btns_frame.grid(row=2, column=0, sticky="w")
-        save_java_btn = make_sound_button(java_btns_frame, text="💾 Сохранить", command=self.save_java_path,
+        save_java_btn = make_sound_button(java_btns_frame, text="Сохранить", command=self.save_java_path,
                                           fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f", height=32)
         save_java_btn.pack(side="left", padx=(0, 8))
-        auto_java_btn = make_sound_button(java_btns_frame, text="↩️ Автоопределение", command=self.reset_java_path,
+        auto_java_btn = make_sound_button(java_btns_frame, text="Автоопределение", command=self.reset_java_path,
                                           fg_color="#2b2840", hover_color="#3d3a52", height=32)
         auto_java_btn.pack(side="left")
 
-        ctk.CTkLabel(main_frame, text="💾 RAM по умолчанию", font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=13, column=0, sticky="w", pady=(0, 5))
+        ctk.CTkLabel(main_frame, text="RAM по умолчанию", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=15, column=0, sticky="w", pady=(0, 5))
         ram_default_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        ram_default_frame.grid(row=14, column=0, sticky="w", pady=(0, 15))
+        ram_default_frame.grid(row=16, column=0, sticky="w", pady=(0, 15))
         for ram in ["1G", "2G", "3G", "4G", "6G", "8G"]:
             ctk.CTkRadioButton(ram_default_frame, text=ram, variable=self.ram_var, value=ram,
                               command=self.save_ram_setting).pack(side="left", padx=5)
 
-        ctk.CTkLabel(main_frame, text="🔗 Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=15,
+        ctk.CTkLabel(main_frame, text="Обновление 67Launcher", font=ctk.CTkFont(size=14, weight="bold")).grid(row=17, column=0, sticky="w", pady=(15, 5))
+        updater_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        updater_frame.grid(row=18, column=0, sticky="ew", pady=(0, 15))
+        updater_frame.grid_columnconfigure(0, weight=1)
+        local_ver, _ = _launcher_read_local_version()
+        self._launcher_update_status = ctk.CTkLabel(updater_frame, text=f"Текущая версия: {local_ver or 'не определена'}", text_color="#a8a4bd")
+        self._launcher_update_status.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._launcher_update_button = make_sound_button(updater_frame, text="Проверить обновления", command=lambda: check_launcher_update_from_settings(self), height=34)
+        self._launcher_update_button.grid(row=1, column=0, sticky="w")
+        ctk.CTkLabel(updater_frame, text="Проверка выполняется в фоне. Перед заменой файлов updater проверяет архив.", font=ctk.CTkFont(size=11), text_color="#8b87a3").grid(row=2, column=0, sticky="w", pady=(5, 0))
+
+        ctk.CTkLabel(main_frame, text="Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=20,
                                                                                                           column=0,
                                                                                                           sticky="w",
                                                                                                           pady=(15, 10))
         links_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        links_frame.grid(row=16, column=0, sticky="w", pady=(0, 15))
+        links_frame.grid(row=21, column=0, sticky="w", pady=(0, 15))
 
-        github_btn = make_sound_button(links_frame, text="⭐ GitHub",
+        github_btn = make_sound_button(links_frame, text="GitHub",
                                        command=lambda: webbrowser.open("https://github.com/KotiPlayYT/67launcher/"),
                                        width=180, height=40, fg_color="#2b2840", hover_color="#3d3a52",
                                        font=ctk.CTkFont(size=13, weight="bold"))
         github_btn.grid(row=0, column=0, padx=(0, 15), pady=5)
 
-        donate_btn = make_sound_button(links_frame, text="💝 Поддержать",
+        donate_btn = make_sound_button(links_frame, text="Поддержать",
                                        command=lambda: webbrowser.open("https://www.donationalerts.com/r/ionux"),
                                        width=180, height=40, fg_color="#d9622f", hover_color="#c14f26",
                                        font=ctk.CTkFont(size=13, weight="bold"))
@@ -8822,24 +11701,99 @@ class LauncherApp(ctk.CTk):
         main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
         main_frame.grid_columnconfigure(0, weight=1)
         main_frame.grid_rowconfigure(1, weight=1)
+        main_frame.grid_rowconfigure(6, weight=2)
 
-        ctk.CTkLabel(main_frame, text="📊 Статистика", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0,
-                                                                                                     pady=(0, 20))
+        self._lb_running = False
+        self._lb_pending_submit = False
 
-        self.stats_text = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Consolas", size=13), height=300)
-        self.stats_text.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        ctk.CTkLabel(main_frame, text="Статистика", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0,
+                                                                                                     pady=(0, 10))
 
-        refresh_btn = make_sound_button(main_frame, text="🔄 Обновить", command=self.on_stats_refresh_click,
+        self.stats_text = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Consolas", size=13), height=200)
+        self.stats_text.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+
+        refresh_btn = make_sound_button(main_frame, text="Обновить статистику", command=self.on_stats_refresh_click,
                                         fg_color="#6d92ff", hover_color="#5a7dd8", width=200)
-        refresh_btn.grid(row=2, column=0)
+        refresh_btn.grid(row=2, column=0, pady=(0, 14))
+
+        ctk.CTkLabel(main_frame, text="🌍 Мировой рейтинг по времени в игре",
+                     font=ctk.CTkFont(size=20, weight="bold")).grid(row=3, column=0, pady=(0, 2))
+        ctk.CTkLabel(main_frame,
+                     text="В рейтинге только лицензионные аккаунты (🔷) — идёт время, которое ты наиграл на них. "
+                          "Оффлайн и Ely.by не считаются.",
+                     font=ctk.CTkFont(size=12), text_color="#a8a4bd", wraplength=780,
+                     justify="center").grid(row=4, column=0, pady=(0, 6))
+
+        self.lb_participate_switch = ctk.CTkSwitch(main_frame,
+                                                   text="Отправлять моё время в рейтинг (ник и время видны всем)",
+                                                   command=self.lb_toggle_participate,
+                                                   font=ctk.CTkFont(size=13))
+        if self._lb_participates():
+            self.lb_participate_switch.select()
+        else:
+            self.lb_participate_switch.deselect()
+        self.lb_participate_switch.grid(row=5, column=0, pady=(0, 6))
+
+        self.lb_textbox = ctk.CTkTextbox(main_frame, font=ctk.CTkFont(family="Consolas", size=13), height=220)
+        self.lb_textbox.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
+        self.lb_textbox.tag_config("head", foreground="#8a86a3")
+        self.lb_textbox.tag_config("gold", foreground="#FFD700")
+        self.lb_textbox.tag_config("silver", foreground="#C8CCD6")
+        self.lb_textbox.tag_config("bronze", foreground="#D9925A")
+        self.lb_textbox.tag_config("me", foreground="#6fce7f")
+        self.lb_textbox.insert("1.0", "Рейтинг грузится…")
+        self.lb_textbox.configure(state="disabled")
+
+        # Контекстное меню игроков рейтинга (ПКМ).
+        self._lb_context_player = None
+        self._lb_context_menu = tk.Menu(
+            self, tearoff=0, bg="#201d30", fg="#e5e2f0",
+            activebackground="#6d92ff", activeforeground="#16141f", bd=0
+        )
+        self._lb_context_menu.add_command(
+            label="👤 Открыть профиль", command=self._lb_open_context_profile
+        )
+        self._lb_context_menu.add_command(
+            label="💬 Написать сообщение", command=self._lb_message_context_player
+        )
+        self._lb_context_menu.add_command(
+            label="➕ Добавить в друзья", command=self._lb_add_context_friend
+        )
+        self._lb_context_menu.add_command(
+            label="📊 Статистики", command=self._lb_show_context_stats
+        )
+        self._lb_context_menu.add_separator()
+        self._lb_context_menu.add_command(
+            label="Скопировать ник", command=self._lb_copy_context_player
+        )
+        self.lb_textbox._textbox.bind("<Button-3>", self._lb_show_context_menu)
+
+        lb_buttons = ctk.CTkFrame(main_frame, fg_color="transparent")
+        lb_buttons.grid(row=7, column=0, pady=(0, 4))
+        self.lb_refresh_btn = make_sound_button(lb_buttons, text="Обновить рейтинг",
+                                                command=lambda: self.lb_start(submit=False),
+                                                fg_color="#6d92ff", hover_color="#5a7dd8", width=200)
+        self.lb_refresh_btn.grid(row=0, column=0, padx=(0, 10))
+        self.lb_submit_btn = make_sound_button(lb_buttons, text="Отправить моё время",
+                                               command=lambda: self.lb_start(submit=True, force=True),
+                                               fg_color="#6d92ff", hover_color="#5a7dd8", width=200)
+        self.lb_submit_btn.grid(row=0, column=1)
+
+        self.lb_status_label = ctk.CTkLabel(main_frame, text="", font=ctk.CTkFont(size=12), text_color="#a8a4bd",
+                                            wraplength=780, justify="center")
+        self.lb_status_label.grid(row=8, column=0, pady=(2, 0))
 
         self.update_stats_display()
+
+        # Через несколько секунд после старта: заодно будим сервер (он бесплатный и любит спать),
+        # шлём накопленное время и подтягиваем таблицу.
+        self.after(6000, lambda: self.lb_start(submit=True))
 
     def search_mods(self):
         query = self.mod_search_entry.get().strip()
         if not query:
             play_error()
-            show_error_toast(self, "Ошибка", "Напиши, что искать")
+            show_error_toast(self, "Не вышло", "Напиши, что искать")
             return
         version = self.mod_version_entry.get().strip()
         if not version:
@@ -8852,9 +11806,9 @@ class LauncherApp(ctk.CTk):
         self.selected_mod_index = -1
         self.install_mod_btn.configure(state="disabled")
         self.reset_mod_description()
-        ctk.CTkLabel(self.results_frame, text=f"⏳ Поиск «{query}»...",
+        ctk.CTkLabel(self.results_frame, text=f"Ищу «{query}»...",
                      font=ctk.CTkFont(size=13)).pack(pady=10)
-        self.mod_status_label.configure(text="⏳ Поиск...", text_color="#d9622f")
+        self.mod_status_label.configure(text="Ищу...", text_color="#d9622f")
         self.update_idletasks()
 
         def do_search():
@@ -8872,9 +11826,9 @@ class LauncherApp(ctk.CTk):
         self.mod_cards = []
 
         if not results:
-            ctk.CTkLabel(self.results_frame, text="❌ Ничего не найдено",
+            ctk.CTkLabel(self.results_frame, text="Ничего не найдено",
                          font=ctk.CTkFont(size=13)).pack(pady=10)
-            self.mod_status_label.configure(text="❌ Моды не найдены", text_color="#d3453f")
+            self.mod_status_label.configure(text="Моды не найдены", text_color="#d3453f")
             return
 
         for i, mod in enumerate(results):
@@ -8882,7 +11836,7 @@ class LauncherApp(ctk.CTk):
             card.pack(fill="x", padx=5, pady=3)
             self.mod_cards.append(card)
 
-        self.mod_status_label.configure(text=f"✅ Найдено {len(results)} модов", text_color="#6fce7f")
+        self.mod_status_label.configure(text=f"Найдено {len(results)} модов", text_color="#6fce7f")
 
     def create_mod_card(self, parent, mod, index):
         title = mod.get('title', 'Без названия')
@@ -9001,7 +11955,7 @@ class LauncherApp(ctk.CTk):
         mod_filename = entry.replace("📦 ", "").strip()
 
         self.mod_desc_title.configure(text=mod_filename)
-        self.mod_desc_meta.configure(text="🔍 Ищу на Modrinth...")
+        self.mod_desc_meta.configure(text="Ищу на Modrinth...")
         self.mod_desc_text.configure(state="normal")
         self.mod_desc_text.delete("1.0", "end")
         self.mod_desc_text.configure(state="disabled")
@@ -9059,21 +12013,21 @@ class LauncherApp(ctk.CTk):
     def install_selected_mod(self):
         if self.selected_mod_index < 0 or self.selected_mod_index >= len(self.search_results):
             play_error()
-            show_error_toast(self, "Ошибка", "Сначала выбери мод из списка")
+            show_error_toast(self, "Не вышло", "Сначала выбери мод из списка")
             return
         mod = self.search_results[self.selected_mod_index]
         project_id = mod.get('project_id')
         if not project_id:
             play_error()
-            show_error_toast(self, "Ошибка", "У мода нет ID, странно как-то")
+            show_error_toast(self, "Не вышло", "У мода нет ID, странно как-то")
             return
         version = self.mod_version_entry.get().strip()
         if not version:
             version = "1.20.1"
         loader = self.mod_loader_var.get()
 
-        self.install_mod_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
-        self.mod_status_label.configure(text="⏳ Установка мода...", text_color="#d9622f")
+        self.install_mod_btn.configure(state="disabled", text="СТАВЛЮ...")
+        self.mod_status_label.configure(text="Ставлю мод...", text_color="#d9622f")
         self.update_idletasks()
 
         def do_install():
@@ -9083,20 +12037,20 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=do_install, daemon=True).start()
 
     def install_mod_finish(self, success, result):
-        self.install_mod_btn.configure(state="normal", text="📥 УСТАНОВИТЬ МОД")
+        self.install_mod_btn.configure(state="normal", text="УСТАНОВИТЬ МОД")
         if success:
-            self.mod_status_label.configure(text=f"✅ Мод установлен: {result}", text_color="#6fce7f")
+            self.mod_status_label.configure(text=f"Мод встал: {result}", text_color="#6fce7f")
             self.refresh_mods_list()
             play_click()
-            show_info_toast(self, "Успешно", f"✅ Мод '{result}' стоит, можно играть")
+            show_info_toast(self, "Готово", f"Мод '{result}' стоит, можно играть")
         else:
-            self.mod_status_label.configure(text=f"❌ Ошибка: {result}", text_color="#d3453f")
+            self.mod_status_label.configure(text=f"Ошибка: {result}", text_color="#d3453f")
             play_error()
-            show_error_toast(self, "Ошибка", f"❌ Мод не встал:\n{result}")
+            show_error_toast(self, "Не вышло", f"Мод не встал:\n{result}")
 
     def update_timer_display(self):
         if self.timer_running:
-            self.timer_label.configure(text=f"⏱ Время игры: {self.format_time(self.timer_seconds)}")
+            self.timer_label.configure(text=f"Время игры: {self.format_time(self.timer_seconds)}")
             self.timer_seconds += 1
             self.after(1000, self.update_timer_display)
 
@@ -9104,21 +12058,55 @@ class LauncherApp(ctk.CTk):
         if not self.timer_running:
             self.timer_running = True
             self.timer_seconds = 0
-            self.log("⏱ Таймер запущен")
+            self._timer_licensed = getattr(self, "_session_licensed", None)
+            # Записываем реальное время старта сессии для защиты от накрутки
+            self._real_start_epoch = time.time()
+            _write_real543(self._real_start_epoch)
+            self.log("Таймер запущен")
             self.update_timer_display()
 
     def stop_game_timer(self):
         if self.timer_running:
             self.timer_running = False
+            licensed = getattr(self, "_timer_licensed", None)
+            self._timer_licensed = None
+
+            # Защита от накрутки: вычисляем реальное время через real-543.txt
+            real_start = getattr(self, "_real_start_epoch", None)
+            if real_start is not None:
+                real_elapsed = int(time.time() - real_start)
+                real_elapsed = max(0, min(real_elapsed, 86400))
+            else:
+                # Fallback: берём из файла
+                real_elapsed = _get_real_session_seconds()
+
+            if real_elapsed is not None and abs(self.timer_seconds - real_elapsed) > 60:
+                self.log(f"[защита] UI-таймер: {self.format_time(self.timer_seconds)}, "
+                         f"реальное время: {self.format_time(real_elapsed)} — использую реальное")
+                self.timer_seconds = real_elapsed
+
+            # Обновляем real-543.txt актуальным временем перед сохранением
+            # (update_play_time сам его прочтёт и удалит)
+            if real_start is not None:
+                _write_real543(real_start)  # гарантируем файл актуален
+
             if self.timer_seconds > 0:
-                update_play_time(self.timer_seconds)
+                update_play_time(self.timer_seconds, licensed)
                 self.stats = load_stats()
-                self.log(f"⏱ Время игры сохранено: {self.format_time(self.timer_seconds)}")
+                self.log(f"Время игры сохранено: {self.format_time(self.timer_seconds)}")
                 self.update_info_display()
                 self.update_subtitle()
+                if licensed:
+                    self.lb_start(submit=True)
             else:
-                self.log("⏱ Таймер остановлен (0 секунд)")
-            self.timer_label.configure(text="⏱ Время игры: 0с")
+                _delete_real543()
+                self.log("Таймер остановлен (0 секунд)")
+
+            self._real_start_epoch = None
+            try:
+                self.timer_label.configure(text="Время игры: 0с")
+            except Exception:
+                pass
 
     def set_launch_progress(self, percent, status_text=None):
         def _update():
@@ -9135,6 +12123,43 @@ class LauncherApp(ctk.CTk):
         except:
             pass
 
+    def _send_friend_presence(self, mode="online", server=""):
+        """Мгновенно сообщает друзьям текущее состояние лаунчера/Minecraft."""
+        if not getattr(self, "_dm_inbox_running", False):
+            return
+        payload = {"action": "friend_presence", "mode": mode, "server": str(server or "")[:128]}
+        try:
+            ws = getattr(self, "_friend_presence_ws", None)
+            if ws is not None:
+                ws.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        except Exception:
+            pass
+
+    def _detect_minecraft_presence(self, line):
+        """Определяет одиночную игру или подключение к серверу по стандартным логам Minecraft."""
+        text = str(line or "")
+        low = text.lower()
+        if "stopping!" in low or "stopping minecraft" in low:
+            self._send_friend_presence("online")
+            return
+        m = re.search(r"Connecting to ([^,\s]+)(?:,\s*(\d+))?", text, re.I)
+        if m:
+            self._friend_last_server = m.group(1)
+            self._send_friend_presence("server", m.group(1))
+            return
+        if "connecting to " in low and "server" in low:
+            addr = text.split("Connecting to ", 1)[-1].strip()[:128]
+            self._friend_last_server = addr
+            self._send_friend_presence("server", addr)
+            return
+        if "joining world" in low or "joined the game" in low:
+            # Если перед этим не было адреса сервера, считаем это одиночным миром.
+            if not getattr(self, "_friend_last_server", ""):
+                self._send_friend_presence("singleplayer")
+            else:
+                self._send_friend_presence("server", self._friend_last_server)
+            return
+
     def launch_game(self):
         if self.is_launching:
             return
@@ -9142,7 +12167,7 @@ class LauncherApp(ctk.CTk):
         username = self.account_combo.get()
         if username == "Нет аккаунтов" or not username:
             play_error()
-            show_error_toast(self, "Ошибка", "Аккаунта нет — сначала создай")
+            show_error_toast(self, "Не вышло", "Аккаунта нет — сначала создай")
             return
 
         account_data = None
@@ -9151,22 +12176,29 @@ class LauncherApp(ctk.CTk):
                 account_data = acc
                 break
 
+        # Для мирового рейтинга: время идёт в зачёт только на лицензионном аккаунте.
+        self._session_licensed = None
+        if account_data and account_data.get("type") == "microsoft":
+            self._session_licensed = {"uuid": account_data.get("uuid"),
+                                      "name": account_data.get("username") or username}
+
         version = self.version_combo.get()
         if version == "Нет версий" or not version:
             play_error()
-            show_error_toast(self, "Ошибка", "Версия не стоит — сначала поставь")
+            show_error_toast(self, "Не вышло", "Версия не стоит — сначала поставь")
             return
 
         ram = self.ram_var.get()
 
         self.is_launching = True
-        self.launch_btn.configure(state="disabled", text="⏳ ЗАПУСК...")
+        self._friend_last_server = ""
+        self.launch_btn.configure(state="disabled", text="ЗАПУСК...")
 
         self.launch_progressbar.animating = False
         self.launch_progressbar.set(0)
         self.launch_progressbar.configure(progress_color="#7896f7")
-        self.launch_status_label.configure(text="⏳ Запуск Minecraft...", text_color="#d9622f")
-        self.log(f"🚀 Запуск: {version} от {username} с памятью {ram}")
+        self.launch_status_label.configure(text="Запускаю Minecraft...", text_color="#d9622f")
+        self.log(f"Запускаю: {version} от {username} с памятью {ram}")
         self.update_idletasks()
 
         def do_launch():
@@ -9175,7 +12207,7 @@ class LauncherApp(ctk.CTk):
             try:
                 self.set_launch_progress(10, "⏳ Проверка Java...")
                 java_path = get_java_for_version(version)
-                self.log(f"☕ Java: {java_path}")
+                self.log(f"Java: {java_path}")
                 self.set_launch_progress(25)
 
                 version_path = os.path.join(MINECRAFT_DIR, "versions", version)
@@ -9188,7 +12220,7 @@ class LauncherApp(ctk.CTk):
                 if not jar_path:
                     error_message = (f"JAR файл версии {version} не найден "
                                      f"(ни у самой версии, ни у родительской через inheritsFrom)")
-                    self.log(f"❌ {error_message}")
+                    self.log(f"{error_message}")
                     self.after(0, lambda: self.launch_finish(False, error_message))
                     return
                 self.set_launch_progress(45, "⏳ Проверка файлов версии...")
@@ -9233,7 +12265,7 @@ class LauncherApp(ctk.CTk):
                     self.set_launch_progress(78, "⏳ Подключаю authlib-injector (Ely.by)...")
                     injector_path = ensure_authlib_injector()
                     if not injector_path:
-                        self.log("⚠️ Не удалось скачать authlib-injector — скин Ely.by в игре не покажется")
+                        self.log("Не получилось скачать authlib-injector — скин Ely.by в игре не покажется")
                 else:
                     command.extend(["--username", username])
                     command.extend(["--uuid", "00000000-0000-0000-0000-000000000000"])
@@ -9246,13 +12278,13 @@ class LauncherApp(ctk.CTk):
                 if java_path != "java":
                     command.insert(0, java_path)
 
-                self.log(f"📋 Команда запуска: {' '.join(command[:6])}...")
+                self.log(f"Команда запуска: {' '.join(command[:6])}...")
                 self.set_launch_progress(85, "⏳ Запуск процесса...")
 
                 self.minecraft_process = subprocess.Popen(
                     command,
                     cwd=MINECRAFT_DIR,
-
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -9281,6 +12313,10 @@ class LauncherApp(ctk.CTk):
                         for line in iter(pipe.readline, ''):
                             if line:
                                 line = line.strip()
+                                try:
+                                    self._detect_minecraft_presence(line)
+                                except Exception:
+                                    pass
                                 if line:
                                     try:
                                         self.last_game_output.append(f"[{name}] {line}")
@@ -9304,7 +12340,8 @@ class LauncherApp(ctk.CTk):
                                  daemon=True).start()
                 threading.Thread(target=read_output, args=(self.minecraft_process.stderr, "ERROR"), daemon=True).start()
 
-                self.log("✅ Процесс запущен!")
+                self.log("Процесс запущен!")
+                self._send_friend_presence("minecraft")
                 self.set_launch_progress(95)
                 success = True
                 was_first_launch = load_stats().get("launches", 0) == 0
@@ -9319,19 +12356,24 @@ class LauncherApp(ctk.CTk):
                     if self.minecraft_process:
                         self.minecraft_process.wait()
                         self.after(0, self.stop_game_timer)
+                        self._friend_last_server = ""
+                        self._send_friend_presence("online")
                         returncode = self.minecraft_process.returncode
                         if returncode != 0:
-                            self.log(f"💥 Игра завершилась с кодом ошибки {returncode}")
+                            self.log(f"Игра завершилась с кодом ошибки {returncode}")
                             self.after(0, lambda: self.on_game_crashed(returncode))
                         else:
-                            self.log("🔄 Игра закрыта, таймер остановлен")
+                            self.log("Игра закрыта, таймер остановлен")
 
                 threading.Thread(target=monitor_process, daemon=True).start()
 
             except Exception as e:
                 error_message = str(e)
-                self.log(f"❌ Ошибка запуска: {error_message}")
-                self.stop_game_timer()
+                self.log(f"Не запустилось: {error_message}")
+                try:
+                    self.after(0, self.stop_game_timer)
+                except Exception:
+                    pass
 
             if success:
                 self.after(0, lambda: self.launch_finish(True, error_message))
@@ -9342,24 +12384,24 @@ class LauncherApp(ctk.CTk):
 
     def launch_finish(self, success, message):
         self.is_launching = False
-        self.launch_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ИГРУ")
+        self.launch_btn.configure(state="normal", text="ЗАПУСТИТЬ ИГРУ")
         self.launch_progressbar.animating = False
 
         if success:
-            self.launch_status_label.configure(text="✅ Игра запущена!", text_color="#6fce7f")
+            self.launch_status_label.configure(text="Игра запущена!", text_color="#6fce7f")
             self.launch_progressbar.set(1.0)
             self.launch_progressbar.configure(progress_color="#6fce7f")
-            self.log("✅ Игра успешно запущена")
+            self.log("Игра запущена")
             self.save_current_selection()
             play_click()
         else:
-            self.launch_status_label.configure(text="❌ Ошибка запуска", text_color="#d3453f")
+            self.launch_status_label.configure(text="Не запустилось", text_color="#d3453f")
             self.launch_progressbar.set(0.3)
             self.launch_progressbar.configure(progress_color="#d3453f")
-            self.log(f"❌ Ошибка запуска: {message}")
+            self.log(f"Не запустилось: {message}")
             self.stop_game_timer()
             play_error()
-            show_error_toast(self, "Ошибка запуска", f"Игра не запустилась.\n\nПричина: {message}")
+            show_error_toast(self, "Не запустилось", f"Игра не запустилась.\n\nПричина: {message}")
 
     def on_game_crashed(self, returncode):
         play_error()
@@ -9388,7 +12430,7 @@ class LauncherApp(ctk.CTk):
         tail_lines = list(self.last_game_output)[-15:] if hasattr(self, 'last_game_output') else []
         tail_text = "\n".join(tail_lines) if tail_lines else "(нет вывода от процесса)"
 
-        self.launch_status_label.configure(text=f"💥 Игра вылетела (код {returncode})", text_color="#d3453f")
+        self.launch_status_label.configure(text=f"Игра вылетела (код {returncode})", text_color="#d3453f")
         self.launch_progressbar.set(0.3)
         self.launch_progressbar.configure(progress_color="#d3453f")
 
@@ -9406,18 +12448,18 @@ class LauncherApp(ctk.CTk):
         try:
             self.log(f"📦 Установка Vanilla {version}...")
             mll.install.install_minecraft_version(version, MINECRAFT_DIR, mll_callback)
-            self.log(f"✅ Vanilla {version} установлен!")
+            self.log(f"Vanilla {version} установлен!")
             create_profile(version, f"Vanilla {version}")
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка: {e}")
+            self.log(f"Ошибка: {e}")
             return False
 
     def install_fabric(self, version):
         try:
             self.log(f"📦 Установка Fabric {version}...")
             mll.fabric.install_fabric(version, MINECRAFT_DIR, callback=mll_callback)
-            self.log(f"✅ Fabric {version} установлен!")
+            self.log(f"Fabric {version} установлен!")
             installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
             fabric_versions = [v for v in installed if "fabric" in v["id"].lower()]
             if fabric_versions:
@@ -9426,7 +12468,7 @@ class LauncherApp(ctk.CTk):
             self.scan_and_update_versions()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка установки Fabric: {e}")
+            self.log(f"Fabric не встал: {e}")
             return False
 
     def install_forge(self, version):
@@ -9441,11 +12483,11 @@ class LauncherApp(ctk.CTk):
             if is_legacy_mc_version(version):
                 full_forge_version = get_forge_full_version(version)
                 if full_forge_version:
-                    self.log(f"🔧 Версия до 1.13 — использую официальный установщик Forge "
+                    self.log(f"Версия до 1.13 — использую официальный установщик Forge "
                              f"{full_forge_version} (надёжнее для этого поколения, меньше шанс крашей рантайм-деобфускации)")
                     installed_ok = self.install_forge_manual(full_forge_version)
                 else:
-                    self.log("⚠️ Не удалось определить точную сборку Forge, пробую через minecraft_launcher_lib...")
+                    self.log("Не получилось определить точную сборку Forge, пробую через minecraft_launcher_lib...")
 
             if not installed_ok:
                 if hasattr(mll.forge, 'install_forge'):
@@ -9465,7 +12507,7 @@ class LauncherApp(ctk.CTk):
             if not installed_ok:
                 return False
 
-            self.log(f"✅ Forge {version} установлен!")
+            self.log(f"Forge {version} установлен!")
             installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
             forge_versions = [v for v in installed if "forge" in v["id"].lower()]
             if forge_versions:
@@ -9474,13 +12516,13 @@ class LauncherApp(ctk.CTk):
             self.scan_and_update_versions()
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка установки Forge: {e}")
+            self.log(f"Forge не встал: {e}")
             return False
 
     def install_forge_manual(self, version):
         try:
             import urllib.request
-            self.log("📥 Скачивание установщика Forge...")
+            self.log("Качаю установщик Forge...")
             forge_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{version}/forge-{version}-installer.jar"
             installer_path = os.path.join(tempfile.gettempdir(), f"forge-{version}-installer.jar")
 
@@ -9488,38 +12530,38 @@ class LauncherApp(ctk.CTk):
                 if total_size > 0:
                     percent = int(count * block_size * 100 / total_size)
                     if percent % 10 == 0:
-                        self.log(f"📊 Скачивание Forge: {percent}%")
+                        self.log(f"Скачивание Forge: {percent}%")
 
             urllib.request.urlretrieve(forge_url, installer_path, report_progress)
-            self.log("🔧 Запуск установщика Forge...")
+            self.log("Запускаю установщик Forge...")
             java_path = get_java_for_version(version)
             cmd = [java_path, "-jar", installer_path, "--installClient", MINECRAFT_DIR]
             process = subprocess.Popen(cmd, cwd=MINECRAFT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True)
+                                       stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
             while True:
                 output = process.stdout.readline()
                 if output == '' and process.poll() is not None:
                     break
                 if output:
-                    self.log(f"📌 {output.strip()}")
+                    self.log(f"{output.strip()}")
             if process.returncode != 0:
                 stderr = process.stderr.read()
-                self.log(f"❌ Ошибка установки Forge: {stderr}")
+                self.log(f"Forge не встал: {stderr}")
                 return False
             try:
                 os.remove(installer_path)
             except:
                 pass
-            self.log("✅ Forge установлен через официальный установщик")
+            self.log("Forge установлен через официальный установщик")
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка ручной установки Forge: {e}")
+            self.log(f"Forge вручную не встал: {e}")
             return False
 
     def install_optifine(self, version):
         try:
             if not hasattr(self, 'selected_installer_path') or not self.selected_installer_path:
-                self.log("❌ Файл не выбран")
+                self.log("Файл не выбран")
                 return False
 
             self.log(f"📦 Установка OptiFine {version}...")
@@ -9528,7 +12570,7 @@ class LauncherApp(ctk.CTk):
             self.log(f"📦 Шаг 2/2: Установка OptiFine...")
             mll.optifine.install_optifine(self.selected_installer_path, MINECRAFT_DIR, mll_callback)
 
-            self.log(f"✅ OptiFine {version} установлен!")
+            self.log(f"OptiFine {version} установлен!")
             installed = mll.utils.get_installed_versions(MINECRAFT_DIR)
             optifine_versions = [v for v in installed if "optifine" in v["id"].lower()]
             if optifine_versions:
@@ -9536,10 +12578,10 @@ class LauncherApp(ctk.CTk):
                 create_profile(optifine_id, f"OptiFine {version}")
             self.scan_and_update_versions()
             self.selected_installer_path = None
-            self.install_file_label.configure(text="❌ Файл не выбран", text_color="#d3453f")
+            self.install_file_label.configure(text="Файл не выбран", text_color="#d3453f")
             return True
         except Exception as e:
-            self.log(f"❌ Ошибка установки OptiFine: {e}")
+            self.log(f"OptiFine не встал: {e}")
             return False
 
     def install_selected_client(self):
@@ -9548,22 +12590,22 @@ class LauncherApp(ctk.CTk):
 
         if not version:
             play_error()
-            show_error_toast(self, "Ошибка", "Укажи версию Minecraft")
+            show_error_toast(self, "Не вышло", "Укажи версию Minecraft")
             return
 
         if install_type == "optifine":
             if not hasattr(self, 'selected_installer_path') or not self.selected_installer_path:
                 play_error()
-                show_error_toast(self, "Ошибка", "Файл OptiFine не выбран")
+                show_error_toast(self, "Не вышло", "Файл OptiFine не выбран")
                 return
 
         self.log(f"📦 Установка {install_type} {version}")
-        self.install_btn.configure(state="disabled", text="⏳ УСТАНОВКА...")
+        self.install_btn.configure(state="disabled", text="СТАВЛЮ...")
         _reset_install_progress_state()
         self.install_progressbar.animating = False
         self.install_progressbar.set(0)
         self.install_progressbar.configure(progress_color="#6d92ff")
-        self.install_status_label.configure(text="Подготовка...", text_color="#d9622f")
+        self.install_status_label.configure(text="Готовлю...", text_color="#d9622f")
         self.update_idletasks()
 
         def do_install():
@@ -9582,24 +12624,24 @@ class LauncherApp(ctk.CTk):
             cleanup_forge_temp()
 
             def finish_ui():
-                self.install_btn.configure(state="normal", text="📥 УСТАНОВИТЬ")
+                self.install_btn.configure(state="normal", text="УСТАНОВИТЬ")
                 self.install_progressbar.animating = False
                 if success:
-                    self.log(f"✅ {install_type.capitalize()} {version} установлен!")
+                    self.log(f"{install_type.capitalize()} {version} установлен!")
                     self.install_progressbar.set(1.0)
                     self.install_progressbar.configure(progress_color="#6fce7f")
-                    self.install_status_label.configure(text=f"✅ {install_type.capitalize()} {version} установлен!",
+                    self.install_status_label.configure(text=f"{install_type.capitalize()} {version} установлен!",
                                                         text_color="#6fce7f")
                     self.scan_and_update_versions()
                     play_click()
-                    show_info_toast(self, "Успешно", f"{install_type.capitalize()} {version} готов к работе")
+                    show_info_toast(self, "Готово", f"{install_type.capitalize()} {version} готов к работе")
                 else:
-                    self.log(f"❌ Ошибка установки {install_type}")
+                    self.log(f"Ошибка установки {install_type}")
                     self.install_progressbar.set(0.3)
                     self.install_progressbar.configure(progress_color="#d3453f")
-                    self.install_status_label.configure(text=f"❌ Ошибка установки {install_type}", text_color="#d3453f")
+                    self.install_status_label.configure(text=f"Ошибка установки {install_type}", text_color="#d3453f")
                     play_error()
-                    show_error_toast(self, "Ошибка", f"{install_type.capitalize()} {version} не встал")
+                    show_error_toast(self, "Не вышло", f"{install_type.capitalize()} {version} не встал")
 
             self.after(0, finish_ui)
 
@@ -9618,7 +12660,7 @@ class LauncherApp(ctk.CTk):
                 }.get(relay_status, f"🌐 Релей: {new_relay}")
                 self.log(status_text)
             except Exception as e:
-                self.log(f"⚠️ Ошибка проверки relay.active.txt: {e}")
+                self.log(f"Ошибка проверки relay.active.txt: {e}")
 
         threading.Thread(target=_check_relay, daemon=True).start()
 
@@ -9691,13 +12733,13 @@ class LauncherApp(ctk.CTk):
                     self.settings["chat_setup_last_view"] = view
                     save_launcher_settings(self.settings)
 
-        group_btn = make_sound_button(switch_frame, text="👥 Групповой чат",
+        group_btn = make_sound_button(switch_frame, text="Групповой чат",
                                       command=lambda: switch_view("group"),
                                       fg_color="#6d92ff", hover_color="#5a7dd8",
                                       height=36, font=ctk.CTkFont(size=13, weight="bold"))
         group_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
-        chats_btn = make_sound_button(switch_frame, text="💌 Чаты (новое!)",
+        chats_btn = make_sound_button(switch_frame, text="Чаты (новое!)",
                                       command=lambda: switch_view("chats"),
                                       fg_color="#2b2840", hover_color="#3d3a52",
                                       height=36, font=ctk.CTkFont(size=13, weight="bold"))
@@ -9711,7 +12753,7 @@ class LauncherApp(ctk.CTk):
         relay_frame = ctk.CTkFrame(group_container, fg_color="#100e1a", corner_radius=10)
         relay_frame.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(relay_frame, text="🌍 ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЛЕЙ (работает через интернет, без проброса портов):",
+        ctk.CTkLabel(relay_frame, text="ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЛЕЙ (работает через интернет, без проброса портов):",
                      font=ctk.CTkFont(size=12, weight="bold"), text_color="#6fce7f",
                      wraplength=520, justify="center").pack(pady=(8, 4), padx=10)
         relay_row = ctk.CTkFrame(relay_frame, fg_color="transparent")
@@ -9733,7 +12775,7 @@ class LauncherApp(ctk.CTk):
             relay_entry.insert(0, RELAY_URL)
             play_click()
 
-        reset_relay_btn = make_sound_button(relay_row, text="↩️ По умолчанию",
+        reset_relay_btn = make_sound_button(relay_row, text="По умолчанию",
                                             command=reset_relay,
                                             width=110, height=32,
                                             fg_color="#2b2840", hover_color="#3d3a52",
@@ -9741,14 +12783,14 @@ class LauncherApp(ctk.CTk):
         reset_relay_btn.pack(side="left", padx=(6, 0))
 
         ctk.CTkLabel(relay_frame,
-                     text="Можно вписать свой адрес релея (wss://...), если не хотите использовать релей по умолчанию",
+                     text="Можно вписать свой адрес релея (wss://...), если не хочешь пользоваться стандартным",
                      font=ctk.CTkFont(size=10), text_color="#8b87a3",
                      wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
 
         instr_frame = ctk.CTkFrame(group_container, fg_color="#201d30", corner_radius=10)
         instr_frame.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(instr_frame, text="📝 КАК ПОДКЛЮЧИТЬСЯ:",
+        ctk.CTkLabel(instr_frame, text="Как подключиться:",
                      font=ctk.CTkFont(size=13, weight="bold"), text_color="#d9622f").pack(pady=(5, 5))
 
         instr_text = """1️⃣ Один из вас жмёт "Хост" (создать комнату)
@@ -9771,12 +12813,12 @@ class LauncherApp(ctk.CTk):
 
         mode_var = ctk.StringVar(value="server")
 
-        server_rb = ctk.CTkRadioButton(mode_frame, text="🖥️ Я ХОСТ (создать комнату) - запустите ПЕРВЫМ",
+        server_rb = ctk.CTkRadioButton(mode_frame, text="Я ХОСТ (создать комнату) - запустите ПЕРВЫМ",
                                        variable=mode_var, value="server",
                                        font=ctk.CTkFont(size=13))
         server_rb.pack(anchor="w", pady=3)
 
-        client_rb = ctk.CTkRadioButton(mode_frame, text="💻 Я ГОСТЬ (подключиться по коду) - запустите ВТОРЫМ",
+        client_rb = ctk.CTkRadioButton(mode_frame, text="Я ГОСТЬ (подключиться по коду) - запустите ВТОРЫМ",
                                        variable=mode_var, value="client",
                                        font=ctk.CTkFont(size=13))
         client_rb.pack(anchor="w", pady=3)
@@ -9787,20 +12829,20 @@ class LauncherApp(ctk.CTk):
         room_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
         room_row.pack(fill="x", pady=3)
 
-        ctk.CTkLabel(room_row, text="🚪 Код комнаты:", font=ctk.CTkFont(size=13, weight="bold"),
+        ctk.CTkLabel(room_row, text="Код комнаты:", font=ctk.CTkFont(size=13, weight="bold"),
                      width=140).pack(side="left")
         room_entry = ctk.CTkEntry(room_row, placeholder_text="Код комнаты сюда", width=180, height=35,
                                   font=ctk.CTkFont(size=13))
         room_entry.pack(side="left", padx=(10, 0))
 
-        paste_btn = make_sound_button(room_row, text="📋 Вставить",
+        paste_btn = make_sound_button(room_row, text="Вставить",
                                       command=lambda: self.paste_ip_to_entry(room_entry),
                                       width=80, height=30,
                                       fg_color="#d9622f", hover_color="#c14f26",
                                       text_color="#16141f", font=ctk.CTkFont(size=11))
         paste_btn.pack(side="left", padx=(5, 0))
 
-        copy_room_btn = make_sound_button(room_row, text="📋 Копировать",
+        copy_room_btn = make_sound_button(room_row, text="Копировать",
                                           command=lambda: self.copy_ip_to_clipboard(room_entry.get().strip()),
                                           width=95, height=30,
                                           fg_color="#6d92ff", hover_color="#5a7dd8",
@@ -9831,14 +12873,14 @@ class LauncherApp(ctk.CTk):
 
                 if not room:
                     play_error()
-                    show_error_toast(self, "Ошибка", "Код комнаты пустой")
+                    show_error_toast(self, "Не вышло", "Код комнаты пустой")
                     return
 
                 if mode != "server":
                     open_chat_and_finish(mode, room, relay_url)
                     return
 
-                start_btn.configure(state="disabled", text="⏳ Проверяем код...")
+                start_btn.configure(state="disabled", text="Проверяем код...")
                 cancel_btn.configure(state="disabled")
 
                 def do_check():
@@ -9850,13 +12892,13 @@ class LauncherApp(ctk.CTk):
 
                     def after_check():
                         try:
-                            start_btn.configure(state="normal", text="🚀 ЗАПУСТИТЬ ЧАТ")
+                            start_btn.configure(state="normal", text="ЗАПУСТИТЬ ЧАТ")
                             cancel_btn.configure(state="normal")
                         except:
                             return
 
                         if error_text:
-                            self.log(f"⚠️ Не удалось проверить код комнаты ({error_text}) — создаю без проверки")
+                            self.log(f"Не удалось проверить код комнаты ({error_text}) — создаю без проверки")
                             open_chat_and_finish(mode, room, relay_url)
                         elif active and count >= max_size:
                             play_error()
@@ -9887,14 +12929,14 @@ class LauncherApp(ctk.CTk):
 
             except Exception as e:
                 play_error()
-                show_error_toast(self, "Ошибка", f"Чат не открылся:\n{e}")
+                show_error_toast(self, "Не вышло", f"Чат не открылся:\n{e}")
 
-        start_btn = make_sound_button(btn_frame, text="🚀 ЗАПУСТИТЬ ЧАТ", command=start_chat,
+        start_btn = make_sound_button(btn_frame, text="ЗАПУСТИТЬ ЧАТ", command=start_chat,
                                       fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                                       font=ctk.CTkFont(size=16, weight="bold"), height=50)
         start_btn.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        cancel_btn = make_sound_button(btn_frame, text="❌ ОТМЕНА", command=_save_setup_size_and_close,
+        cancel_btn = make_sound_button(btn_frame, text="Отмена", command=_save_setup_size_and_close,
                                        fg_color="#d3453f", hover_color="#b83530", height=50,
                                        font=ctk.CTkFont(size=16, weight="bold"))
         cancel_btn.pack(side="right", fill="x", expand=True)
@@ -9904,7 +12946,7 @@ class LauncherApp(ctk.CTk):
         my_id_frame = ctk.CTkFrame(chats_container, fg_color="#100e1a", corner_radius=10)
         my_id_frame.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(my_id_frame, text="🆔 Твой личный ID — дай его другу, чтобы он тебя добавил:",
+        ctk.CTkLabel(my_id_frame, text="Твой личный ID — дай его другу, чтобы он тебя добавил:",
                      font=ctk.CTkFont(size=12, weight="bold"), text_color="#6fce7f",
                      wraplength=520, justify="center").pack(pady=(8, 4), padx=10)
 
@@ -9917,18 +12959,24 @@ class LauncherApp(ctk.CTk):
         my_id_entry.configure(state="disabled")
         my_id_entry.pack(side="left", fill="x", expand=True)
 
-        copy_my_id_btn = make_sound_button(my_id_row, text="📋 Копировать",
+        copy_my_id_btn = make_sound_button(my_id_row, text="Копировать",
                                            command=lambda: self.copy_ip_to_clipboard(my_user_id),
                                            width=110, height=32,
                                            fg_color="#6d92ff", hover_color="#5a7dd8",
                                            font=ctk.CTkFont(size=11))
         copy_my_id_btn.pack(side="left", padx=(6, 0))
 
-        add_user_btn = make_sound_button(chats_container, text="➕ Добавить пользователя",
+        add_user_btn = make_sound_button(chats_container, text="Добавить пользователя",
                                          command=lambda: open_add_contact_dialog(),
                                          fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                                          font=ctk.CTkFont(size=14, weight="bold"), height=42)
-        add_user_btn.pack(fill="x", pady=(0, 10))
+        add_user_btn.pack(fill="x", pady=(0, 8))
+
+        friends_btn = make_sound_button(chats_container, text="👥 Друзья",
+                                        command=self.open_friends_window,
+                                        fg_color="#6d92ff", hover_color="#5a7dd8",
+                                        height=42, font=ctk.CTkFont(size=14, weight="bold"))
+        friends_btn.pack(fill="x", pady=(0, 10))
 
         chats_scroll = ctk.CTkScrollableFrame(chats_container, fg_color="#100e1a", corner_radius=10)
         chats_scroll.pack(fill="both", expand=True)
@@ -9948,50 +12996,8 @@ class LauncherApp(ctk.CTk):
             refresh_chats_list()
 
         def open_personal_chat_and_finish(contact):
-            their_id = contact.get("id")
-
-            existing = self.active_chat_windows.get(their_id)
-            if existing:
-                try:
-                    if existing.winfo_exists():
-                        existing.restore_chat_only()
-                        self.active_chat_window = existing
-                        _save_setup_size_and_close()
-                        return
-                except:
-                    pass
-
-            room = "dm-" + "-".join(sorted([my_user_id, their_id]))
-            relay_url = relay_entry.get().strip() or RELAY_URL
-
-            def do_negotiate():
-                try:
-                    active, _count, _max_size = check_room_active(relay_url, room, timeout=5)
-                    negotiated_mode = "client" if active else "server"
-                except Exception:
-                    negotiated_mode = "server"
-
-                def after_negotiate():
-                    try:
-                        self.settings["custom_relay_url"] = relay_url if relay_url != RELAY_URL else ""
-                        save_launcher_settings(self.settings)
-                    except:
-                        pass
-                    _save_setup_size_only()
-                    self.chats_list_refresh_callback = None
-                    release_and_destroy(dialog)
-                    chat_window = ChatWindow(self, negotiated_mode, room, relay_url=relay_url,
-                                             personal_contact=contact)
-                    self.active_chat_window = chat_window
-                    self.active_chat_windows[their_id] = chat_window
-                    self.log(f"💬 Личный чат с «{contact.get('name')}» открыт (комната {room})")
-
-                try:
-                    dialog.after(0, after_negotiate)
-                except:
-                    pass
-
-            threading.Thread(target=do_negotiate, daemon=True).start()
+            self._open_direct_message(contact)
+            _save_setup_size_and_close()
 
         def refresh_chats_list():
             try:
@@ -10064,7 +13070,7 @@ class LauncherApp(ctk.CTk):
 
         def open_add_contact_dialog():
             add_dialog = ctk.CTkToplevel(dialog)
-            add_dialog.title("➕ Добавить пользователя")
+            add_dialog.title("Добавить пользователя")
             add_dialog.geometry("420x320")
             add_dialog.resizable(False, False)
             add_dialog.grab_set()
@@ -10073,7 +13079,7 @@ class LauncherApp(ctk.CTk):
             frame = ctk.CTkFrame(add_dialog, fg_color="transparent")
             frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-            ctk.CTkLabel(frame, text="➕ Добавить пользователя",
+            ctk.CTkLabel(frame, text="Добавить пользователя",
                          font=ctk.CTkFont(size=18, weight="bold"), text_color="#6d92ff").pack(pady=(0, 12))
 
             ctk.CTkLabel(frame, text="ID пользователя (его дал тебе друг):",
@@ -10093,11 +13099,11 @@ class LauncherApp(ctk.CTk):
 
                 if not cid:
                     play_error()
-                    show_error_toast(self, "Ошибка", "Введи ID пользователя")
+                    show_error_toast(self, "Не вышло", "Введи ID пользователя")
                     return
                 if cid == my_user_id:
                     play_error()
-                    show_error_toast(self, "Ошибка", "Это твой собственный ID")
+                    show_error_toast(self, "Не вышло", "Это твой собственный ID")
                     return
 
                 contacts = self.settings.setdefault("personal_chats", [])
@@ -10110,26 +13116,16 @@ class LauncherApp(ctk.CTk):
                     show_error_toast(self,
                         "Лимит чатов",
                         f"Больше {MAX_PERSONAL_CHATS} личных чатов не влезет.\n"
-                        f"Удали ненужный (🗑️ в списке «Чаты») — и добавишь нового."
+                        f"Удали ненужный (в списке «Чаты») — и добавишь нового."
                     )
                     return
 
-                contacts.append({
-                    "id": cid,
-                    "name": cname or cid,
-                    "last_message": "",
-                    "last_message_time": "",
-                    "last_message_ts": 0,
-                    "last_message_mine": False,
-                    "unread": False,
-                })
-                save_launcher_settings(self.settings)
                 self.send_friend_request_to(cid, cname)
                 play_click()
                 add_dialog.destroy()
                 refresh_chats_list()
 
-            make_sound_button(frame, text="✅ Добавить", command=confirm_add,
+            make_sound_button(frame, text="Добавить", command=confirm_add,
                               fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
                               height=40, font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", pady=(6, 0))
 
@@ -10152,15 +13148,610 @@ class LauncherApp(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(ip)
             play_click()
-            show_info_toast(self, "Скопировано", f"IP-адрес скопирован в буфер обмена:\n{ip}")
+            show_info_toast(self, "Скопировано", f"IP скопирован:\n{ip}")
         except:
             play_error()
-            show_error_toast(self, "Ошибка", "IP не скопировался")
+            show_error_toast(self, "Не вышло", "IP не скопировался")
+
+    # ---------- Мировой рейтинг по времени в игре ----------
+
+    def _lb_participates(self):
+        return bool(self.settings.get("lb_participate", True))
+
+    def lb_toggle_participate(self):
+        enabled = self.lb_participate_switch.get() == 1
+        self.settings["lb_participate"] = enabled
+        save_launcher_settings(self.settings)
+        self.log(f"Отправка времени в мировой рейтинг: {'включена' if enabled else 'выключена'} (сохранено)")
+        if enabled:
+            self.lb_start(submit=True)
+
+    def _lb_stats_snapshot(self):
+        """Готовит компактный снимок локальной статистики для мирового рейтинга."""
+        stats = load_stats()
+        launches = max(0, lb_safe_int(stats.get("launches", 0)))
+        total_play_time = max(0, lb_safe_int(stats.get("total_play_time", 0)))
+        licensed_book = stats.get("licensed_play")
+        account_times = {}
+        licensed_play = 0
+        if isinstance(licensed_book, dict):
+            for uid, rec in licensed_book.items():
+                if not isinstance(rec, dict):
+                    continue
+                seconds = max(0, lb_safe_int(rec.get("seconds", 0)))
+                licensed_play += seconds
+                name = str(rec.get("name") or uid or "?").strip()[:32]
+                if name:
+                    account_times[name] = max(account_times.get(name, 0), seconds)
+
+        history = []
+        raw_history = stats.get("launch_history")
+        if isinstance(raw_history, list):
+            for item in raw_history[-20:]:
+                if not isinstance(item, dict):
+                    continue
+                when = str(item.get("time") or "").strip()
+                version = str(item.get("version") or "unknown").strip()
+                if when:
+                    history.append(f"{when[:32]} - {version[:64]}")
+
+        last_launch = stats.get("last_launch")
+        if not isinstance(last_launch, str):
+            last_launch = None
+
+        return {
+            "launches": launches,
+            "total_play_time": total_play_time,
+            "licensed_play": licensed_play,
+            "account_times": account_times,
+            "last_launch": last_launch,
+            "launch_history": history,
+            "launcher_launches": max(0, lb_safe_int(self.settings.get("launch_count", 0))),
+        }
+
+    def _lb_targets(self):
+        """[(аккаунт, секунды)] — лицензионные аккаунты с наигранным временем."""
+        stats = load_stats()
+        played = stats.get("licensed_play")
+        if not isinstance(played, dict):
+            return []
+        targets = []
+        for acc in load_accounts():
+            if acc.get("type") != "microsoft":
+                continue
+            uid = lb_normalize_uuid(acc.get("uuid"))
+            rec = played.get(uid) if uid else None
+            secs = lb_safe_int(rec.get("seconds")) if isinstance(rec, dict) else 0
+            if secs > 0:
+                targets.append((acc, secs))
+        return targets
+
+    def _lb_my_uuids(self):
+        result = []
+        for acc in load_accounts():
+            if acc.get("type") == "microsoft":
+                uid = lb_normalize_uuid(acc.get("uuid"))
+                if uid:
+                    result.append(uid)
+        return result
+
+    def _lb_ui(self, func, *args):
+        """Безопасно вызвать func в главном потоке (окно могли уже закрыть)."""
+        try:
+            if not getattr(self, "_closing", False):
+                self.after(0, lambda: func(*args))
+        except Exception:
+            pass
+
+    def _lb_set_status(self, text, color="#a8a4bd"):
+        try:
+            self.lb_status_label.configure(text=text, text_color=color)
+        except Exception:
+            pass
+
+    def _lb_set_buttons(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for name in ("lb_refresh_btn", "lb_submit_btn"):
+            try:
+                getattr(self, name).configure(state=state)
+            except Exception:
+                pass
+
+    def lb_start(self, submit=False, force=False):
+        """Запускает в фоне: (по желанию) отправку времени и загрузку таблицы.
+        submit — слать время (если включено в настройках), force — слать, даже если отправка выключена."""
+        if not hasattr(self, "lb_textbox"):
+            return
+        if getattr(self, "_lb_running", False):
+            if submit:
+                self._lb_pending_submit = True
+            if force:
+                self._lb_set_status("Погоди, я ещё с прошлым запросом вожусь…", "#d9622f")
+            return
+        do_submit = bool(submit) and (force or self._lb_participates())
+        self._lb_running = True
+        self._lb_set_buttons(False)
+        self._lb_set_status("Грузу рейтинг… если сервер спал, это может занять до минуты", "#d9622f")
+        threading.Thread(target=self._lb_worker, args=(do_submit, force), daemon=True).start()
+
+    def _lb_worker(self, do_submit, force):
+        notes = []
+        data = None
+        error = None
+        try:
+            if do_submit:
+                targets = self._lb_targets()
+                snapshot = self._lb_stats_snapshot()
+                if not targets:
+                    notes.append(("info", "отправлять пока нечего — нужен лицензионный аккаунт, на котором ты уже играл"))
+                for acc, secs in targets:
+                    nick = acc.get("username", "?")
+                    try:
+                        my_launcher_id = ensure_user_id(self.settings)
+                        my_friend_auth = ensure_friend_auth_token(self.settings)
+                        res = submit_licensed_playtime(acc, secs, snapshot, my_launcher_id, my_friend_auth)
+                        notes.append(("ok", f"{nick}: #{res.get('rank')} в мире"))
+                    except LeaderboardNetworkError as e:
+                        error = str(e)
+                        break
+                    except LeaderboardError as e:
+                        notes.append(("err", f"{nick}: {e}"))
+                    except Exception as e:
+                        notes.append(("err", f"{nick}: не вышло ({e})"))
+            if error is None:
+                data = fetch_world_leaderboard(self._lb_my_uuids())
+        except LeaderboardError as e:
+            error = str(e)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        self._lb_ui(self._lb_finish, data, notes, error, force)
+
+    def _lb_finish(self, data, notes, error, force):
+        self._lb_running = False
+        self._lb_set_buttons(True)
+        if data is not None:
+            self._lb_render(data)
+        oks = [text for kind, text in notes if kind == "ok"]
+        errs = [text for kind, text in notes if kind == "err"]
+        infos = [text for kind, text in notes if kind == "info"]
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if error:
+            self._lb_set_status(f"Не достучался до рейтинга: {error}", "#d3453f")
+            if force:
+                play_error()
+                show_error_toast(self, "Не вышло", f"Рейтинг не отозвался:\n{error}")
+        else:
+            total = lb_safe_int((data or {}).get("total"))
+            status = f"Обновлено в {stamp} · игроков в рейтинге: {total}"
+            color = "#6fce7f"
+            if oks:
+                status += " · время ушло: " + "; ".join(oks)
+            if errs:
+                status += " · не ушло — " + "; ".join(errs)
+                color = "#e0a93b"
+            if infos and not oks and not errs:
+                status += " · " + "; ".join(infos)
+            self._lb_set_status(status, color)
+            if force:
+                if errs:
+                    play_error()
+                    show_error_toast(self, "Не вышло", "\n".join(errs))
+                elif oks:
+                    play_click()
+                    show_info_toast(self, "Готово", "Время ушло в рейтинг:\n" + "\n".join(oks))
+                else:
+                    show_info_toast(self, "Пусто", infos[0] if infos else "Отправлять нечего")
+        if self._lb_pending_submit:
+            self._lb_pending_submit = False
+            self.lb_start(submit=True)
+
+    def _lb_show_context_menu(self, event):
+        """Открывает меню по ПКМ, только если курсор находится на строке игрока."""
+        try:
+            tb = self.lb_textbox._textbox
+            index = tb.index(f"@{event.x},{event.y}")
+            line_no = int(str(index).split(".", 1)[0])
+            line = tb.get(f"{line_no}.0", f"{line_no}.end").strip()
+
+            # Строки игроков начинаются с номера места. Заголовок, многоточие
+            # и служебные строки меню не вызывают.
+            parts = line.split(None, 1)
+            if not parts or not parts[0].isdigit():
+                self._lb_context_player = None
+                return
+
+            rank = lb_safe_int(parts[0])
+            if rank <= 0:
+                self._lb_context_player = None
+                return
+
+            name_part = parts[1] if len(parts) > 1 else ""
+            # Формат строки: "Ник                1ч 20м   ← это ты".
+            if "← это ты" in name_part:
+                name_part = name_part.split("← это ты", 1)[0].rstrip()
+            # Берём ник по фиксированной ширине строки, как в _lb_render.
+            name = name_part[:16].strip()
+            if not name or name == "?":
+                self._lb_context_player = None
+                return
+
+            # Сохраняем точную запись игрока из данных рейтинга. Это позволяет
+            # безопасно получить UUID и ID лаунчера, не угадывая их по текстовой строке.
+            player = {"rank": rank, "name": name, "seconds": 0, "uuid": "", "launcher_user_id": ""}
+            for entry in getattr(self, "_lb_entries_cache", []):
+                if not isinstance(entry, dict):
+                    continue
+                if lb_safe_int(entry.get("rank")) == rank and str(entry.get("name") or "").strip() == name:
+                    player.update({
+                        "name": str(entry.get("name") or name).strip(),
+                        "seconds": lb_safe_int(entry.get("seconds")),
+                        "uuid": lb_normalize_uuid(entry.get("uuid")) or "",
+                        "launcher_user_id": str(entry.get("launcher_user_id") or "").strip(),
+                    })
+                    break
+            self._lb_context_player = player
+            self._lb_context_menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            self._lb_context_player = None
+        finally:
+            try:
+                self.lb_textbox.configure(state="disabled")
+            except Exception:
+                pass
+
+    def _lb_context_get_player(self):
+        player = getattr(self, "_lb_context_player", None)
+        return player if isinstance(player, dict) else None
+
+    def _lb_message_context_player(self):
+        player = self._lb_context_get_player()
+        if not player:
+            return
+        target_id = str(player.get("launcher_user_id") or "").strip()
+        if not target_id:
+            play_error()
+            show_error_toast(self, "Не вышло", "У этого игрока ещё нет доступного личного чата.\nОбновите его 67Launcher до новой версии.")
+            return
+        if target_id == ensure_user_id(self.settings):
+            show_info_toast(self, "Это ты", "Нельзя открыть личный чат с самим собой.")
+            return
+        contact = {
+            "id": target_id,
+            "name": str(player.get("name") or target_id),
+            "last_message": "",
+            "last_message_time": "",
+            "last_message_ts": 0,
+            "last_message_mine": False,
+            "unread": False,
+        }
+        try:
+            contacts = self.settings.setdefault("personal_chats", [])
+            existing = next((c for c in contacts if c.get("id") == target_id), None)
+            if existing:
+                contact = existing
+            else:
+                if len(contacts) >= MAX_PERSONAL_CHATS:
+                    play_error()
+                    show_error_toast(self, "Лимит чатов", f"Больше {MAX_PERSONAL_CHATS} личных чатов не влезет.")
+                    return
+                contacts.append(contact)
+                save_launcher_settings(self.settings)
+            self._lb_open_personal_contact(contact)
+        except Exception as e:
+            play_error()
+            show_error_toast(self, "Не вышло", f"Не удалось открыть чат: {e}")
+
+    def _lb_open_personal_contact(self, contact):
+        """Открывает настоящий DM 1-на-1. Он НЕ использует комнаты."""
+        self._open_direct_message(contact)
+
+    def _open_direct_message(self, contact):
+        their_id = str((contact or {}).get("id") or "").strip().upper()
+        if not their_id:
+            return
+        if their_id == ensure_user_id(self.settings):
+            show_info_toast(self, "Это ты", "Нельзя открыть личный чат с самим собой.")
+            return
+        contact = dict(contact or {})
+        contact["id"] = their_id
+        contact["name"] = str(contact.get("name") or their_id)
+        existing = getattr(self, "active_direct_chat_windows", {}).get(their_id)
+        if existing:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+        win = DirectMessageWindow(self, contact)
+        self.active_direct_chat_windows[their_id] = win
+        self.active_chat_window = win
+        self.log(f"💬 Личная переписка с «{contact.get('name')}» открыта напрямую, без комнаты")
+
+    def _send_friend_direct_message(self, target_id, text):
+        target_id = str(target_id or "").strip().upper()
+        text = str(text or "").strip()
+        ws = getattr(self, "_friend_presence_ws", None)
+        if not target_id or not text or ws is None:
+            return False
+        if len(text) > 2000:
+            text = text[:2000]
+        try:
+            with self._friend_send_lock:
+                ws.send(json.dumps({
+                    "action": "friend_message",
+                    "user_id": ensure_user_id(self.settings),
+                    "target_id": target_id,
+                    "text": text,
+                }, ensure_ascii=False, separators=(",", ":")))
+            return True
+        except Exception:
+            return False
+
+    def _update_personal_chat_preview(self, contact_id, text, mine):
+        try:
+            contact_id = str(contact_id or "").strip().upper()
+            contacts = self.settings.setdefault("personal_chats", [])
+            changed = False
+            for c in contacts:
+                if str(c.get("id") or "").strip().upper() == contact_id:
+                    now = datetime.now()
+                    c["last_message"] = str(text or "")[:200]
+                    c["last_message_time"] = now.strftime("%d.%m %H:%M")
+                    c["last_message_ts"] = now.timestamp()
+                    c["last_message_mine"] = bool(mine)
+                    c["unread"] = False if mine else not bool(getattr(self.active_direct_chat_windows.get(contact_id), "winfo_exists", lambda: False)())
+                    changed = True
+                    break
+            if changed:
+                save_launcher_settings(self.settings)
+                cb = getattr(self, "chats_list_refresh_callback", None)
+                if cb:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _handle_friend_direct_message(self, data):
+        from_id = str(data.get("from_id") or "").strip().upper()
+        text = str(data.get("text") or "").strip()
+        if not from_id or not text:
+            return
+        contacts = self.settings.setdefault("personal_chats", [])
+        contact = next((c for c in contacts if str(c.get("id") or "").strip().upper() == from_id), None)
+        if contact is None:
+            if len(contacts) >= MAX_PERSONAL_CHATS:
+                return
+            contact = {
+                "id": from_id,
+                "name": from_id,
+                "last_message": "",
+                "last_message_time": "",
+                "last_message_ts": 0,
+                "last_message_mine": False,
+                "unread": True,
+            }
+            contacts.append(contact)
+            save_launcher_settings(self.settings)
+        else:
+            contact["unread"] = True
+            save_launcher_settings(self.settings)
+        win = getattr(self, "active_direct_chat_windows", {}).get(from_id)
+        if win:
+            try:
+                if win.winfo_exists():
+                    win.receive_message(text, data.get("timestamp"))
+                    contact["unread"] = False
+                    save_launcher_settings(self.settings)
+                    return
+            except Exception:
+                pass
+        self._update_personal_chat_preview(from_id, text, False)
+        self._show_direct_message_notification(contact.get("name") or from_id, text)
+
+    def _show_direct_message_notification(self, name, text):
+        try:
+            show_info_toast(self, f"💬 {name}", text[:180])
+        except Exception:
+            pass
+
+    def _lb_open_context_profile(self):
+        player = self._lb_context_get_player()
+        if not player:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title(f"👤 Профиль — {player.get('name') or '?'}")
+        win.geometry("460x390")
+        win.resizable(False, False)
+        win.transient(self)
+        frame = ctk.CTkFrame(win, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=24, pady=24)
+        ctk.CTkLabel(frame, text=f"👤 {player.get('name') or '?'}",
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(0, 18))
+        info = ctk.CTkLabel(frame, text=(
+            f"🏆 Место в рейтинге: #{lb_safe_int(player.get('rank'))}\n"
+            f"⏱ Время в игре: {lb_format_duration(player.get('seconds'))}\n\n"
+            "Загружаю публичную статистику…"),
+            font=ctk.CTkFont(size=14), justify="left")
+        info.pack(anchor="w", fill="x")
+        ctk.CTkButton(frame, text="Закрыть", command=win.destroy, width=150).pack(side="bottom", pady=(20, 0))
+
+        def worker():
+            try:
+                data = fetch_world_player_stats(player.get("uuid"))
+                stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+                text = (
+                    f"🏆 Место в рейтинге: #{lb_safe_int(data.get('rank'))}\n"
+                    f"⏱ Время в игре: {lb_format_duration(data.get('seconds'))}\n"
+                    f"🚀 Запусков игры: {lb_safe_int(stats.get('launches'))}\n"
+                    f"⏱ Общее время игры: {lb_format_duration(stats.get('total_play_time'))}\n"
+                    f"🔷 Лицензионное время: {lb_format_duration(stats.get('licensed_play'))}\n"
+                    f"📊 Запусков лаунчера: {lb_safe_int(stats.get('launcher_launches'))}\n"
+                    f"🕐 Последний запуск: {stats.get('last_launch') or 'нет данных'}")
+            except Exception as e:
+                text = f"🏆 Место в рейтинге: #{lb_safe_int(player.get('rank'))}\n⏱ Время в игре: {lb_format_duration(player.get('seconds'))}\n\nНе удалось загрузить дополнительные данные: {e}"
+            try:
+                win.after(0, lambda: info.configure(text=text))
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _lb_show_context_stats(self):
+        player = self._lb_context_get_player()
+        if not player:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title(f"📊 Статистика — {player.get('name') or '?'}")
+        win.geometry("560x520")
+        win.transient(self)
+        frame = ctk.CTkFrame(win, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        ctk.CTkLabel(frame, text=f"📊 Статистика игрока «{player.get('name') or '?'}»",
+                     font=ctk.CTkFont(size=21, weight="bold")).pack(pady=(0, 12))
+        box = ctk.CTkTextbox(frame, font=ctk.CTkFont(family="Consolas", size=13))
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", "Загружаю статистику…")
+        box.configure(state="disabled")
+
+        def worker():
+            try:
+                data = fetch_world_player_stats(player.get("uuid"))
+                stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+                lines = [
+                    f"👤 Ник: {data.get('name') or player.get('name') or '?'}",
+                    f"🏆 Место: #{lb_safe_int(data.get('rank'))}",
+                    f"⏱ Время в рейтинге: {lb_format_duration(data.get('seconds'))}",
+                    f"🚀 Всего запусков игры: {lb_safe_int(stats.get('launches'))}",
+                    f"⏱ Общее время игры: {lb_format_duration(stats.get('total_play_time'))}",
+                    f"🔷 Лицензионное время: {lb_format_duration(stats.get('licensed_play'))}",
+                    f"📊 Запусков лаунчера: {lb_safe_int(stats.get('launcher_launches'))}",
+                    f"🕐 Последний запуск: {stats.get('last_launch') or 'нет данных'}",
+                    "",
+                    "🎮 Время по аккаунтам:",
+                ]
+                accounts = stats.get("account_times") if isinstance(stats.get("account_times"), dict) else {}
+                if accounts:
+                    lines.extend(f"  • {name}: {lb_format_duration(seconds)}" for name, seconds in accounts.items())
+                else:
+                    lines.append("  нет данных")
+                lines += ["", "📋 Последние запуски:"]
+                history = stats.get("launch_history") if isinstance(stats.get("launch_history"), list) else []
+                lines.extend(f"  • {item}" for item in history[-20:])
+                if not history:
+                    lines.append("  нет данных")
+                text = "\n".join(lines)
+            except Exception as e:
+                text = f"Не удалось загрузить статистику: {e}"
+            try:
+                def apply():
+                    try:
+                        box.configure(state="normal")
+                        box.delete("1.0", "end")
+                        box.insert("1.0", text)
+                        box.configure(state="disabled")
+                    except Exception:
+                        pass
+                win.after(0, apply)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _lb_add_context_friend(self):
+        player = self._lb_context_get_player()
+        if not player:
+            return
+        target_id = str(player.get("launcher_user_id") or "").strip()
+        if not target_id:
+            play_error()
+            show_error_toast(self, "Не вышло", "У этого игрока нет ID нового формата. Он появится после обновления его лаунчера.")
+            return
+        my_id = ensure_user_id(self.settings)
+        if target_id == my_id:
+            show_info_toast(self, "Это ты", "Нельзя добавить самого себя в друзья.")
+            return
+        contacts = self.settings.setdefault("personal_chats", [])
+        if any(c.get("id") == target_id for c in contacts):
+            show_info_toast(self, "Уже в друзьях", f"«{player.get('name') or target_id}» уже есть в твоих чатах.")
+            return
+        self.send_friend_request_to(target_id, str(player.get("name") or target_id))
+        play_click()
+        show_info_toast(self, "Заявка отправлена", f"Заявка в друзья отправлена игроку «{player.get('name') or target_id}».")
+
+    def _lb_copy_context_player(self):
+        player = self._lb_context_player
+        if not isinstance(player, dict):
+            return
+        name = str(player.get("name") or "").strip()
+        if not name:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(name)
+            self.update()
+            play_click()
+            show_info_toast(self, "Скопировано", f"Ник «{name}» скопирован")
+        except Exception:
+            play_error()
+
+    def _lb_render(self, data):
+        tb = self.lb_textbox
+        entries = data.get("entries")
+        entries = entries if isinstance(entries, list) else []
+        self._lb_entries_cache = entries
+        mine = data.get("mine")
+        mine = mine if isinstance(mine, dict) else {}
+        my_ranks = {}
+        for rec in mine.values():
+            if isinstance(rec, dict) and lb_safe_int(rec.get("rank")) > 0:
+                my_ranks[lb_safe_int(rec.get("rank"))] = rec
+
+        def row(rank, name, seconds):
+            return f"{rank:>4}  {str(name)[:16]:<16}  {lb_format_duration(seconds)}"
+
+        try:
+            tb.configure(state="normal")
+            tb.delete("1.0", "end")
+            shown = 0
+            if not entries:
+                tb.insert("end", "Пока в рейтинге пусто — будь первым!\n"
+                                 "Сыграй на лицензионном аккаунте, и время само улетит сюда.")
+            else:
+                tb.insert("end", f"{'#':>4}  {'Ник':<16}  Время в игре\n", "head")
+                place_tags = {1: "gold", 2: "silver", 3: "bronze"}
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    rank = lb_safe_int(e.get("rank"))
+                    if rank <= 0:
+                        continue
+                    is_me = rank in my_ranks
+                    tag = "me" if is_me else place_tags.get(rank)
+                    line = row(rank, e.get("name", "?"), e.get("seconds")) + ("   ← это ты" if is_me else "") + "\n"
+                    if tag:
+                        tb.insert("end", line, tag)
+                    else:
+                        tb.insert("end", line)
+                    shown = max(shown, rank)
+                outside = sorted(r for r in my_ranks if r > shown)
+                if outside:
+                    tb.insert("end", "     …\n", "head")
+                    for r in outside:
+                        rec = my_ranks[r]
+                        tb.insert("end", row(r, rec.get("name", "?"), rec.get("seconds")) + "   ← это ты\n", "me")
+        finally:
+            try:
+                tb.configure(state="disabled")
+            except Exception:
+                pass
 
     def on_stats_refresh_click(self):
         play_click()
         self.update_stats_display()
-        self.log("🔄 Статистика обновлена")
+        self.log("Статистика обновлена")
 
     def open_advanced_color_settings(self):
         try:
@@ -10172,7 +13763,7 @@ class LauncherApp(ctk.CTk):
             pass
         self._advanced_color_window = AdvancedColorSettingsWindow(self)
         self._advanced_color_window.focus_force()
-        self.log("🎨 Расширенные настройки цвета открыты!")
+        self.log("Открыл расширенные настройки")
 
     def open_secret_launcher(self):
         try:
@@ -10180,14 +13771,14 @@ class LauncherApp(ctk.CTk):
                 try:
                     if self._secret_launcher.winfo_exists():
                         self._secret_launcher.focus_force()
-                        self.log("ℹ️ Секретный лаунчер уже открыт")
+                        self.log("Секретный лаунчер уже открыт")
                         return
                 except:
                     pass
 
             self._secret_launcher = SecretGeometryDashLauncher(self)
             self._secret_launcher.focus_force()
-            self.log("🎮 Секретный лаунчер открыт!")
+            self.log("Секретный лаунчер открыт!")
 
             def on_close():
                 if self._secret_launcher:
@@ -10197,10 +13788,10 @@ class LauncherApp(ctk.CTk):
             self._secret_launcher.protocol("WM_DELETE_WINDOW", on_close)
 
         except Exception as e:
-            self.log(f"❌ Ошибка открытия секретного лаунчера: {e}")
+            self.log(f"Секретный лаунчер не открылся: {e}")
             play_error()
-            show_error_toast(self, "Ошибка",
-                                 f"Не удалось открыть секретный лаунчер:\n{e}\n\n"
+            show_error_toast(self, "Не вышло",
+                                 f"Секретный лаунчер не открылся:\n{e}\n\n"
                                  "Попробуйте перезапустить лаунчер.")
 
     def clear_console(self):
@@ -10215,7 +13806,7 @@ class LauncherApp(ctk.CTk):
             show_info_toast(self, "Скопировано", f"Путь скопирован:\n{MINECRAFT_DIR}")
         except Exception as e:
             play_error()
-            show_error_toast(self, "Ошибка", f"Путь не скопировался:\n{e}")
+            show_error_toast(self, "Не вышло", f"Путь не скопировался:\n{e}")
 
     def copy_console_log(self):
         try:
@@ -10230,7 +13821,7 @@ class LauncherApp(ctk.CTk):
             show_info_toast(self, "Скопировано", "Лог скопирован. Кидай в чат поддержки, если что-то сломалось")
         except Exception as e:
             play_error()
-            show_error_toast(self, "Ошибка", f"Лог не скопировался:\n{e}")
+            show_error_toast(self, "Не вышло", f"Лог не скопировался:\n{e}")
 
     def log(self, message):
 
@@ -10248,16 +13839,421 @@ class LauncherApp(ctk.CTk):
         except:
             print(f"LOG: {message}")
 
+    def _fresh_google_access_token(self):
+        """Возвращает свежий access token для серверной проверки аккаунта 67Launcher."""
+        client_id = get_google_client_id()
+        refresh = str(self.settings.get("launcher_google_refresh_token") or "").strip()
+        current = str(getattr(self, "_google_access_token", "") or "").strip()
+        if not client_id or not refresh:
+            return current
+        try:
+            profile = google_refresh_session(refresh, client_id)
+            token = str(profile.get("access_token") or "").strip()
+            if token:
+                self._google_access_token = token
+                self.settings["launcher_google_sub"] = str(profile.get("sub") or self.settings.get("launcher_google_sub") or "")
+                self.settings["launcher_google_email"] = str(profile.get("email") or self.settings.get("launcher_google_email") or "")[:160]
+                self.settings["launcher_google_name"] = str(profile.get("name") or self.settings.get("launcher_google_name") or "Аккаунт Google")[:80]
+                self.settings["user_id"] = launcher_google_user_id(self.settings["launcher_google_sub"])
+                save_launcher_settings(self.settings)
+                return token
+        except Exception:
+            pass
+        return current
+
+    def _friend_action(self, action, target_id="", extra=None, callback=None):
+        """Безопасная одноразовая операция через authenticated inbox-sender."""
+        allowed = {"friend_request", "friend_accept", "friend_decline", "friend_remove"}
+        if action not in allowed:
+            if callback:
+                try:
+                    self.after(0, lambda: callback(None, "Неизвестное действие друзей"))
+                except Exception:
+                    pass
+            return
+        my_id = str(ensure_user_id(self.settings) or "").strip().upper()
+        target_id = str(target_id or "").strip().upper()
+        if not my_id or not target_id or my_id == target_id:
+            if callback:
+                try:
+                    self.after(0, lambda: callback({"ok": False, "reason": "bad_target"}, None))
+                except Exception:
+                    pass
+            return
+        event = dict(extra or {}) if isinstance(extra, dict) else {}
+        event["type"] = action
+        event["contact_name"] = str(event.get("contact_name") or event.get("name") or self._friend_my_display_name())[:32]
+
+        def worker():
+            ws = None
+            result = None
+            error = None
+            try:
+                auth_token = ensure_friend_auth_token(self.settings)
+                ws = ws_client.create_connection(RELAY_URL, timeout=60, sslopt=_ws_sslopt())
+                ws.settimeout(15)
+                ws.send(json.dumps({
+                    "room": f"dm-inbox-{target_id}",
+                    "role": "inbox-sender",
+                    "username": "system",
+                    "user_id": my_id,
+                    "friend_auth": auth_token,
+                }, ensure_ascii=False, separators=(",", ":")))
+                payload = dict(event)
+                payload["user_id"] = my_id
+                payload["username"] = self._friend_my_display_name()[:32]
+                ws.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+                result = {"ok": True, "status": action.replace("friend_", ""), "user_id": target_id,
+                          "name": event["contact_name"]}
+            except Exception as e:
+                error = str(e)
+            finally:
+                try:
+                    if ws:
+                        ws.close()
+                except Exception:
+                    pass
+            if callback:
+                try:
+                    self.after(0, lambda r=result, e=error: callback(r, e))
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _friend_cache(self):
+        friends = self.settings.setdefault("friends", {})
+        requests = self.settings.setdefault("friend_requests", {})
+        outgoing = self.settings.setdefault("outgoing_friend_requests", {})
+        if not isinstance(friends, dict):
+            friends = {}
+            self.settings["friends"] = friends
+        if not isinstance(requests, dict):
+            requests = {}
+            self.settings["friend_requests"] = requests
+        if not isinstance(outgoing, dict):
+            outgoing = {}
+            self.settings["outgoing_friend_requests"] = outgoing
+        return friends, requests
+
+    def _apply_friends_state(self, friends_list, requests_list):
+        first_state = not getattr(self, "_friend_state_received", False)
+        self._friend_state_received = True
+        friends, requests = self._friend_cache()
+        if isinstance(friends_list, list):
+            friends.clear()
+            for item in friends_list:
+                if not isinstance(item, dict):
+                    continue
+                fid = str(item.get("id") or "").strip().upper()
+                if not fid or fid == ensure_user_id(self.settings):
+                    continue
+                friends[fid] = {
+                    "id": fid,
+                    "name": str(item.get("name") or fid)[:32],
+                    "online": bool(item.get("online")),
+                    "mode": str(item.get("mode") or ("online" if item.get("online") else "offline")),
+                    "server": str(item.get("server") or "")[:128],
+                }
+        if isinstance(requests_list, list):
+            requests.clear()
+            for item in requests_list:
+                if not isinstance(item, dict):
+                    continue
+                rid = str(item.get("id") or "").strip().upper()
+                if rid and rid != ensure_user_id(self.settings):
+                    requests[rid] = {
+                        "id": rid,
+                        "name": str(item.get("name") or rid)[:32],
+                        "created": item.get("created", 0),
+                    }
+        save_launcher_settings(self.settings)
+        if first_state and requests:
+            for rid, req in list(requests.items()):
+                self.after(150, lambda tid=rid, name=req.get("name", rid): self._show_friend_request_popup(tid, name))
+        try:
+            if getattr(self, "chats_list_refresh_callback", None):
+                self.chats_list_refresh_callback()
+        except Exception:
+            pass
+        self._refresh_friends_window()
+
+    def _handle_friend_request(self, their_id, suggested_name):
+        friends, requests = self._friend_cache()
+        their_id = str(their_id or "").strip().upper()
+        if not their_id or their_id == ensure_user_id(self.settings) or their_id in friends:
+            return
+        requests[their_id] = {"id": their_id, "name": suggested_name or their_id, "created": time.time()}
+        save_launcher_settings(self.settings)
+        self.log(f"📨 Новая заявка в друзья от «{suggested_name or their_id}»")
+        self._refresh_friends_window()
+        self._show_friend_request_popup(their_id, suggested_name or their_id)
+
+    def _handle_friend_accept(self, their_id, suggested_name):
+        friends, requests = self._friend_cache()
+        their_id = str(their_id or "").strip().upper()
+        if their_id:
+            requests.pop(their_id, None)
+            self.settings.setdefault("outgoing_friend_requests", {}).pop(their_id, None)
+            friends[their_id] = {"id": their_id, "name": suggested_name or their_id, "online": True, "mode": "online", "server": ""}
+            save_launcher_settings(self.settings)
+            self.log(f"🤝 «{suggested_name or their_id}» принял(а) твою заявку в друзья")
+            self._refresh_friends_window()
+
+    def _handle_friend_decline(self, their_id, suggested_name):
+        _friends, requests = self._friend_cache()
+        their_id = str(their_id or "").strip().upper()
+        if their_id:
+            self.settings.setdefault("outgoing_friend_requests", {}).pop(their_id, None)
+            save_launcher_settings(self.settings)
+            self.log(f"ℹ️ «{suggested_name or their_id}» отклонил(а) твою заявку в друзья")
+
+    def _handle_friend_removed(self, their_id):
+        friends, _requests = self._friend_cache()
+        their_id = str(their_id or "").strip().upper()
+        if their_id in friends:
+            friends.pop(their_id, None)
+            save_launcher_settings(self.settings)
+            self.log(f"👋 «{their_id}» удалил(а) тебя из друзей")
+            self._refresh_friends_window()
+
+    def _handle_friend_status(self, their_id, online, mode="online", server=""):
+        friends, _requests = self._friend_cache()
+        their_id = str(their_id or "").strip().upper()
+        if their_id in friends:
+            friends[their_id]["online"] = bool(online)
+            friends[their_id]["mode"] = str(mode or ("online" if online else "offline"))
+            friends[their_id]["server"] = str(server or "")[:128]
+            save_launcher_settings(self.settings)
+            self._refresh_friends_window()
+
+    def _show_friend_request_popup(self, their_id, name):
+        try:
+            win = ctk.CTkToplevel(self)
+            win.title("📨 Заявка в друзья")
+            win.geometry("430x230")
+            win.resizable(False, False)
+            win.transient(self)
+            win.grab_set()
+            frame = ctk.CTkFrame(win, fg_color="transparent")
+            frame.pack(fill="both", expand=True, padx=22, pady=22)
+            ctk.CTkLabel(frame, text="📨 Новая заявка в друзья",
+                         font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(0, 10))
+            ctk.CTkLabel(frame, text=f"Игрок «{name}» хочет добавить тебя в друзья.",
+                         font=ctk.CTkFont(size=13), wraplength=370).pack(pady=(0, 18))
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x")
+
+            def finish():
+                try:
+                    win.grab_release()
+                    win.destroy()
+                except Exception:
+                    pass
+
+            def accept():
+                self._friend_action("friend_accept", their_id,
+                                    {"name": self._friend_my_display_name()},
+                                    lambda r, e: self._friend_action_done(r, e, "Заявка принята", finish))
+
+            def decline():
+                self._friend_action("friend_decline", their_id,
+                                    callback=lambda r, e: self._friend_action_done(r, e, "Заявка отклонена", finish))
+
+            make_sound_button(row, text="Принять", command=accept, fg_color="#6fce7f", hover_color="#5cb56c",
+                              text_color="#16141f", height=38).pack(side="left", fill="x", expand=True, padx=(0, 6))
+            make_sound_button(row, text="Отклонить", command=decline, fg_color="#d3453f", hover_color="#b83530",
+                              height=38).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        except Exception:
+            pass
+
+    def _friend_my_display_name(self):
+        accounts = load_accounts()
+        for acc in accounts:
+            if acc.get("type") == "microsoft" and acc.get("username"):
+                return str(acc.get("username"))[:32]
+        return ensure_user_id(self.settings)
+
+    def _friend_action_done(self, result, error, success_text, finish=None):
+        if finish:
+            finish()
+        if error:
+            play_error()
+            show_error_toast(self, "Не вышло", f"Сервер друзей недоступен:\n{error}")
+            return
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = (result or {}).get("reason", "unknown") if isinstance(result, dict) else "unknown"
+            play_error()
+            show_error_toast(self, "Не вышло", f"Система друзей отклонила операцию: {reason}")
+            return
+        friends, requests = self._friend_cache()
+        target = str(result.get("user_id") or "").strip().upper()
+        status = str(result.get("status") or "")
+        if target:
+            if status == "accept":
+                old_req = requests.pop(target, None) or {}
+                friends[target] = {
+                    "id": target,
+                    "name": str(old_req.get("name") or target)[:32],
+                    "online": True, "mode": "online", "server": "",
+                }
+            elif status == "decline":
+                requests.pop(target, None)
+            elif status == "remove":
+                friends.pop(target, None)
+            save_launcher_settings(self.settings)
+            self._refresh_friends_window()
+        play_click()
+        show_info_toast(self, "Готово", success_text)
+
+    def _refresh_friends_window(self):
+        try:
+            if getattr(self, "_friends_window", None) and self._friends_window.winfo_exists():
+                self._render_friends_window()
+        except Exception:
+            pass
+
+    def open_friends_window(self):
+        try:
+            if getattr(self, "_friends_window", None) and self._friends_window.winfo_exists():
+                self._friends_window.focus_force()
+                self._render_friends_window()
+                return
+        except Exception:
+            pass
+        self._friends_window = ctk.CTkToplevel(self)
+        self._friends_window.title("👥 Друзья 67Launcher")
+        self._friends_window.geometry("620x650")
+        self._friends_window.minsize(520, 520)
+        self._friends_window.transient(self)
+        self._friends_window.protocol("WM_DELETE_WINDOW", self._friends_window.destroy)
+        self._friends_window_body = ctk.CTkScrollableFrame(self._friends_window, fg_color="transparent")
+        self._friends_window_body.pack(fill="both", expand=True, padx=14, pady=14)
+        self._render_friends_window()
+
+    def _render_friends_window(self):
+        body = getattr(self, "_friends_window_body", None)
+        if not body:
+            return
+        for child in body.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        friends, requests = self._friend_cache()
+        ctk.CTkLabel(body, text="👥 Друзья",
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w", pady=(0, 10))
+
+        if requests:
+            ctk.CTkLabel(body, text=f"📨 Заявки ({len(requests)})",
+                         font=ctk.CTkFont(size=16, weight="bold"), text_color="#d9a441").pack(anchor="w", pady=(4, 6))
+            for rid, req in list(requests.items()):
+                row = ctk.CTkFrame(body, corner_radius=8)
+                row.pack(fill="x", pady=4)
+                ctk.CTkLabel(row, text=f"👤 {req.get('name', rid)}\nID: {rid}", justify="left",
+                             font=ctk.CTkFont(size=12)).pack(side="left", padx=12, pady=8, fill="x", expand=True)
+                make_sound_button(row, text="✓", command=lambda x=rid: self._accept_friend_from_window(x),
+                                  width=38, height=34, fg_color="#6fce7f", hover_color="#5cb56c",
+                                  text_color="#16141f").pack(side="right", padx=(4, 8))
+                make_sound_button(row, text="✕", command=lambda x=rid: self._decline_friend_from_window(x),
+                                  width=38, height=34, fg_color="#d3453f", hover_color="#b83530").pack(side="right", padx=4)
+
+        ctk.CTkLabel(body, text=f"🤝 Мои друзья ({len(friends)})",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(18, 6))
+        if not friends:
+            ctk.CTkLabel(body, text="Пока нет друзей. Добавь игрока из рейтинга или по ID.",
+                         text_color="#8b87a3", wraplength=520).pack(anchor="w", pady=10)
+        else:
+            for fid, friend in sorted(friends.items(), key=lambda kv: str(kv[1].get("name", kv[0])).lower()):
+                row = ctk.CTkFrame(body, corner_radius=8)
+                row.pack(fill="x", pady=4)
+                online = bool(friend.get("online"))
+                mode = friend.get("mode") or ("online" if online else "offline")
+                server = str(friend.get("server") or "")
+                if mode == "server":
+                    status = f"🎮 играет в Minecraft · сервер: {server or 'неизвестно'}"
+                elif mode == "singleplayer":
+                    status = "🎮 играет в Minecraft · одиночный мир"
+                elif mode == "minecraft":
+                    status = "🎮 играет в Minecraft"
+                else:
+                    status = "🟢 онлайн" if online else "⚫ офлайн"
+                ctk.CTkLabel(row, text=f"👤 {friend.get('name', fid)}\n{status} · ID: {fid}", justify="left",
+                             font=ctk.CTkFont(size=12)).pack(side="left", padx=12, pady=8, fill="x", expand=True)
+                make_sound_button(row, text="💬", command=lambda f=dict(friend): self._open_friend_from_window(f),
+                                  width=42, height=34).pack(side="right", padx=(4, 8))
+                make_sound_button(row, text="🗑", command=lambda x=fid: self._remove_friend_from_window(x),
+                                  width=42, height=34, fg_color="transparent", hover_color="#3d3a52").pack(side="right", padx=4)
+
+    def _accept_friend_from_window(self, fid):
+        self._friend_action("friend_accept", fid, {"name": self._friend_my_display_name()},
+                            lambda r, e: self._friend_window_result(r, e, "Заявка принята"))
+
+    def _decline_friend_from_window(self, fid):
+        self._friend_action("friend_decline", fid,
+                            callback=lambda r, e: self._friend_window_result(r, e, "Заявка отклонена"))
+
+    def _remove_friend_from_window(self, fid):
+        friends, _ = self._friend_cache()
+        name = friends.get(fid, {}).get("name", fid)
+        if not messagebox.askyesno("Удалить друга", f"Удалить «{name}» из друзей?\nЭто удалит связь у обоих игроков."):
+            return
+        self._friend_action("friend_remove", fid,
+                            callback=lambda r, e: self._friend_window_result(r, e, "Друг удалён"))
+
+    def _friend_window_result(self, result, error, success):
+        if error:
+            play_error()
+            show_error_toast(self, "Не вышло", error)
+            return
+        if not isinstance(result, dict) or not result.get("ok"):
+            play_error()
+            show_error_toast(self, "Не вышло", str((result or {}).get("reason", "unknown")))
+            return
+        friends, requests = self._friend_cache()
+        status = result.get("status")
+        target = str(result.get("user_id") or "").upper()
+        if status == "accepted" and target:
+            requests.pop(target, None)
+            friends[target] = {"id": target, "name": result.get("name") or target, "online": True, "mode": "online", "server": ""}
+        elif status == "declined" and target:
+            requests.pop(target, None)
+        elif status == "removed" and target:
+            friends.pop(target, None)
+        save_launcher_settings(self.settings)
+        self._refresh_friends_window()
+        play_click()
+        show_info_toast(self, "Готово", success)
+
+    def _open_friend_from_window(self, friend):
+        contact = {"id": friend.get("id"), "name": friend.get("name") or friend.get("id"),
+                   "last_message": "", "last_message_time": "", "last_message_ts": 0,
+                   "last_message_mine": False, "unread": False}
+        contacts = self.settings.setdefault("personal_chats", [])
+        existing = next((c for c in contacts if c.get("id") == contact["id"]), None)
+        if existing:
+            contact = existing
+        elif len(contacts) < MAX_PERSONAL_CHATS:
+            contacts.append(contact)
+            save_launcher_settings(self.settings)
+        else:
+            play_error()
+            show_error_toast(self, "Лимит чатов", f"Больше {MAX_PERSONAL_CHATS} личных чатов не влезет.")
+            return
+        self._lb_open_personal_contact(contact)
+
     def _dm_inbox_loop(self):
         delay = 3
         while self._dm_inbox_running:
             ws = None
             try:
                 my_id = ensure_user_id(self.settings)
+                auth_token = ensure_friend_auth_token(self.settings)
                 room = f"dm-inbox-{my_id}"
-                ws = ws_client.create_connection(RELAY_URL, timeout=15, sslopt=_ws_sslopt())
-                ws.settimeout(1.0)
-                ws.send(json.dumps({"room": room, "role": "inbox", "username": "inbox"}))
+                ws = ws_client.create_connection(RELAY_URL, timeout=60, sslopt=_ws_sslopt())
+                ws.settimeout(5.0)
+                ws.send(json.dumps({"room": room, "role": "inbox", "username": "inbox",
+                                    "user_id": my_id, "friend_auth": auth_token}, separators=(",", ":")))
                 delay = 3
                 while self._dm_inbox_running:
                     try:
@@ -10267,24 +14263,28 @@ class LauncherApp(ctk.CTk):
                     if not raw:
                         break
                     if isinstance(raw, bytes):
-                        try:
-                            raw = raw.decode("utf-8")
-                        except UnicodeDecodeError:
-                            continue
-                    if not raw.startswith("{"):
-                        continue
+                        raw = raw.decode("utf-8", "replace")
                     try:
                         data = json.loads(raw)
                     except Exception:
                         continue
-                    if data.get("type") == "friend_request":
-                        their_id = (data.get("user_id") or "").strip().upper()
-                        suggested_name = (data.get("contact_name") or data.get("username") or "").strip()
+                    typ = data.get("type")
+                    if typ in ("friend_request", "friend_accept", "friend_decline", "friend_remove"):
+                        their_id = str(data.get("user_id") or "").strip().upper()
+                        suggested_name = str(data.get("contact_name") or data.get("username") or their_id).strip()
                         if their_id and their_id != my_id:
-                            self.after(0, lambda tid=their_id, name=suggested_name:
-                            self._handle_incoming_friend_request(tid, name))
-            except Exception:
-                pass
+                            if typ == "friend_request":
+                                self.after(0, lambda tid=their_id, name=suggested_name: self._handle_friend_request(tid, name))
+                            elif typ == "friend_accept":
+                                self.after(0, lambda tid=their_id, name=suggested_name: self._handle_friend_accept(tid, name))
+                            elif typ == "friend_decline":
+                                self.after(0, lambda tid=their_id, name=suggested_name: self._handle_friend_decline(tid, name))
+                            else:
+                                self.after(0, lambda tid=their_id: self._handle_friend_removed(tid))
+                    elif typ == "error":
+                        self.log(f"Система друзей: {data.get('reason', 'unknown')}")
+            except Exception as e:
+                self.log(f"Сервер друзей недоступен ({RELAY_URL}), повторю подключение: {e}")
             finally:
                 try:
                     if ws:
@@ -10296,54 +14296,55 @@ class LauncherApp(ctk.CTk):
             time.sleep(delay)
             delay = min(delay * 2, 30)
 
-    def _handle_incoming_friend_request(self, their_id, suggested_name):
-        contacts = self.settings.setdefault("personal_chats", [])
-        for c in contacts:
-            if c.get("id") == their_id:
-                return
-        if len(contacts) >= MAX_PERSONAL_CHATS:
-            return
-        contacts.append({
-            "id": their_id,
-            "name": suggested_name or their_id,
-            "last_message": "",
-            "last_message_time": "",
-            "last_message_ts": 0,
-            "last_message_mine": False,
-            "unread": False,
-        })
-        save_launcher_settings(self.settings)
-        self.log(f"➕ «{suggested_name or their_id}» добавил(а) тебя в друзья — чат появился в «Чаты»")
-        if self.chats_list_refresh_callback:
-            try:
-                self.chats_list_refresh_callback()
-            except Exception:
-                pass
-
     def send_friend_request_to(self, their_id, contact_name):
-        def _worker():
-            ws = None
-            try:
-                my_id = ensure_user_id(self.settings)
-                ws = ws_client.create_connection(RELAY_URL, timeout=10, sslopt=_ws_sslopt())
-                ws.settimeout(5)
-                ws.send(json.dumps({"room": f"dm-inbox-{their_id}", "role": "inbox-sender", "username": "system"}))
-                ws.send(json.dumps({
-                    "type": "friend_request",
-                    "user_id": my_id,
-                    "username": contact_name or my_id,
-                    "contact_name": contact_name or my_id,
-                }))
-            except Exception as e:
-                self.log(f"⚠️ Не удалось отправить заявку {their_id}: {e}")
-            finally:
-                try:
-                    if ws:
-                        ws.close()
-                except Exception:
-                    pass
+        their_id = str(their_id or "").strip().upper()
+        if not their_id or their_id == ensure_user_id(self.settings):
+            return
+        friends, requests = self._friend_cache()
+        if their_id in friends:
+            show_info_toast(self, "Уже друзья", f"«{contact_name or their_id}» уже есть в друзьях.")
+            return
+        outgoing = self.settings.setdefault("outgoing_friend_requests", {})
+        if their_id in outgoing:
+            show_info_toast(self, "Уже отправлено", f"Заявка игроку «{contact_name or their_id}» уже ожидает ответа.")
+            return
+        self._friend_action("friend_request", their_id,
+                            {"contact_name": self._friend_my_display_name()},
+                            lambda r, e: self._friend_request_result(r, e, contact_name or their_id))
 
-        threading.Thread(target=_worker, daemon=True).start()
+    def _friend_request_result(self, result, error, target_name):
+        if error:
+            play_error()
+            show_error_toast(self, "Не вышло", f"Не удалось отправить заявку:\n{error}")
+            return
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = (result or {}).get("reason", "unknown") if isinstance(result, dict) else "unknown"
+            if reason == "bad_target":
+                text = "Некорректный ID игрока."
+            elif reason == "request_limit":
+                text = "У игрока слишком много входящих заявок."
+            else:
+                text = f"Сервер отклонил заявку: {reason}"
+            play_error()
+            show_error_toast(self, "Не вышло", text)
+            return
+        status = result.get("status")
+        if status == "already_friends":
+            show_info_toast(self, "Уже друзья", f"«{target_name}» уже есть в друзьях.")
+        elif status == "request_exists":
+            show_info_toast(self, "Уже отправлено", f"Заявка игроку «{target_name}» уже ожидает ответа.")
+        elif status == "request":
+            _friends, _requests = self._friend_cache()
+            outgoing = self.settings.setdefault("outgoing_friend_requests", {})
+            target_id = str(result.get("user_id") or "").strip().upper()
+            if target_id:
+                outgoing[target_id] = {"id": target_id, "name": target_name[:32], "created": time.time()}
+            save_launcher_settings(self.settings)
+            play_click()
+            show_info_toast(self, "Заявка отправлена", f"Заявка в друзья отправлена игроку «{target_name}».")
+        else:
+            play_error()
+            show_error_toast(self, "Не вышло", "Не удалось отправить заявку.")
 
     def on_closing(self):
         self._dm_inbox_running = False
@@ -10353,6 +14354,19 @@ class LauncherApp(ctk.CTk):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    if _SHORTCUT_LAUNCH:
+        # Запуск по ярлыку: окно лаунчера не создаём, сплеш уже на экране
+        try:
+            _exit_code = run_game_shortcut(_SHORTCUT_LAUNCH["version"], _SHORTCUT_LAUNCH["account"])
+        except Exception as e:
+            _exit_code = 1
+            try:
+                _boot_root.withdraw()
+                messagebox.showerror("Minecraft не запустился", f"Что-то пошло не так: {e}")
+                _boot_root.destroy()
+            except Exception:
+                pass
+        sys.exit(_exit_code)
     try:
         _boot_root.destroy()
     except Exception:
@@ -10365,8 +14379,30 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-        with open("error_log.txt", "w", encoding="utf-8") as f:
-            f.write(f"Ошибка: {e}\n")
-            f.write(traceback.format_exc())
+        _crash_text = f"Ошибка: {e}\n" + traceback.format_exc()
+        _log_written = ""
+        for _dir in (get_launcher_dir(), tempfile.gettempdir()):
+            try:
+                _log_path = os.path.join(_dir, "error_log.txt")
+                with open(_log_path, "w", encoding="utf-8") as f:
+                    f.write(_crash_text)
+                _log_written = _log_path
+                break
+            except Exception:
+                continue
         play_error()
-        input("\nНажмите Enter для выхода...")
+        if getattr(sys, "frozen", False):
+            # В exe консоли нет — показываем окно, иначе лаунчер просто молча пропадает
+            try:
+                _err_root = tk.Tk()
+                _err_root.withdraw()
+                messagebox.showerror("67Launcher упал",
+                                     f"{e}\n\nПодробности: {_log_written or 'лог записать не удалось'}")
+                _err_root.destroy()
+            except Exception:
+                pass
+        else:
+            try:
+                input("\nНажмите Enter для выхода...")
+            except Exception:
+                pass
