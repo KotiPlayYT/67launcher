@@ -42,11 +42,39 @@ _CURSOR_WINDOWS = weakref.WeakSet()
 _CURSOR_MISSING_REPORTED = False
 
 
+def _find_bundled_file(*rel_parts):
+    """Ищет файл ресурса везде, где он может лежать: внутри exe (_MEIPASS), рядом с exe,
+    в _internal (onedir), рядом со скриптом и в рабочей папке. Возвращает путь или None."""
+    bases = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bases.append(meipass)
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]))
+        bases.extend([exe_dir, os.path.join(exe_dir, "_internal")])
+    except Exception:
+        pass
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    bases.append(os.getcwd())
+    seen = set()
+    for base in bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        candidate = os.path.join(base, *rel_parts)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _custom_cursor_string():
     """Путь к .cur в формате, который понимает Tk на Windows ('@путь'). None, если файла нет."""
     global _CURSOR_MISSING_REPORTED
-    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-    cursor_path = os.path.join(base, "resources", "cursor.cur")
+    cursor_path = _find_bundled_file("resources", "cursor.cur") or os.path.join(
+        getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__)), "resources", "cursor.cur")
     if not os.path.isfile(cursor_path):
         if not _CURSOR_MISSING_REPORTED:
             _CURSOR_MISSING_REPORTED = True
@@ -118,6 +146,97 @@ def _parse_shortcut_args(argv):
 
 
 _SHORTCUT_LAUNCH = _parse_shortcut_args(sys.argv)
+
+# --- Один экземпляр лаунчера -------------------------------------------------
+# Если лаунчер уже запущен (в том числе свёрнут в трей), повторный запуск не плодит
+# новые копии, а просит первую развернуть окно и сам тихо закрывается.
+# Работает через именованное событие Windows: оно общее для .py и собранного exe.
+# Запуск по ярлыку игры (--play) не трогаем: их можно запускать сколько угодно.
+_SINGLE_INSTANCE = {"app": None, "pending": False, "event": None}
+
+
+def _single_instance_show(app):
+    """Достаёт окно лаунчера из трея / из свёрнутого состояния."""
+    try:
+        app.deiconify()
+        app.lift()
+        app.attributes("-topmost", True)
+        app.after(250, lambda: app.attributes("-topmost", False))
+        app.focus_force()
+        _reapply_cursor_after_show(app)
+    except Exception:
+        pass
+
+
+def _single_instance_attach(app):
+    """Вызывается, когда окно лаунчера уже создано."""
+    _SINGLE_INSTANCE["app"] = app
+    if _SINGLE_INSTANCE["pending"]:
+        # Второй запуск случился, пока мы ещё грузились. Показываем окно сразу.
+        _SINGLE_INSTANCE["pending"] = False
+        try:
+            app.after(200, lambda: _single_instance_show(app))
+        except Exception:
+            pass
+
+
+def _single_instance_guard():
+    if sys.platform != "win32" or _SHORTCUT_LAUNCH:
+        return
+    if multiprocessing.current_process().name != "MainProcess":
+        return  # дочерние процессы (например, окно входа Microsoft) не считаем
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateEventW.restype = wintypes.HANDLE
+        k32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.SetEvent.argtypes = [wintypes.HANDLE]
+        k32.SetEvent.restype = wintypes.BOOL
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+
+        # Префикс Local — своё пространство имён на каждый сеанс Windows, чужие пользователи не мешают.
+        ev = k32.CreateEventW(None, False, False, "Local\\67Launcher_SingleInstance_Event")
+        if not ev:
+            return  # не получилось создать — лучше запуститься как раньше, чем не запуститься
+        already_running = (ctypes.get_last_error() == 183)  # ERROR_ALREADY_EXISTS
+        _SINGLE_INSTANCE["event"] = ev
+
+        if already_running:
+            try:
+                # Разрешаем первому экземпляру выйти на передний план.
+                ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+            except Exception:
+                pass
+            k32.SetEvent(ev)
+            sys.exit(0)
+
+        def _listen():
+            while True:
+                if k32.WaitForSingleObject(ev, 0xFFFFFFFF) != 0:
+                    break
+                app = _SINGLE_INSTANCE["app"]
+                if app is None:
+                    _SINGLE_INSTANCE["pending"] = True
+                    continue
+                try:
+                    app.after(0, lambda a=app: _single_instance_show(a))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_listen, daemon=True).start()
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
+import threading  # нужен сторожу до основных импортов
+
+_single_instance_guard()
+
 
 if (_SHORTCUT_LAUNCH or getattr(sys, "frozen", False)) and sys.platform == "win32":
     # Ярлык не должен светить консолью: ни своей, ни у дочерних процессов
@@ -327,6 +446,55 @@ def _patched_ctkbutton_init(self, *args, **kwargs):
 
 ctk.CTkButton.__init__ = _patched_ctkbutton_init
 
+# customtkinter при наведении на кнопки, переключатели, чекбоксы и т.п. сам ставит системную
+# "руку" (hand2), а при уходе — системную стрелку (arrow). Из-за этого наш курсор из
+# resources/cursor.cur пропадает. Оборачиваем их обработчики наведения: после родного кода
+# возвращаем наш курсор. В режиме "classic" ничего не трогаем, там рука как раз нужна.
+_CTK_CURSOR_PARTS = ("_canvas", "_text_label", "_image_label", "_entry", "_dropdown_menu_label")
+
+
+def _keep_custom_cursor(widget):
+    if _CURSOR_MODE == "classic":
+        return
+    cursor_str = _custom_cursor_string()
+    if not cursor_str:
+        return
+    for _part_name in _CTK_CURSOR_PARTS:
+        part = getattr(widget, _part_name, None)
+        if part is None:
+            continue
+        try:
+            if str(part.cget("cursor")) != cursor_str:
+                part.configure(cursor=cursor_str)
+        except Exception:
+            pass
+
+
+def _wrap_ctk_hover_handler(cls, method_name):
+    original = getattr(cls, method_name, None)
+    if original is None or getattr(original, "_67_cursor_wrapped", False):
+        return
+
+    def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        _keep_custom_cursor(self)
+        return result
+
+    wrapper._67_cursor_wrapped = True
+    setattr(cls, method_name, wrapper)
+
+
+for _ctk_cls_name in ("CTkButton", "CTkSwitch", "CTkRadioButton", "CTkCheckBox",
+                      "CTkComboBox", "CTkOptionMenu", "CTkSegmentedButton", "CTkSlider"):
+    _ctk_cls = getattr(ctk, _ctk_cls_name, None)
+    if _ctk_cls is None:
+        continue
+    for _handler_name in ("_on_enter", "_on_leave"):
+        try:
+            _wrap_ctk_hover_handler(_ctk_cls, _handler_name)
+        except Exception:
+            pass
+
 # Человекочитаемые подписи для известных цветов кнопок — только для UI
 # расширенных настроек. Реальная замена работает по hex-ключу, так что
 # даже если подпись не идеально точная, замена всё равно применится
@@ -381,7 +549,6 @@ from pathlib import Path
 import ssl
 import certifi
 from datetime import datetime
-import pickle
 
 _boot_tick("Загрузка изображений...")
 from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageSequence
@@ -397,7 +564,61 @@ import http.server
 
 _boot_tick("Загрузка чата и трея...")
 import websocket as ws_client
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
+
+
+# Security limits for untrusted network data and archives.
+_MAX_ZIP_MEMBERS = 100_000
+_MAX_ZIP_UNCOMPRESSED = 2 * 1024 * 1024 * 1024
+_MAX_ZIP_MEMBER = 512 * 1024 * 1024
+_MAX_MOD_DOWNLOAD = 250 * 1024 * 1024
+_MAX_IMAGE_DOWNLOAD = 10 * 1024 * 1024
+
+
+def _is_https_url(url, allowed_hosts=None):
+    """Validate HTTPS URLs and optionally constrain the destination host."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        host = parsed.hostname.rstrip(".").lower()
+        if allowed_hosts is None:
+            return True
+        return any(host == item or host.endswith("." + item) for item in allowed_hosts)
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_extract_zip(zip_ref, destination, max_total=_MAX_ZIP_UNCOMPRESSED):
+    """Extract a ZIP only after rejecting traversal paths and ZIP bombs."""
+    destination = os.path.realpath(os.fspath(destination))
+    members = zip_ref.infolist()
+    if len(members) > _MAX_ZIP_MEMBERS:
+        raise ValueError("Архив содержит слишком много файлов")
+    total = 0
+    for member in members:
+        name = member.filename.replace("\\\\", "/")
+        if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+            raise ValueError("Архив содержит абсолютный путь")
+        target = os.path.realpath(os.path.join(destination, name))
+        try:
+            if os.path.commonpath((destination, target)) != destination:
+                raise ValueError("Небезопасный путь в архиве")
+        except ValueError:
+            raise ValueError("Небезопасный путь в архиве")
+        if member.file_size > _MAX_ZIP_MEMBER:
+            raise ValueError("Файл внутри архива превышает допустимый размер")
+        total += member.file_size
+        if total > max_total:
+            raise ValueError("Распакованный архив превышает допустимый размер")
+        if member.file_size > 1024 * 1024 and member.compress_size == 0:
+            raise ValueError("Подозрительная степень сжатия в архиве")
+        if member.compress_size > 0 and member.file_size / member.compress_size > 1000:
+            raise ValueError("Подозрительная степень сжатия в архиве")
+    os.makedirs(destination, exist_ok=True)
+    zip_ref.extractall(destination)
+
+
 import multiprocessing
 import pystray
 
@@ -410,7 +631,8 @@ except ImportError:
 try:
     import pyautogui
 
-    pyautogui.FAILSAFE = False
+    # Keep PyAutoGUI's emergency corner failsafe enabled.
+    pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0
 except ImportError:
     pyautogui = None
@@ -470,7 +692,7 @@ def _fetch_active_relay_url_legacy(timeout=5):
         except Exception as e:
             print(f"[relay] raw.githubusercontent.com недоступен: {e}")
 
-    if candidate and (candidate.startswith("ws://") or candidate.startswith("wss://")):
+    if candidate and candidate.startswith("wss://") and _is_https_url("https://" + urlparse(candidate).netloc):
         changed = candidate != RELAY_URL
         RELAY_URL = candidate
         print(f"[relay] Релей ({source_used}): {RELAY_URL}")
@@ -838,6 +1060,9 @@ def _ms_login_webview_process(login_url, redirect_uri, result_queue):
 
 
 def resource_path(relative_path):
+    found = _find_bundled_file(*os.path.normpath(relative_path).split(os.sep))
+    if found:
+        return found
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -856,9 +1081,20 @@ def _launcher_base_dir():
     return os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 
 
+_LAUNCHER_VERSION_RE = r"\d+(?:\.\d+)*(?:[-_ ]?[A-Za-z][A-Za-z0-9.]*)?"
+
+
 def _launcher_version_tuple(value):
-    parts = re.findall(r"\d+", str(value or ""))
-    return tuple(int(x) for x in parts) if parts else ()
+    """2.0BETA < 2.0 < 2.0.1. Хвост с буквами (beta/rc/...) считается пред-релизом."""
+    text = str(value or "").strip().lower().lstrip("v")
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)$", text)
+    if not m:
+        return ()
+    nums = [int(x) for x in m.group(1).split(".")]
+    while len(nums) < 4:
+        nums.append(0)
+    is_release = 0 if m.group(2).strip() else 1
+    return tuple(nums[:4]) + (is_release,)
 
 
 def _launcher_read_local_version():
@@ -877,7 +1113,7 @@ def _launcher_read_local_version():
                 continue
             if line.upper().startswith("LAUNCHERVERSION="):
                 line = line.split("=", 1)[1].strip()
-            if re.fullmatch(r"\d+(?:\.\d+)*", line):
+            if re.fullmatch(_LAUNCHER_VERSION_RE, line):
                 return line, path
             return "", path
     return "", path
@@ -897,10 +1133,16 @@ def _launcher_fetch_update_info():
         data[key.strip().upper()] = value.strip()
     remote = data.get("LAUNCHERVERSION", "")
     download = data.get("URLDOWNLOAD", "")
-    if not re.fullmatch(r"\d+(?:\.\d+)*", remote):
+    if not re.fullmatch(_LAUNCHER_VERSION_RE, remote):
         raise ValueError("GitHub: неверный LAUNCHERVERSION")
-    if not download.lower().startswith(("https://", "http://")):
-        raise ValueError("GitHub: неверный URLDOWNLOAD")
+    # Обновление запускает исполняемый код, поэтому HTTP без TLS запрещён.
+    parsed_download = urlparse(download)
+    download_host = (parsed_download.hostname or "").lower()
+    official_release_path = parsed_download.path.startswith("/KotiPlayYT/67launcher/releases/download/")
+    trusted_release_asset = download_host == "release-assets.githubusercontent.com"
+    if not _is_https_url(download, {"github.com", "githubusercontent.com"}) or not (
+            (download_host == "github.com" and official_release_path) or trusted_release_asset):
+        raise ValueError("GitHub: URLDOWNLOAD должен указывать на официальный релиз 67Launcher")
     return remote, download
 
 
@@ -982,12 +1224,173 @@ def _launcher_update_result(self, ok, message, local_version, remote_version, do
         self.log("[Updater] Пользователь отменил обновление")
         return
     try:
-        proc = _launcher_start_updater(self, download_url, remote_version)
-        self.log(f"[Updater] Updater запущен, PID={proc.pid}")
-        self._launcher_update_status.configure(text="Updater запущен. Лаунчер закроется...", text_color="#6fce7f")
-        self.after(700, self.destroy)
+        _launcher_run_update(self, download_url, remote_version)
     except Exception as e:
         _launcher_update_result(self, False, str(e), local_version, remote_version, download_url)
+
+
+def _launcher_run_update(self, download_url, remote_version):
+    """Запускает updater и закрывает лаунчер. Бросает исключение, если updater не найден."""
+    proc = _launcher_start_updater(self, download_url, remote_version)
+    self.log(f"[Updater] Updater запущен, PID={proc.pid}")
+    try:
+        self._launcher_update_status.configure(text="Updater запущен. Лаунчер закроется...", text_color="#6fce7f")
+    except Exception:
+        pass
+    self.after(700, self.destroy)
+
+
+# ---------- автопроверка при запуске ----------
+UPDATE_AUTOCHECK_FIRST_DELAY_MS = 4000            # через сколько после старта проверяем
+UPDATE_AUTOCHECK_INTERVAL_MS = 6 * 60 * 60 * 1000  # лаунчер часто висит в трее — перепроверяем раз в 6 часов
+UPDATE_AUTOCHECK_RETRY_MS = 10 * 60 * 1000         # если сейчас неудобно (игра / окно скрыто) — ещё раз через 10 минут
+
+
+def _launcher_autoupdate_busy(self):
+    """Не дёргаем человека окном, пока он запускает игру, играет или лаунчер свёрнут в трей."""
+    if getattr(self, "is_launching", False):
+        return True
+    proc = getattr(self, "minecraft_process", None)
+    try:
+        if proc is not None and proc.poll() is None:
+            return True
+    except Exception:
+        pass
+    try:
+        if str(self.state()) in ("withdrawn", "iconic"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def launcher_autoupdate_start(self):
+    """Вызывается один раз после того, как лаунчер полностью загрузился."""
+    if getattr(self, "_launcher_autoupdate_started", False):
+        return
+    self._launcher_autoupdate_started = True
+    self.after(UPDATE_AUTOCHECK_FIRST_DELAY_MS, lambda: launcher_autoupdate_check(self))
+
+
+def launcher_autoupdate_check(self):
+    if getattr(self, "_closing", False):
+        return
+    # Следующая проверка планируется сразу, чтобы любая ошибка ниже её не сломала.
+    self.after(UPDATE_AUTOCHECK_INTERVAL_MS, lambda: launcher_autoupdate_check(self))
+    if not self.settings.get("auto_update_check", True):
+        return
+    if getattr(self, "_launcher_update_check_running", False) or getattr(self, "_launcher_update_dialog", None):
+        return
+    local_version, _path = _launcher_read_local_version()
+    if not local_version:
+        self.log("[Updater] Автопроверка: не смог прочитать локальную версию, пропускаю")
+        return
+    self._launcher_update_check_running = True
+
+    def worker():
+        try:
+            remote, download = _launcher_fetch_update_info()
+            self.after(0, lambda: _launcher_autoupdate_found(self, local_version, remote, download))
+        except Exception as e:
+            # Нет интернета / GitHub лёг — молчим, это не повод пугать человека.
+            self.after(0, lambda: _launcher_autoupdate_failed(self, str(e)))
+    threading.Thread(target=worker, daemon=True, name="launcher-autoupdate").start()
+
+
+def _launcher_autoupdate_failed(self, message):
+    self._launcher_update_check_running = False
+    self.log(f"[Updater] Автопроверка не вышла: {message}")
+
+
+def _launcher_autoupdate_found(self, local_version, remote_version, download_url):
+    self._launcher_update_check_running = False
+    self.log(f"[Updater] Автопроверка. Текущая: {local_version} | GitHub: {remote_version}")
+    if _launcher_version_tuple(remote_version) <= _launcher_version_tuple(local_version):
+        return
+    if self.settings.get("update_skipped_version", "") == remote_version:
+        self.log(f"[Updater] Версию {remote_version} ты раньше пропустил — не показываю")
+        return
+    try:
+        self._launcher_update_status.configure(text=f"Доступно обновление: {local_version} → {remote_version}",
+                                               text_color="#e5c76b")
+    except Exception:
+        pass
+    if _launcher_autoupdate_busy(self):
+        self.log("[Updater] Обновление есть, но сейчас неудобно — спрошу чуть позже")
+        self.after(UPDATE_AUTOCHECK_RETRY_MS,
+                   lambda: _launcher_autoupdate_found(self, local_version, remote_version, download_url))
+        return
+    _launcher_show_update_dialog(self, local_version, remote_version, download_url)
+
+
+def _launcher_show_update_dialog(self, local_version, remote_version, download_url):
+    if getattr(self, "_launcher_update_dialog", None):
+        return
+    dialog = ctk.CTkToplevel(self)
+    self._launcher_update_dialog = dialog
+    dialog.title("Вышло обновление")
+    dialog.geometry("460x300")
+    dialog.resizable(False, False)
+    dialog.transient(self)
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        _install_custom_cursor(dialog)
+    except Exception:
+        pass
+
+    def close():
+        self._launcher_update_dialog = None
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+    def do_update():
+        close()
+        try:
+            _launcher_run_update(self, download_url, remote_version)
+        except Exception as e:
+            self.log(f"[Updater] Ошибка: {e}")
+            try:
+                show_error_toast(self, "Обновление", str(e))
+            except Exception:
+                pass
+
+    def later():
+        self.log("[Updater] Обновление отложено до следующей проверки")
+        close()
+
+    def skip():
+        self.settings["update_skipped_version"] = remote_version
+        save_launcher_settings(self.settings)
+        self.log(f"[Updater] Версия {remote_version} пропущена")
+        close()
+
+    dialog.protocol("WM_DELETE_WINDOW", later)
+
+    frame = ctk.CTkFrame(dialog, fg_color="transparent")
+    frame.pack(fill="both", expand=True, padx=20, pady=18)
+    ctk.CTkLabel(frame, text="🚀", font=ctk.CTkFont(size=44)).pack(pady=(0, 2))
+    ctk.CTkLabel(frame, text="Вышла новая версия", font=ctk.CTkFont(size=20, weight="bold"),
+                 text_color="#6d92ff").pack()
+    ctk.CTkLabel(frame, text=f"{local_version}  →  {remote_version}", font=ctk.CTkFont(size=15, weight="bold"),
+                 text_color="#e5c76b").pack(pady=(6, 4))
+    ctk.CTkLabel(frame, text="Скачать и поставить сейчас? Лаунчер закроется, updater всё заменит сам "
+                             "и запустит его заново.",
+                 font=ctk.CTkFont(size=12), text_color="#a8a4bd", wraplength=400, justify="center").pack(pady=(0, 14))
+
+    btns = ctk.CTkFrame(frame, fg_color="transparent")
+    btns.pack()
+    make_sound_button(btns, text="Обновить", command=do_update, width=140, height=40,
+                      fg_color="#6fce7f", hover_color="#5cb56c", text_color="#16141f",
+                      font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, padx=6)
+    make_sound_button(btns, text="Потом", command=later, width=100, height=40,
+                      fg_color="#2b2840", hover_color="#3d3a52").grid(row=0, column=1, padx=6)
+    make_sound_button(btns, text="Пропустить версию", command=skip, width=140, height=40,
+                      fg_color="#2b2840", hover_color="#3d3a52").grid(row=0, column=2, padx=6)
 
 
 def check_launcher_update_from_settings(self):
@@ -1033,14 +1436,17 @@ def add_firewall_rule():
 
     try:
         import subprocess
-        check_cmd = 'netsh advfirewall firewall show rule name="67Launcher Chat"'
-        result = subprocess.run(check_cmd, capture_output=True, text=True, shell=True, encoding='cp866')
+        check_cmd = ["netsh", "advfirewall", "firewall", "show", "rule", 'name=67Launcher Chat']
+        result = subprocess.run(check_cmd, capture_output=True, text=True, shell=False,
+                                encoding='cp866', timeout=10)
 
         if "No rules match" in result.stdout or "Не найдено" in result.stdout:
-            add_cmd = 'netsh advfirewall firewall add rule name="67Launcher Chat" dir=in action=allow protocol=TCP localport=25565'
-            subprocess.run(add_cmd, capture_output=True, text=True, shell=True, encoding='cp866')
-            add_cmd2 = 'netsh advfirewall firewall add rule name="67Launcher Chat All" dir=in action=allow protocol=TCP localport=25560-25570'
-            subprocess.run(add_cmd2, capture_output=True, text=True, shell=True, encoding='cp866')
+            add_cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
+                       "name=67Launcher Chat", "dir=in", "action=allow", "protocol=TCP", "localport=25565"]
+            subprocess.run(add_cmd, capture_output=True, text=True, shell=False,
+                           encoding='cp866', timeout=10)
+            # Не открываем широкий диапазон портов автоматически.
+            # Для пользовательского сервера следует создать отдельное точечное правило вручную.
             print("✅ Правило брандмауэра добавлено")
             return True
         else:
@@ -1128,6 +1534,224 @@ def play_sound(sound_type="click"):
 
 def play_click():
     threading.Thread(target=lambda: play_sound("click"), daemon=True).start()
+
+
+_THEME_TRANSITION_POPUP = {
+    "window": None,
+    "after_id": None,
+    "fade_after_id": None,
+}
+_THEME_SWITCH_LOCK_UNTIL = 0.0
+
+
+def _theme_transition_asset_path(filename):
+    """Ищет ресурс эффекта смены темы и в исходниках, и в собранном exe."""
+    candidates = []
+    try:
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            candidates.append(os.path.join(base, "resources", filename))
+            candidates.append(os.path.join(base, filename))
+    except Exception:
+        pass
+
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    candidates.extend([
+        os.path.join(exe_dir, "resources", filename),
+        os.path.join(exe_dir, filename),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", filename),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
+        os.path.join(os.getcwd(), "resources", filename),
+        os.path.join(os.getcwd(), filename),
+    ])
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _close_theme_transition_popup():
+    """Полностью закрывает эффект смены темы и отменяет его таймеры."""
+    after_id = _THEME_TRANSITION_POPUP.get("after_id")
+    fade_after_id = _THEME_TRANSITION_POPUP.get("fade_after_id")
+    window = _THEME_TRANSITION_POPUP.get("window")
+
+    if window is not None:
+        for timer_id in (after_id, fade_after_id):
+            if timer_id is not None:
+                try:
+                    window.after_cancel(timer_id)
+                except Exception:
+                    pass
+
+    _THEME_TRANSITION_POPUP["after_id"] = None
+    _THEME_TRANSITION_POPUP["fade_after_id"] = None
+
+    if window is not None:
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except Exception:
+            pass
+
+    _THEME_TRANSITION_POPUP["window"] = None
+
+
+def _play_theme_transition_sound(sound_filename):
+    sound_path = _theme_transition_asset_path(sound_filename)
+    if not sound_path:
+        print(f"[theme-effect] Не найден звук: {sound_filename}")
+        return
+    try:
+        play_mp3_winmm(sound_path)
+    except Exception as e:
+        print(f"[theme-effect] Не удалось проиграть звук {sound_filename}: {e}")
+
+
+def _fade_out_theme_transition_popup():
+    """Плавно растворяет изображение, не затрагивая само окно лаунчера."""
+    popup = _THEME_TRANSITION_POPUP.get("window")
+    if popup is None:
+        return
+
+    try:
+        if not popup.winfo_exists():
+            _THEME_TRANSITION_POPUP["window"] = None
+            return
+    except Exception:
+        _THEME_TRANSITION_POPUP["window"] = None
+        return
+
+    try:
+        alpha = float(popup.attributes("-alpha"))
+    except Exception:
+        alpha = 1.0
+
+    # Около 400 мс на исчезновение. Чем меньше шаг, тем плавнее переход.
+    next_alpha = alpha - 0.08
+
+    if next_alpha <= 0.0:
+        _close_theme_transition_popup()
+        return
+
+    try:
+        popup.attributes("-alpha", next_alpha)
+        _THEME_TRANSITION_POPUP["fade_after_id"] = popup.after(
+            35, _fade_out_theme_transition_popup
+        )
+    except Exception:
+        _close_theme_transition_popup()
+
+
+def show_theme_transition_effect(master, theme):
+    """Показывает изображение во время смены темы и затем плавно его растворяет.
+
+    dark  -> лицо в темноте + мужской крик
+    light -> яркий кот + звук flashbang
+
+    Изображение ровно покрывает окно 67Launcher, а не весь монитор.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        try:
+            master.after(0, lambda: show_theme_transition_effect(master, theme))
+        except Exception:
+            pass
+        return
+
+    _close_theme_transition_popup()
+
+    if theme == "dark":
+        image_filename = "theme_dark.jpg"
+        sound_filename = "theme_dark.mp3"
+    else:
+        image_filename = "theme_light.webp"
+        sound_filename = "theme_light.mp3"
+
+    image_path = _theme_transition_asset_path(image_filename)
+    if not image_path:
+        print(f"[theme-effect] Не найдено изображение: {image_filename}")
+        return
+
+    try:
+        image = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        print(f"[theme-effect] Не удалось открыть изображение {image_filename}: {e}")
+        return
+
+    popup = None
+    try:
+        popup = tk.Toplevel(master)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.attributes("-alpha", 1.0)
+        popup.configure(bg="black")
+        _install_custom_cursor(popup)
+
+        # Эффект ровно покрывает окно 67Launcher, а не весь монитор.
+        master.update_idletasks()
+        width = max(1, master.winfo_width())
+        height = max(1, master.winfo_height())
+        x = master.winfo_rootx()
+        y = master.winfo_rooty()
+
+        # Заполняем всё окно без чёрных полос, сохраняя пропорции (crop по краям).
+        scale = max(width / image.width, height / image.height)
+        scaled_w = max(1, int(image.width * scale))
+        scaled_h = max(1, int(image.height * scale))
+        image = image.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+        left = max(0, (scaled_w - width) // 2)
+        top = max(0, (scaled_h - height) // 2)
+        image = image.crop((left, top, left + width, top + height))
+
+        photo = ImageTk.PhotoImage(image)
+        label = tk.Label(
+            popup,
+            image=photo,
+            bg="black",
+            bd=0,
+            highlightthickness=0,
+        )
+        label.image = photo
+        label.pack(fill="both", expand=True)
+
+        popup.update_idletasks()
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.deiconify()
+        popup.lift()
+
+        _THEME_TRANSITION_POPUP["window"] = popup
+        _THEME_TRANSITION_POPUP["fade_after_id"] = None
+
+        # Изображение полностью видно 1 секунду, после чего начинается
+        # плавное растворение примерно за 0.4 секунды.
+        _THEME_TRANSITION_POPUP["after_id"] = popup.after(
+            1000,
+            _start_theme_transition_fade,
+        )
+
+        threading.Thread(
+            target=_play_theme_transition_sound,
+            args=(sound_filename,),
+            daemon=True,
+            name="theme-transition-sound",
+        ).start()
+    except Exception as e:
+        print(f"[theme-effect] Ошибка показа эффекта: {e}")
+        try:
+            if popup is not None:
+                popup.destroy()
+        except Exception:
+            pass
+        _THEME_TRANSITION_POPUP["window"] = None
+        _THEME_TRANSITION_POPUP["after_id"] = None
+        _THEME_TRANSITION_POPUP["fade_after_id"] = None
+
+
+def _start_theme_transition_fade():
+    """Запускает плавное исчезновение текущего изображения."""
+    _THEME_TRANSITION_POPUP["after_id"] = None
+    _fade_out_theme_transition_popup()
 
 
 def play_error():
@@ -1684,18 +2308,25 @@ REQUIRED_FOLDERS = [
 
 
 def fix_game_path():
+    """Мигрирует только старый путь .ionux; пользовательский game_dir сохраняет."""
     settings_path = SETTINGS_FILE
-    if os.path.exists(settings_path):
-        try:
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                settings = json.load(f)
-            old_path = settings.get("game_dir", "")
-            if ".ionux" in old_path or old_path != DEFAULT_GAME_DIR:
-                settings["game_dir"] = DEFAULT_GAME_DIR
-                with open(settings_path, 'w', encoding='utf-8') as f:
-                    json.dump(settings, f, indent=2, ensure_ascii=False)
-        except:
-            pass
+    if not os.path.exists(settings_path):
+        return
+    try:
+        with open(settings_path, 'r', encoding='utf-8') as f:
+            settings = json.load(f)
+        if not isinstance(settings, dict):
+            return
+        old_path = str(settings.get("game_dir", "") or "")
+        # Раньше проверка `old_path != DEFAULT_GAME_DIR` сбрасывала ЛЮБОЙ
+        # пользовательский каталог при каждом старте лаунчера.
+        if ".ionux" in old_path.casefold():
+            settings["game_dir"] = DEFAULT_GAME_DIR
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+    except (OSError, ValueError, TypeError):
+        # Повреждённый файл настроек не должен блокировать запуск.
+        pass
 
 
 fix_game_path()
@@ -1744,7 +2375,9 @@ def load_launcher_settings():
         "launcher_google_refresh_token": "",
         "personal_chats": [],
         "custom_button_colors": {},
-        "custom_variables": {}
+        "custom_variables": {},
+        "auto_update_check": True,
+        "update_skipped_version": ""
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -2303,16 +2936,37 @@ def ensure_authlib_injector():
             if asset.get("name", "").endswith(".jar"):
                 download_url = asset.get("browser_download_url")
                 break
-        if not download_url:
+        if not download_url or not _is_https_url(
+                download_url, {"github.com", "githubusercontent.com"}):
             return None
 
-        with requests.get(download_url, stream=True, timeout=60) as file_response:
-            file_response.raise_for_status()
-            with open(injector_path, "wb") as f:
-                for chunk in file_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        return injector_path
+        temp_path = injector_path + ".download"
+        downloaded = 0
+        try:
+            with requests.get(download_url, stream=True, timeout=(15, 60), allow_redirects=True) as file_response:
+                file_response.raise_for_status()
+                if not _is_https_url(file_response.url, {"github.com", "githubusercontent.com"}):
+                    raise ValueError("Недоверенный адрес загрузки authlib-injector")
+                length = int(file_response.headers.get("Content-Length", 0) or 0)
+                if length > 30 * 1024 * 1024:
+                    raise ValueError("authlib-injector превышает допустимый размер")
+                with open(temp_path, "wb") as f:
+                    for chunk in file_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            downloaded += len(chunk)
+                            if downloaded > 30 * 1024 * 1024:
+                                raise ValueError("authlib-injector превышает допустимый размер")
+                            f.write(chunk)
+            if downloaded <= 0:
+                raise ValueError("Пустой файл authlib-injector")
+            os.replace(temp_path, injector_path)
+            return injector_path
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
     except Exception:
         return None
 
@@ -2447,22 +3101,28 @@ def scan_versions():
 
 
 def get_java_version(java_path="java"):
+    """Определяет major-версию Java по выводу java -version; работает с Java 8+ и разными локалями."""
+    if not java_path:
+        return None
     try:
-        result = subprocess.run([java_path, "-version"], capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
-        if result.returncode == 0:
-            output = (result.stderr + result.stdout).lower()
-            if "1.8" in output or '"8.' in output:
-                return 8
-            elif "17." in output or '"17' in output:
-                return 17
-            elif "21." in output or '"21' in output:
-                return 21
-            elif "11." in output or '"11' in output:
-                return 11
-    except:
-        pass
-    return None
+        result = subprocess.run(
+            [os.fspath(java_path), "-version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+            timeout=8, check=False
+        )
+        output = (result.stderr or "") + "\n" + (result.stdout or "")
+        # Java 8 сообщает версию вида 1.8.0_..., более новые — 17.0.x, 21.0.x и т.д.
+        match = re.search(r'(?i)(?:openjdk|java)\s+version\s+"?([0-9]+)(?:\.([0-9]+))?', output)
+        if not match:
+            # Некоторые сборки пишут только openjdk 21.0.2 без слова version.
+            match = re.search(r'(?i)openjdk\s+([0-9]+)(?:\.([0-9]+))?', output)
+        if not match:
+            return None
+        first = int(match.group(1))
+        second = int(match.group(2) or 0)
+        return second if first == 1 else first
+    except (OSError, ValueError, subprocess.SubprocessError, TypeError):
+        return None
 
 
 def resolve_version_jar_path(version, minecraft_dir, _depth=0):
@@ -2507,7 +3167,7 @@ def get_forge_full_version(mc_version):
     try:
         response = requests.get(
             "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
-            headers={"User-Agent": "67Launcher/2.0"})
+            headers={"User-Agent": "67Launcher/2.0"}, timeout=15)
         response.raise_for_status()
         promos = response.json().get("promos", {})
         build = promos.get(f"{mc_version}-recommended") or promos.get(f"{mc_version}-latest")
@@ -2519,70 +3179,142 @@ def get_forge_full_version(mc_version):
 
 
 def _required_java_major(minecraft_version):
-    """Возвращает минимальную major-версию Java для Minecraft.
-
-    1.20.5+ и 1.21+ требуют Java 21; 1.18–1.20.4 — Java 17;
-    1.17 обычно запускается на Java 17; старые версии — Java 8.
-    """
-    raw = str(minecraft_version).strip()
+    """Возвращает минимальную major-версию Java для известных поколений Minecraft."""
+    raw = str(minecraft_version or "").strip()
+    # Snapshot IDs: snapshots 26w относятся к новому поколению 26.x (Java 25),
+    # snapshots 24w/25w — к поколениям Minecraft на Java 21.
     snapshot = re.match(r"^(\d{2})w(\d{2})[a-z]?$", raw, re.IGNORECASE)
-    if snapshot and int(snapshot.group(1)) >= 24:
-        return 21
-    m = re.match(r"^(?:release[-_])?(\d+)\.(\d+)(?:\.(\d+))?", raw)
+    if snapshot:
+        year = int(snapshot.group(1))
+        if year >= 26:
+            return 25
+        return 21 if year >= 24 else (17 if year >= 21 else 8)
+
+    # Поддерживаем старые IDs (1.20.1-forge-...) и новую схему версий 26.1+.
+    m = re.match(r"^(?:release[-_])?(\d+)\.(\d+)(?:\.(\d+))?", raw, re.IGNORECASE)
     if not m:
-        return 17
-    major, minor, patch = map(lambda x: int(x or 0), m.groups())
-    if major == 1 and minor == 20 and patch >= 5:
+        raise ValueError(f"Не удалось определить версию Minecraft из '{raw}'")
+    major, minor, patch = (int(x or 0) for x in m.groups())
+
+    # Minecraft 26.1 официально требует Java 25; новые версии используют схему 26.x.
+    if major >= 26:
+        return 25
+    if major != 1:
+        raise ValueError(f"Неизвестный формат версии Minecraft: '{raw}'")
+    if minor >= 21 or (minor == 20 and patch >= 5):
         return 21
-    if major == 1 and minor >= 21:
-        return 21
-    if major == 1 and minor >= 18:
-        return 17
-    if major == 1 and minor == 17:
+    if minor >= 17:
         return 17
     return 8
 
 
-def get_java_for_version(minecraft_version):
-    settings = load_launcher_settings()
-    target_version = _required_java_major(minecraft_version)
-    manual_java = settings.get("java_path", "")
-    if manual_java and os.path.exists(manual_java):
-        ver = get_java_version(manual_java)
-        if ver == target_version:
-            return manual_java
+def _java_is_compatible(java_major, required_major):
+    """Допускает более новую Java для современных версий, предпочитая точное совпадение."""
+    if java_major is None:
+        return False
+    if required_major == 8:
+        # Старые версии/моды часто несовместимы с новыми JVM.
+        return java_major == 8
+    return java_major >= required_major
 
-    def _check_java(path):
+
+def _java_executable_name():
+    return "java.exe" if os.name == "nt" else "java"
+
+
+def _java_candidates():
+    """Возвращает найденные Java-кандидаты из PATH, JAVA_HOME и типовых runtime-папок."""
+    exe_name = _java_executable_name()
+    seen = set()
+
+    def add(path):
+        if not path:
+            return
+        path = os.path.expandvars(os.path.expanduser(os.fspath(path).strip().strip('"')))
+        if os.path.isdir(path):
+            path = os.path.join(path, "bin", exe_name)
+        key = os.path.normcase(os.path.abspath(path)) if os.path.isabs(path) else path
+        if key not in seen and (os.path.isfile(path) or (not os.path.isabs(path) and shutil.which(path))):
+            seen.add(key)
+            candidates.append(path)
+
+    candidates = []
+    add(shutil.which("java") or "java")
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        add(java_home)
+
+    roots = []
+    if os.name == "nt":
+        for env_name, fallback in (("ProgramFiles", r"C:\Program Files"),
+                                   ("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            base = os.environ.get(env_name, fallback)
+            roots.extend([os.path.join(base, "Java"), os.path.join(base, "Eclipse Adoptium"),
+                          os.path.join(base, "Microsoft")])
+        roots.extend([os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Eclipse Adoptium"),
+                      os.path.join(MINECRAFT_DIR, "runtime")])
+    else:
+        roots.extend(["/usr/lib/jvm", "/usr/java", "/opt/java", os.path.join(MINECRAFT_DIR, "runtime")])
+
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
         try:
-            ver = get_java_version(path)
-            return ver == target_version
-        except Exception:
-            return False
-
-    if _check_java("java"):
-        return "java"
-
-    common_roots = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Java"),
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Eclipse Adoptium"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Java"),
-    ]
-    for root in common_roots:
-        try:
-            if not os.path.isdir(root):
-                continue
-            for name in sorted(os.listdir(root), reverse=True):
-                candidate = os.path.join(root, name, "bin", "java.exe")
-                if os.path.exists(candidate) and _check_java(candidate):
-                    return candidate
+            # Java installations vary in layout; cap traversal depth to avoid scanning the whole disk.
+            root_depth = root.rstrip(os.sep).count(os.sep)
+            for current, dirs, files in os.walk(root):
+                depth = current.rstrip(os.sep).count(os.sep) - root_depth
+                if depth >= 5:
+                    dirs[:] = []
+                if exe_name in files and os.path.basename(current).lower() == "bin":
+                    add(os.path.join(current, exe_name))
         except OSError:
             continue
 
-    local_java_dir = os.path.join(MINECRAFT_DIR, f"java{target_version}")
-    java_exe = os.path.join(local_java_dir, "bin", "java.exe")
-    if os.path.exists(java_exe) and _check_java(java_exe):
-        return java_exe
-    return "java"
+    # Minecraft runtime installations may live under versions of this directory on all platforms.
+    local_runtime = os.path.join(MINECRAFT_DIR, "java")
+    add(local_runtime)
+    for major in (8, 17, 21, 25):
+        add(os.path.join(MINECRAFT_DIR, f"java{major}"))
+    return candidates
+
+
+def get_java_for_version(minecraft_version):
+    """Выбирает совместимую Java; не возвращает непроверенный путь при отсутствии Java."""
+    required = _required_java_major(minecraft_version)
+    settings = load_launcher_settings()
+    manual_java = str(settings.get("java_path", "") or "").strip().strip('"')
+
+    if manual_java:
+        manual_java = os.path.expandvars(os.path.expanduser(manual_java))
+        if os.path.isdir(manual_java):
+            manual_java = os.path.join(manual_java, "bin", _java_executable_name())
+        if not os.path.isfile(manual_java) and not shutil.which(manual_java):
+            raise FileNotFoundError(f"Указанный путь Java не найден: {manual_java}. Исправьте путь в настройках.")
+        manual_major = get_java_version(manual_java)
+        if manual_major is None:
+            raise RuntimeError(f"Не удалось запустить Java по пути: {manual_java}")
+        if not _java_is_compatible(manual_major, required):
+            raise RuntimeError(
+                f"Выбрана Java {manual_major}, но для Minecraft {minecraft_version} нужна Java {required}"
+                + (" (для старых версий требуется именно Java 8)." if required == 8 else " или новее.")
+            )
+        return manual_java
+
+    valid = []
+    for candidate in _java_candidates():
+        major = get_java_version(candidate)
+        if _java_is_compatible(major, required):
+            valid.append((major, candidate))
+    if not valid:
+        required_text = "Java 8" if required == 8 else f"Java {required} или новее"
+        raise FileNotFoundError(
+            f"Не найдена совместимая Java для Minecraft {minecraft_version}. Требуется {required_text}. "
+            "Установите её или укажите java.exe/java в настройках лаунчера."
+        )
+    # Сначала предпочитаем точное совпадение, затем самую низкую подходящую версию.
+    valid.sort(key=lambda item: (item[0] != required, item[0]))
+    return valid[0][1]
 
 
 def get_mods_folder():
@@ -2601,9 +3333,20 @@ def load_image_from_url(url, size=(48, 48)):
     if cache_key in _icon_cache:
         return _icon_cache[cache_key]
     try:
-        response = requests.get(url, timeout=10, headers={"User-Agent": "67Launcher/2.0"})
+        if not _is_https_url(url):
+            return None
+        response = requests.get(url, timeout=(5, 10), headers={"User-Agent": "67Launcher/2.0"}, stream=True)
         response.raise_for_status()
-        img = Image.open(BytesIO(response.content)).convert("RGBA")
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                content.extend(chunk)
+                if len(content) > _MAX_IMAGE_DOWNLOAD:
+                    response.close()
+                    return None
+        response.close()
+        img = Image.open(BytesIO(content)).convert("RGBA")
+        img.thumbnail((512, 512))
         ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
         _icon_cache[cache_key] = ctk_img
         return ctk_img
@@ -2620,7 +3363,7 @@ def search_mods(query, game_version, mod_loader, limit=20):
     }
     try:
         response = requests.get("https://api.modrinth.com/v2/search", params=params,
-                                headers={"User-Agent": "67Launcher/2.0"})
+                                headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         response.raise_for_status()
         return response.json().get("hits", [])
     except:
@@ -2631,23 +3374,43 @@ def install_mod(project_id, game_version, mod_loader):
     try:
         params = {"game_versions": f'["{game_version}"]', "loaders": f'["{mod_loader}"]'}
         response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}/version",
-                                params=params, headers={"User-Agent": "67Launcher/2.0"})
+                                params=params, headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         response.raise_for_status()
         versions = response.json()
         if not versions:
             return False, "Нет совместимых версий"
         mod_file = versions[0].get('files', [])[0]
         download_url = mod_file.get('url')
-        filename = mod_file.get('filename')
-        if not download_url:
-            return False, "Нет ссылки для скачивания"
+        filename = sanitize_shared_filename(mod_file.get('filename') or "mod.jar")
+        if not download_url or not _is_https_url(download_url, {"modrinth.com"}):
+            return False, "Ссылка на мод должна вести на HTTPS-домен Modrinth"
         filepath = os.path.join(get_mods_folder(), filename)
-        response = requests.get(download_url, stream=True)
-        response.raise_for_status()
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        temp_path = filepath + ".download"
+        downloaded = 0
+        try:
+            with requests.get(download_url, stream=True, timeout=(15, 60), allow_redirects=True) as response:
+                response.raise_for_status()
+                if not _is_https_url(response.url, {"modrinth.com"}):
+                    return False, "Сервер перенаправил загрузку на недоверенный домен"
+                length = int(response.headers.get("Content-Length", 0) or 0)
+                if length > _MAX_MOD_DOWNLOAD:
+                    return False, "Файл мода превышает лимит 250 МБ"
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            downloaded += len(chunk)
+                            if downloaded > _MAX_MOD_DOWNLOAD:
+                                raise ValueError("Файл мода превышает лимит 250 МБ")
+                            f.write(chunk)
+            if downloaded <= 0:
+                raise ValueError("Сервер вернул пустой файл")
+            os.replace(temp_path, filepath)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
         return True, filename
     except Exception as e:
         return False, str(e)
@@ -2668,7 +3431,7 @@ def identify_mod_by_hash(filepath):
 
         response = requests.get(f"https://api.modrinth.com/v2/version_file/{file_hash}",
                                 params={"algorithm": "sha1"},
-                                headers={"User-Agent": "67Launcher/2.0"})
+                                headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         if response.status_code != 200:
             return None
         version_data = response.json()
@@ -2677,7 +3440,7 @@ def identify_mod_by_hash(filepath):
             return None
 
         project_response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}",
-                                        headers={"User-Agent": "67Launcher/2.0"})
+                                        headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         project_response.raise_for_status()
         project = project_response.json()
         return {
@@ -2707,7 +3470,7 @@ def search_resourcepacks(query, game_version, limit=20):
     }
     try:
         response = requests.get("https://api.modrinth.com/v2/search", params=params,
-                                headers={"User-Agent": "67Launcher/2.0"})
+                                headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         response.raise_for_status()
         return response.json().get("hits", [])
     except:
@@ -2718,23 +3481,43 @@ def install_resourcepack_web(project_id, game_version):
     try:
         params = {"game_versions": f'["{game_version}"]'}
         response = requests.get(f"https://api.modrinth.com/v2/project/{project_id}/version",
-                                params=params, headers={"User-Agent": "67Launcher/2.0"})
+                                params=params, headers={"User-Agent": "67Launcher/2.0"}, timeout=20)
         response.raise_for_status()
         versions = response.json()
         if not versions:
             return False, "Нет совместимых версий"
         pack_file = versions[0].get('files', [])[0]
         download_url = pack_file.get('url')
-        filename = pack_file.get('filename')
-        if not download_url:
-            return False, "Нет ссылки для скачивания"
+        filename = sanitize_shared_filename(pack_file.get('filename') or "resourcepack.zip")
+        if not download_url or not _is_https_url(download_url, {"modrinth.com"}):
+            return False, "Ссылка на ресурспак должна вести на HTTPS-домен Modrinth"
         filepath = os.path.join(get_resourcepacks_folder(), filename)
-        response = requests.get(download_url, stream=True)
-        response.raise_for_status()
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        temp_path = filepath + ".download"
+        downloaded = 0
+        try:
+            with requests.get(download_url, stream=True, timeout=(15, 60), allow_redirects=True) as response:
+                response.raise_for_status()
+                if not _is_https_url(response.url, {"modrinth.com"}):
+                    return False, "Сервер перенаправил загрузку на недоверенный домен"
+                length = int(response.headers.get("Content-Length", 0) or 0)
+                if length > _MAX_MOD_DOWNLOAD:
+                    return False, "Ресурспак превышает лимит 250 МБ"
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            downloaded += len(chunk)
+                            if downloaded > _MAX_MOD_DOWNLOAD:
+                                raise ValueError("Ресурспак превышает лимит 250 МБ")
+                            f.write(chunk)
+            if downloaded <= 0:
+                raise ValueError("Сервер вернул пустой файл")
+            os.replace(temp_path, filepath)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
         return True, filename
     except Exception as e:
         return False, str(e)
@@ -2801,20 +3584,39 @@ def install_shader(project_id, game_version):
             files[0],
         )
         download_url = shader_file.get("url")
-        filename = shader_file.get("filename")
-        if not download_url or not filename:
-            return False, "Нет ссылки для скачивания"
+        filename = sanitize_shared_filename(shader_file.get("filename") or "shaderpack.zip")
+        if not download_url or not _is_https_url(download_url, {"modrinth.com"}):
+            return False, "Ссылка на шейдерпак должна вести на HTTPS-домен Modrinth"
 
         filepath = os.path.join(get_shaderpacks_folder(), filename)
-        response = requests.get(
-            download_url, stream=True,
-            headers={"User-Agent": "67Launcher/2.0"}, timeout=60
-        )
-        response.raise_for_status()
-        with open(filepath, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        temp_path = filepath + ".download"
+        downloaded = 0
+        try:
+            with requests.get(download_url, stream=True,
+                              headers={"User-Agent": "67Launcher/2.0"},
+                              timeout=(15, 60), allow_redirects=True) as response:
+                response.raise_for_status()
+                if not _is_https_url(response.url, {"modrinth.com"}):
+                    return False, "Сервер перенаправил загрузку на недоверенный домен"
+                length = int(response.headers.get("Content-Length", 0) or 0)
+                if length > _MAX_MOD_DOWNLOAD:
+                    return False, "Шейдерпак превышает лимит 250 МБ"
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            downloaded += len(chunk)
+                            if downloaded > _MAX_MOD_DOWNLOAD:
+                                raise ValueError("Шейдерпак превышает лимит 250 МБ")
+                            f.write(chunk)
+            if downloaded <= 0:
+                raise ValueError("Сервер вернул пустой файл")
+            os.replace(temp_path, filepath)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
         return True, filename
     except Exception as e:
         return False, str(e)
@@ -3581,14 +4383,18 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 response = requests.get(url, stream=True, timeout=120, headers=headers)
                 response.raise_for_status()
-                total_size = int(response.headers.get('content-length', 0))
+                total_size = int(response.headers.get('content-length', 0) or 0)
+                if total_size > 2 * 1024 * 1024 * 1024:
+                    raise ValueError("Архив Geometry Dash превышает лимит 2 ГБ")
                 downloaded = 0
                 block_size = 8192
                 with open(self.zip_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=block_size):
                         if chunk:
-                            f.write(chunk)
                             downloaded += len(chunk)
+                            if downloaded > 2 * 1024 * 1024 * 1024:
+                                raise ValueError("Архив Geometry Dash превышает лимит 2 ГБ")
+                            f.write(chunk)
                             if total_size > 0:
                                 percent = int((downloaded / total_size) * 100)
                                 self.after(0, lambda p=percent: self.update_progress(p, "Скачивание"))
@@ -3596,7 +4402,8 @@ class SecretGeometryDashLauncher(ctk.CTkToplevel):
                 self.after(0, lambda: self.percent_label.configure(text="0%", text_color="#d9622f"))
                 self.after(0, lambda: self.progressbar.set(0))
                 with zipfile.ZipFile(self.zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(self.gd_path)
+                    destination = os.path.realpath(self.gd_path)
+                    _safe_extract_zip(zip_ref, destination)
                 try:
                     os.remove(self.zip_path)
                 except:
@@ -8156,8 +8963,8 @@ def run_game_shortcut(version, account):
 # Microsoft/Minecraft и не меняет лицензионные аккаунты.
 # Google OAuth для 67Launcher. Для desktop-приложений Google не считает
 # client_secret конфиденциальным: его нельзя надёжно скрыть внутри клиента.
-GOOGLE_CLIENT_ID = "969544058989-tui0i56edd6feotcup5u3luugveqvg20.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET = "СКРЫТО"
+GOOGLE_CLIENT_ID = "############"
+GOOGLE_CLIENT_SECRET = "###########"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -8349,6 +9156,18 @@ class LauncherApp(ctk.CTk):
 
         super().__init__()
         LauncherApp.instance = self
+        # Необработанные ошибки фоновых потоков тоже показываем в главном окне.
+        if hasattr(threading, "excepthook"):
+            def _launcher_thread_exception(args):
+                try:
+                    _details = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+                    self.after(0, lambda err=args.exc_value, details=_details: self.show_error_screen(err, details))
+                except Exception:
+                    try:
+                        print("[thread-error]", args.exc_value)
+                    except Exception:
+                        pass
+            threading.excepthook = _launcher_thread_exception
 
         self.title("67Launcher - МЯУ")
         window_width, window_height = 1200, 950
@@ -8394,6 +9213,142 @@ class LauncherApp(ctk.CTk):
             pass
 
         self.after(10, self._finish_startup)
+
+    def report_callback_exception(self, exc, val, tb):
+        """Перехватывает ошибки Tkinter callback-ов и показывает экран восстановления."""
+        details = "".join(traceback.format_exception(exc, val, tb))
+        self.show_error_screen(val, details)
+
+    def _find_error_gif_path(self):
+        bases = [getattr(sys, "_MEIPASS", ""), get_launcher_dir(),
+                 os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+        for base in bases:
+            if not base:
+                continue
+            for rel in (os.path.join("resources", "gif", "скелет-ошибки.gif"),
+                        os.path.join("resources", "скелет-ошибки.GIF"), "скелет-ошибки.gif"):
+                path = os.path.join(base, rel)
+                if os.path.isfile(path):
+                    return path
+            for folder in (os.path.join(base, "resources", "gif"), os.path.join(base, "resources")):
+                try:
+                    for name in os.listdir(folder):
+                        if name.casefold() == "скелет-ошибки.gif":
+                            path = os.path.join(folder, name)
+                            if os.path.isfile(path):
+                                return path
+                except OSError:
+                    pass
+        return None
+
+    def show_error_screen(self, error, details=None):
+        """Заменяет интерфейс экраном ошибки с GIF и кнопками восстановления."""
+        if getattr(self, "_error_screen_visible", False):
+            try:
+                self._error_problem.configure(text=f"{type(error).__name__}: {error}")
+            except Exception:
+                pass
+            return
+        self._error_screen_visible = True
+        details = details or "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        try:
+            self._error_log_path = os.path.join(get_launcher_dir(), "error_log.txt")
+            with open(self._error_log_path, "w", encoding="utf-8") as f:
+                f.write(str(details))
+        except Exception:
+            self._error_log_path = "error_log.txt"
+        self._splash_gif_running = False
+        for child in self.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        self.title("67Launcher — ошибка")
+        panel = ctk.CTkFrame(self, fg_color="#17151f", corner_radius=18)
+        panel.pack(fill="both", expand=True, padx=18, pady=18)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(2, weight=5)  # GIF занимает примерно половину окна
+        ctk.CTkLabel(panel, text="Что-то пошло не так", text_color="#ff7777",
+                     font=ctk.CTkFont(size=25, weight="bold")).grid(
+            row=0, column=0, padx=24, pady=(22, 8), sticky="n")
+        self._error_problem = ctk.CTkLabel(panel, text=f"{type(error).__name__}: {error}",
+            text_color="#eeeaf5", wraplength=900, justify="center", font=ctk.CTkFont(size=14))
+        self._error_problem.grid(row=1, column=0, padx=30, pady=(0, 8), sticky="ew")
+        gif_area = ctk.CTkFrame(panel, fg_color="#111018", corner_radius=12)
+        gif_area.grid(row=2, column=0, sticky="nsew", padx=24, pady=8)
+        gif_area.grid_columnconfigure(0, weight=1)
+        gif_area.grid_rowconfigure(0, weight=1)
+        self._error_gif_label = ctk.CTkLabel(gif_area, text="")
+        self._error_gif_label.grid(row=0, column=0, sticky="nsew")
+        self._error_gif_frames = []
+        self._error_gif_index = 0
+        gif_path = self._find_error_gif_path()
+        if gif_path:
+            try:
+                with Image.open(gif_path) as gif:
+                    for frame in ImageSequence.Iterator(gif):
+                        image = frame.convert("RGBA")
+                        image.thumbnail((720, 430), getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS))
+                        duration = max(50, int(frame.info.get("duration", 100) or 100))
+                        self._error_gif_frames.append((ctk.CTkImage(light_image=image, dark_image=image, size=image.size), duration))
+                self._animate_error_gif()
+            except Exception as gif_error:
+                self._error_gif_label.configure(text=f"Не удалось загрузить GIF: {gif_error}", text_color="#aaa5b9")
+        else:
+            self._error_gif_label.configure(
+                text="Не найден файл resources/gif/скелет-ошибки.gif", text_color="#aaa5b9",
+                font=ctk.CTkFont(size=16))
+        buttons = ctk.CTkFrame(panel, fg_color="transparent")
+        buttons.grid(row=3, column=0, sticky="ew", padx=24, pady=(8, 10))
+        buttons.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(buttons, text="Перезагрузить лаунчер", height=42,
+                      command=self._restart_after_error).grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        ctk.CTkButton(buttons, text="Очистить настройки лаунчера", height=42,
+                      fg_color="#9f3548", hover_color="#7d2636",
+                      command=self._confirm_clear_settings).grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        ctk.CTkLabel(panel, text=f"Подробности: {self._error_log_path}", text_color="#8f899f",
+                     font=ctk.CTkFont(size=11)).grid(row=4, column=0, pady=(0, 12))
+        self.lift()
+        self.focus_force()
+
+    def _animate_error_gif(self):
+        if not getattr(self, "_error_screen_visible", False) or not self._error_gif_frames:
+            return
+        try:
+            image, duration = self._error_gif_frames[self._error_gif_index]
+            self._error_gif_label.configure(image=image, text="")
+            self._error_gif_index = (self._error_gif_index + 1) % len(self._error_gif_frames)
+            self.after(duration, self._animate_error_gif)
+        except Exception:
+            pass
+
+    def _restart_after_error(self):
+        """Запускает новую копию лаунчера; миры, моды и версии игры не трогает."""
+        try:
+            command = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+            subprocess.Popen(command, cwd=get_launcher_dir(), close_fds=True)
+            self.destroy()
+        except Exception as exc:
+            messagebox.showerror("Не удалось перезапустить", str(exc), parent=self)
+
+    def _confirm_clear_settings(self):
+        """Сбрасывает только файл настроек лаунчера, не папку Minecraft."""
+        if not messagebox.askyesno("Очистить настройки?",
+            "Будут сброшены настройки лаунчера и параметры входа. Миры, моды и версии Minecraft останутся. Продолжить?",
+            parent=self):
+            return
+        try:
+            if os.path.isfile(SETTINGS_FILE):
+                os.remove(SETTINGS_FILE)
+            for suffix in (".tmp", ".temp"):
+                try:
+                    if os.path.isfile(SETTINGS_FILE + suffix):
+                        os.remove(SETTINGS_FILE + suffix)
+                except OSError:
+                    pass
+            self._restart_after_error()
+        except Exception as exc:
+            messagebox.showerror("Не удалось очистить настройки", str(exc), parent=self)
 
     def _set_splash_status(self, text):
         try:
@@ -8539,6 +9494,10 @@ class LauncherApp(ctk.CTk):
         client_id = get_google_client_id()
         refresh = str(self.settings.get("launcher_google_refresh_token") or "").strip()
 
+        # Если пользователь уже выбрал режим гостя — пропускаем вход.
+        if self.settings.get("launcher_is_guest") and not self.settings.get("launcher_google_sub"):
+            return True
+
         # Сначала тихо восстанавливаем сессию по refresh token.
         if client_id and refresh:
             try:
@@ -8578,7 +9537,26 @@ class LauncherApp(ctk.CTk):
             command=lambda: self._open_google_login_browser(dialog, client_id),
             height=46, fg_color="#6d92ff", hover_color="#5a7dd8",
             font=ctk.CTkFont(size=15, weight="bold"))
-        dialog.login_btn.pack(fill="x", pady=(0, 12))
+        dialog.login_btn.pack(fill="x", pady=(0, 8))
+
+        def _continue_as_guest():
+            self.settings["launcher_google_sub"] = ""
+            self.settings["launcher_google_email"] = ""
+            self.settings["launcher_google_name"] = "Гость"
+            self.settings["launcher_google_refresh_token"] = ""
+            self.settings["launcher_is_guest"] = True
+            save_launcher_settings(self.settings)
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except Exception:
+                pass
+
+        make_sound_button(
+            frame, text="Продолжить как гость",
+            command=_continue_as_guest,
+            height=38, fg_color="#2b2840", hover_color="#3d3a52",
+            font=ctk.CTkFont(size=13)).pack(fill="x", pady=(0, 12))
 
         # OAuth-данные встроены в лаунчер, поэтому отдельные файлы не нужны.
 
@@ -8590,35 +9568,75 @@ class LauncherApp(ctk.CTk):
                 self.destroy()
 
         dialog.protocol("WM_DELETE_WINDOW", cancel)
-        ctk.CTkLabel(frame, text="Требуется вход для использования 67Launcher.",
+        ctk.CTkLabel(frame, text="Войди через Google или продолжи как гость.",
                      text_color="#8b87a3", font=ctk.CTkFont(size=11)).pack(side="bottom", pady=(16, 0))
         self.wait_window(dialog)
-        return bool(self.settings.get("launcher_google_sub"))
+        # Считаем успехом и Google-вход, и режим гостя
+        return bool(self.settings.get("launcher_google_sub")) or bool(self.settings.get("launcher_is_guest"))
 
     def _open_launcher_account_window(self):
+        is_guest = bool(self.settings.get("launcher_is_guest")) and not self.settings.get("launcher_google_sub")
         win = ctk.CTkToplevel(self)
         win.title("Аккаунт 67Launcher")
-        win.geometry("500x330")
+        win.geometry("500x360")
         win.resizable(False, False)
         win.transient(self)
         body = ctk.CTkFrame(win, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=28, pady=28)
-        name = self.settings.get("launcher_google_name") or "Аккаунт Google"
-        email = self.settings.get("launcher_google_email") or ""
-        uid = ensure_user_id(self.settings)
         ctk.CTkLabel(body, text="Аккаунт 67Launcher", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(0, 14))
-        ctk.CTkLabel(body, text=f"👤 {name}", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=3)
-        ctk.CTkLabel(body, text=email or "Google", text_color="#a8a4bd").pack(pady=3)
-        ctk.CTkLabel(body, text=f"ID: {uid}", text_color="#8b87a3").pack(pady=(3, 20))
-        make_sound_button(body, text="Выйти из аккаунта", command=lambda: self._logout_google_account(win),
-                          height=40, fg_color="#d3453f", hover_color="#b83530").pack(fill="x")
+        if is_guest:
+            ctk.CTkLabel(body, text="👤 Гость", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=3)
+            ctk.CTkLabel(body, text="Без аккаунта Google", text_color="#a8a4bd").pack(pady=3)
+            ctk.CTkLabel(body, text="Друзья и чаты недоступны в режиме гостя.",
+                         text_color="#8b87a3", wraplength=400, justify="center").pack(pady=(3, 20))
+            make_sound_button(body, text="Войти через Google", command=lambda: self._switch_guest_to_google(win),
+                              height=40, fg_color="#6d92ff", hover_color="#5a7dd8",
+                              font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", pady=(0, 8))
+        else:
+            name = self.settings.get("launcher_google_name") or "Аккаунт Google"
+            email = self.settings.get("launcher_google_email") or ""
+            uid = ensure_user_id(self.settings)
+            ctk.CTkLabel(body, text=f"👤 {name}", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=3)
+            ctk.CTkLabel(body, text=email or "Google", text_color="#a8a4bd").pack(pady=3)
+            ctk.CTkLabel(body, text=f"ID: {uid}", text_color="#8b87a3").pack(pady=(3, 20))
+            make_sound_button(body, text="Выйти из аккаунта", command=lambda: self._logout_google_account(win),
+                              height=40, fg_color="#d3453f", hover_color="#b83530").pack(fill="x")
+
+    def _switch_guest_to_google(self, win=None):
+        """Переключение из режима гостя в Google-аккаунт без перезапуска."""
+        try:
+            if win and win.winfo_exists():
+                win.destroy()
+        except Exception:
+            pass
+        client_id = get_google_client_id()
+        if not client_id:
+            messagebox.showerror("Ошибка", "Google Client ID не настроен.")
+            return
+        # Временно сбрасываем флаг гостя, чтобы диалог входа открылся
+        self.settings["launcher_is_guest"] = False
+        save_launcher_settings(self.settings)
+        if self._ensure_google_login():
+            ensure_user_id(self.settings)
+            save_launcher_settings(self.settings)
+            # Обновляем кнопку профиля
+            try:
+                name = self.settings.get("launcher_google_name") or "Аккаунт"
+                self.google_account_btn.configure(text=f"👤 {name[:22]}")
+            except Exception:
+                pass
+        else:
+            # Вход отменён — возвращаем гостевой режим
+            self.settings["launcher_is_guest"] = True
+            save_launcher_settings(self.settings)
 
     def _logout_google_account(self, win=None):
         self.settings["launcher_google_sub"] = ""
         self.settings["launcher_google_email"] = ""
-        self.settings["launcher_google_name"] = ""
+        self.settings["launcher_google_name"] = "Гость"
         self.settings["launcher_google_refresh_token"] = ""
         self.settings["user_id"] = ""
+        self.settings["launcher_is_guest"] = True
         save_launcher_settings(self.settings)
         self._dm_inbox_running = False
         try:
@@ -8632,8 +9650,12 @@ class LauncherApp(ctk.CTk):
                 win.destroy()
         except Exception:
             pass
-        messagebox.showinfo("Выход", "Ты вышел из аккаунта 67Launcher. Перезапусти лаунчер для нового входа.")
-        self.destroy()
+        # Обновляем кнопку профиля на «Гость»
+        try:
+            self.google_account_btn.configure(text="👤 Гость")
+        except Exception:
+            pass
+        messagebox.showinfo("Выход", "Ты вышел из аккаунта Google и продолжаешь как гость.")
 
     def _finish_startup(self):
         global MINECRAFT_DIR, GAME_DIR, ACCOUNTS_FILE, PROFILES_FILE, LAUNCHER_PROFILES_FILE
@@ -8748,6 +9770,11 @@ class LauncherApp(ctk.CTk):
             self.bind("<Map>", lambda e: _apply_cursor_to_window(self) if e.widget is self else None, add="+")
         except Exception as exc:
             print(f"[cursor] post-startup install failed: {exc}")
+
+        try:
+            launcher_autoupdate_start(self)
+        except Exception as exc:
+            print(f"[Updater] автопроверка не запустилась: {exc}")
 
     def create_emoji_icon(emoji_text="💬"):
         img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
@@ -8879,8 +9906,34 @@ class LauncherApp(ctk.CTk):
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
 
     def toggle_theme(self):
+        global _THEME_SWITCH_LOCK_UNTIL
+
+        # После переключения тему нельзя менять ещё 5 секунд.
+        now = time.monotonic()
+        if now < _THEME_SWITCH_LOCK_UNTIL:
+            try:
+                current_dark = self.settings.get("theme", "dark") == "dark"
+                if current_dark:
+                    self.theme_switch.select()
+                else:
+                    self.theme_switch.deselect()
+            except Exception:
+                pass
+            return
+
+        _THEME_SWITCH_LOCK_UNTIL = now + 5.0
         is_dark = self.theme_switch.get() == 1
         theme = "dark" if is_dark else "light"
+
+        # Эффект запускается первым, затем Tk сразу начинает перерисовку темы.
+        # Поэтому изображение и звук находятся непосредственно ВО ВРЕМЯ загрузки.
+        show_theme_transition_effect(self, theme)
+        try:
+            self.update_idletasks()
+            self.update()
+        except Exception:
+            pass
+
         self.settings["theme"] = theme
         save_launcher_settings(self.settings)
         ctk.set_appearance_mode("Dark" if theme == "dark" else "Light")
@@ -9291,9 +10344,26 @@ class LauncherApp(ctk.CTk):
             self.java_path_entry.insert(0, chosen)
 
     def save_java_path(self):
-        new_path = self.java_path_entry.get().strip()
+        new_path = self.java_path_entry.get().strip().strip('"')
+        if new_path:
+            expanded = os.path.expandvars(os.path.expanduser(new_path))
+            if os.path.isdir(expanded):
+                expanded = os.path.join(expanded, "bin", _java_executable_name())
+            if not os.path.isfile(expanded) and not shutil.which(expanded):
+                play_error()
+                show_error_toast(self, "Неверный путь", "Файл Java не найден. Выберите java.exe/java или очистите поле для автоопределения.")
+                return
+            detected = get_java_version(expanded)
+            if detected is None:
+                play_error()
+                show_error_toast(self, "Java не запускается", "Не удалось определить версию выбранной Java.")
+                return
+            new_path = expanded
         self.settings["java_path"] = new_path
-        save_launcher_settings(self.settings)
+        if not save_launcher_settings(self.settings):
+            play_error()
+            show_error_toast(self, "Ошибка", "Не удалось сохранить настройки Java")
+            return
         play_click()
         self.log(f"Путь к Java: {new_path or 'автоопределение'} (сохранено)")
         show_info_toast(self, "Сохранено", "Путь к Java сохранён")
@@ -10110,7 +11180,7 @@ class LauncherApp(ctk.CTk):
 
         self.google_account_btn = make_sound_button(
             top_frame,
-            text=f"👤 {str(self.settings.get('launcher_google_name') or 'Аккаунт')[:22]}",
+            text=f"👤 {str(self.settings.get('launcher_google_name') or ('Гость' if self.settings.get('launcher_is_guest') else 'Аккаунт'))[:22]}",
             command=self._open_launcher_account_window,
             width=180, height=35, fg_color="#2b2840", hover_color="#3d3a52",
             font=ctk.CTkFont(size=12, weight="bold"))
@@ -11673,6 +12743,15 @@ class LauncherApp(ctk.CTk):
         self._launcher_update_button = make_sound_button(updater_frame, text="Проверить обновления", command=lambda: check_launcher_update_from_settings(self), height=34)
         self._launcher_update_button.grid(row=1, column=0, sticky="w")
         ctk.CTkLabel(updater_frame, text="Проверка выполняется в фоне. Перед заменой файлов updater проверяет архив.", font=ctk.CTkFont(size=11), text_color="#8b87a3").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        self._auto_update_var = tk.BooleanVar(value=bool(self.settings.get("auto_update_check", True)))
+
+        def _save_auto_update():
+            self.settings["auto_update_check"] = bool(self._auto_update_var.get())
+            if self._auto_update_var.get():
+                self.settings["update_skipped_version"] = ""
+            save_launcher_settings(self.settings)
+        ctk.CTkCheckBox(updater_frame, text="Сам проверять обновления при запуске", variable=self._auto_update_var,
+                        command=_save_auto_update).grid(row=3, column=0, sticky="w", pady=(10, 0))
 
         ctk.CTkLabel(main_frame, text="Полезные ссылки", font=ctk.CTkFont(size=14, weight="bold")).grid(row=20,
                                                                                                           column=0,
@@ -12272,13 +13351,18 @@ class LauncherApp(ctk.CTk):
                     command.extend(["--accessToken", "0"])
                     command.extend(["--userType", "mojang"])
 
+                # В команде библиотеки первый элемент — исполняемый файл Java.
+                # Сначала заменяем его, и только потом добавляем JVM-аргументы,
+                # иначе javaagent может затереть путь к Java или оказаться на месте executable.
+                if command:
+                    command[0] = java_path
+                else:
+                    command = [java_path]
                 if injector_path:
-                    command.insert(0, f"-javaagent:{injector_path}=ely.by")
+                    command.insert(1, f"-javaagent:{injector_path}=ely.by")
 
-                if java_path != "java":
-                    command.insert(0, java_path)
-
-                self.log(f"Команда запуска: {' '.join(command[:6])}...")
+                # Do not log command arguments: authentication tokens may appear in them.
+                self.log(f"Команда запуска подготовлена (аргументов: {len(command)}).")
                 self.set_launch_progress(85, "⏳ Запуск процесса...")
 
                 self.minecraft_process = subprocess.Popen(
@@ -12347,8 +13431,11 @@ class LauncherApp(ctk.CTk):
                 was_first_launch = load_stats().get("launches", 0) == 0
                 update_stats()
                 self.stats = load_stats()
-                if was_first_launch:
-                    self.after(0, self.show_first_launch_server_dialog)
+                # Диалога первого запуска в коде нет, поэтому голое обращение к нему падало с
+                # AttributeError и срывало таймер игры и слежение за процессом при самом первом запуске.
+                _first_launch_dialog = getattr(self, "show_first_launch_server_dialog", None)
+                if was_first_launch and callable(_first_launch_dialog):
+                    self.after(0, _first_launch_dialog)
 
                 self.after(0, self.start_game_timer)
 
@@ -12532,12 +13619,33 @@ class LauncherApp(ctk.CTk):
                     if percent % 10 == 0:
                         self.log(f"Скачивание Forge: {percent}%")
 
-            urllib.request.urlretrieve(forge_url, installer_path, report_progress)
+            # urlretrieve не позволяет надёжно задать timeout: сетевой сбой мог
+            # навсегда оставить поток установки в ожидании.
+            with urllib.request.urlopen(forge_url, timeout=60) as response:
+                total_size = int(response.headers.get("Content-Length", 0) or 0)
+                downloaded = 0
+                block_size = 8192
+                with open(installer_path, "wb") as installer_file:
+                    while True:
+                        chunk = response.read(block_size)
+                        if not chunk:
+                            break
+                        installer_file.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            report_progress((downloaded + block_size - 1) // block_size,
+                                            block_size, total_size)
             self.log("Запускаю установщик Forge...")
-            java_path = get_java_for_version(version)
+            mc_version_match = re.match(r"^(1\.\d+(?:\.\d+)?)", str(version))
+            if not mc_version_match:
+                raise ValueError(f"Не удалось извлечь версию Minecraft из версии Forge: {version}")
+            java_path = get_java_for_version(mc_version_match.group(1))
             cmd = [java_path, "-jar", installer_path, "--installClient", MINECRAFT_DIR]
-            process = subprocess.Popen(cmd, cwd=MINECRAFT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+            # Объединяем stderr со stdout, иначе непрочитанный stderr может заполниться
+            # и заблокировать установщик, пока этот поток читает только stdout.
+            process = subprocess.Popen(cmd, cwd=MINECRAFT_DIR, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                       text=True, encoding="utf-8", errors="replace")
             while True:
                 output = process.stdout.readline()
                 if output == '' and process.poll() is not None:
@@ -12545,8 +13653,7 @@ class LauncherApp(ctk.CTk):
                 if output:
                     self.log(f"{output.strip()}")
             if process.returncode != 0:
-                stderr = process.stderr.read()
-                self.log(f"Forge не встал: {stderr}")
+                self.log(f"Forge не встал (код завершения {process.returncode}); подробности выше в логе.")
                 return False
             try:
                 os.remove(installer_path)
@@ -14373,6 +15480,7 @@ if __name__ == "__main__":
         pass
     try:
         app = LauncherApp()
+        _single_instance_attach(app)
         app.mainloop()
     except Exception as e:
         print(f"❌ ОШИБКА: {e}")
@@ -14391,18 +15499,84 @@ if __name__ == "__main__":
             except Exception:
                 continue
         play_error()
-        if getattr(sys, "frozen", False):
-            # В exe консоли нет — показываем окно, иначе лаунчер просто молча пропадает
-            try:
-                _err_root = tk.Tk()
-                _err_root.withdraw()
-                messagebox.showerror("67Launcher упал",
-                                     f"{e}\n\nПодробности: {_log_written or 'лог записать не удалось'}")
+        try:
+            _err_root = ctk.CTk()
+            _err_root.title("67Launcher — ошибка")
+            _err_root.geometry("900x760")
+            _err_root.minsize(650, 600)
+            _err_root.configure(fg_color="#111018")
+            _err_root.grid_columnconfigure(0, weight=1)
+            _err_root.grid_rowconfigure(0, weight=1)
+            _panel = ctk.CTkFrame(_err_root, fg_color="#17151f", corner_radius=18)
+            _panel.grid(row=0, column=0, sticky="nsew", padx=18, pady=18)
+            _panel.grid_columnconfigure(0, weight=1)
+            _panel.grid_rowconfigure(2, weight=5)
+            ctk.CTkLabel(_panel, text="Что-то пошло не так", text_color="#ff7777",
+                         font=ctk.CTkFont(size=25, weight="bold")).grid(row=0, column=0, pady=(22, 8))
+            ctk.CTkLabel(_panel, text=f"{type(e).__name__}: {e}", wraplength=800,
+                         justify="center", text_color="#eeeaf5").grid(row=1, column=0, padx=24, pady=8)
+            _gif_area = ctk.CTkFrame(_panel, fg_color="#111018", corner_radius=12)
+            _gif_area.grid(row=2, column=0, sticky="nsew", padx=24, pady=8)
+            _gif_area.grid_columnconfigure(0, weight=1)
+            _gif_area.grid_rowconfigure(0, weight=1)
+            _gif_label = ctk.CTkLabel(_gif_area, text="")
+            _gif_label.grid(row=0, column=0, sticky="nsew")
+            _frames = []
+            _gif_candidates = [os.path.join(get_launcher_dir(), "resources", "gif", "скелет-ошибки.gif"),
+                               os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "gif", "скелет-ошибки.gif")]
+            for _gif_path in _gif_candidates:
+                if os.path.isfile(_gif_path):
+                    try:
+                        with Image.open(_gif_path) as _gif:
+                            for _frame in ImageSequence.Iterator(_gif):
+                                _im = _frame.convert("RGBA")
+                                _im.thumbnail((720, 430))
+                                _frames.append((ctk.CTkImage(light_image=_im, dark_image=_im, size=_im.size),
+                                                max(50, int(_frame.info.get("duration", 100) or 100))))
+                        break
+                    except Exception:
+                        _frames = []
+            _gif_state = {"i": 0}
+            def _animate_startup_error():
+                if not _frames or not _gif_label.winfo_exists(): return
+                _image, _duration = _frames[_gif_state["i"]]
+                _gif_label.configure(image=_image, text="")
+                _gif_state["i"] = (_gif_state["i"] + 1) % len(_frames)
+                _err_root.after(_duration, _animate_startup_error)
+            if _frames:
+                _animate_startup_error()
+            else:
+                _gif_label.configure(text="Не найден resources/gif/скелет-ошибки.gif", text_color="#aaa5b9")
+            ctk.CTkLabel(_panel, text=f"Подробности: {_log_written or 'лог записать не удалось'}",
+                         text_color="#8f899f", font=ctk.CTkFont(size=11)).grid(row=3, column=0, pady=(0, 8))
+            _buttons = ctk.CTkFrame(_panel, fg_color="transparent")
+            _buttons.grid(row=4, column=0, sticky="ew", padx=24, pady=(8, 22))
+            _buttons.grid_columnconfigure((0, 1), weight=1)
+            def _restart_startup_error():
+                _cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+                subprocess.Popen(_cmd, cwd=get_launcher_dir(), close_fds=True)
                 _err_root.destroy()
-            except Exception:
-                pass
-        else:
-            try:
-                input("\nНажмите Enter для выхода...")
-            except Exception:
-                pass
+            def _clear_startup_settings():
+                if not messagebox.askyesno("Очистить настройки?",
+                    "Сбросить настройки лаунчера и параметры входа? Миры, моды и версии игры останутся.", parent=_err_root): return
+                try:
+                    if os.path.isfile(SETTINGS_FILE): os.remove(SETTINGS_FILE)
+                    _restart_startup_error()
+                except Exception as _clear_exc:
+                    messagebox.showerror("Ошибка сброса", str(_clear_exc), parent=_err_root)
+            ctk.CTkButton(_buttons, text="Перезагрузить лаунчер", command=_restart_startup_error, height=42).grid(
+                row=0, column=0, padx=(0, 8), sticky="ew")
+            ctk.CTkButton(_buttons, text="Очистить настройки лаунчера", command=_clear_startup_settings, height=42,
+                          fg_color="#9f3548", hover_color="#7d2636").grid(row=0, column=1, padx=(8, 0), sticky="ew")
+            _err_root.mainloop()
+        except Exception:
+            if getattr(sys, "frozen", False):
+                try:
+                    _err_root = tk.Tk(); _err_root.withdraw()
+                    messagebox.showerror("67Launcher упал", f"{e}\n\nПодробности: {_log_written or 'лог записать не удалось'}")
+                    _err_root.destroy()
+                except Exception:
+                    pass
+            else:
+                try: input("\nНажмите Enter для выхода...")
+                except Exception: pass
