@@ -1431,29 +1431,45 @@ def sanitize_shared_filename(name):
 
 
 def add_firewall_rule():
+    """Запрашивает разрешение пользователя на входящие соединения только в частной сети.
+
+    Чат через relay не требует входящих соединений, поэтому правило не создаётся
+    автоматически. Эта функция оставлена для сценариев локальной сети и использует
+    отдельное правило для текущего исполняемого файла, профиль Private и UAC.
+    """
     if sys.platform != "win32":
-        return True
+        return False
 
     try:
+        import ctypes
         import subprocess
-        check_cmd = ["netsh", "advfirewall", "firewall", "show", "rule", 'name=67Launcher Chat']
-        result = subprocess.run(check_cmd, capture_output=True, text=True, shell=False,
-                                encoding='cp866', timeout=10)
+        import shlex
 
-        if "No rules match" in result.stdout or "Не найдено" in result.stdout:
-            add_cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
-                       "name=67Launcher Chat", "dir=in", "action=allow", "protocol=TCP", "localport=25565"]
-            subprocess.run(add_cmd, capture_output=True, text=True, shell=False,
-                           encoding='cp866', timeout=10)
-            # Не открываем широкий диапазон портов автоматически.
-            # Для пользовательского сервера следует создать отдельное точечное правило вручную.
-            print("✅ Правило брандмауэра добавлено")
+        executable = os.path.abspath(sys.executable)
+        rule_name = "67Launcher Chat - Private Network"
+        # Проверка существующего правила без повышения привилегий.
+        check_cmd = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"]
+        result = subprocess.run(check_cmd, capture_output=True, text=True, shell=False,
+                                encoding="cp866", errors="replace", timeout=10)
+        combined = (result.stdout + "\n" + result.stderr).lower()
+        if result.returncode == 0 and ("67launcher chat - private network" in combined):
             return True
-        else:
-            print("✅ Правило брандмауэра уже существует")
-            return True
+
+        # ShellExecuteW(runAs) вызывает стандартный системный UAC prompt.
+        args = subprocess.list2cmdline([
+            "advfirewall", "firewall", "add", "rule",
+            f"name={rule_name}", "dir=in", "action=allow",
+            f"program={executable}", "enable=yes", "profile=private", "edge=no"
+        ])
+        result_code = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "netsh.exe", args, None, 0
+        )
+        if result_code <= 32:
+            print(f"⚠️ Пользователь отменил UAC или не удалось открыть netsh (код {result_code})")
+            return False
+        return True
     except Exception as e:
-        print(f"⚠️ Не удалось добавить правило брандмауэра: {e}")
+        print(f"⚠️ Не удалось запросить разрешение частной сети: {e}")
         return False
 
 
@@ -5225,7 +5241,7 @@ class ChatWindow(ctk.CTkToplevel):
         self.unread_count = 0
         self.update_title()
         self._clear_personal_unread()
-
+#продолжит
     def on_minimize(self, event):
         if event.widget is not self:
             return
@@ -5802,6 +5818,41 @@ class ChatWindow(ctk.CTkToplevel):
         self.message_entry.insert("insert", emoji)
         self.message_entry.focus()
 
+    def request_private_network_permission(self):
+        """Запрашивает разрешение брандмауэра по нажатию кнопки в окне чата."""
+        if sys.platform != "win32":
+            messagebox.showinfo("Брандмауэр", "Эта настройка доступна только в Windows.", parent=self)
+            return
+        allowed = messagebox.askyesno(
+            "Разрешение брандмауэра",
+            "Добавить правило брандмауэра для 67Launcher в профиле «Частная сеть»?\n\n"
+            "Это может быть полезно для подключений в локальной сети. Чат через интернет-релей "
+            "работает ТОЛЬКО С ЭТИМ РАЗРЕШЕНИЕМ!(ну я хз как это работает). Windows может запросить подтверждение администратора.",
+            parent=self
+        )
+        if not allowed:
+            return
+        if add_firewall_rule():
+            try:
+                self.master.settings["chat_private_network_permission_decided"] = True
+                self.master.settings["chat_private_network_permission_granted"] = True
+                save_launcher_settings(self.master.settings)
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "Запрос отправлен",
+                "Запрос на добавление правила передан Windows. Если появится запрос UAC, подтвердите его. "
+                ".",
+                parent=self
+            )
+        else:
+            messagebox.showwarning(
+                "Не удалось запросить разрешение",
+                "Не удалось запустить добавление правила. Проверьте настройки брандмауэра Windows "
+                "и права администратора.",
+                parent=self
+            )
+
     def create_widgets(self):
         main_frame = ctk.CTkFrame(self, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
@@ -5819,7 +5870,7 @@ class ChatWindow(ctk.CTkToplevel):
                                                    fg_color="#201d30", hover_color="#3d3a52",
                                                    font=ctk.CTkFont(size=18, weight="bold"))
             self.prev_chat_btn.pack(side="left", padx=(0, 8))
-
+#«Частная сеть»
             self.contact_avatar_lbl = ctk.CTkLabel(
                 left_header, image=make_avatar_image(self.personal_contact.get("name") or "?", size=38), text="")
             self.contact_avatar_lbl.pack(side="left", padx=(0, 10))
@@ -5856,6 +5907,18 @@ class ChatWindow(ctk.CTkToplevel):
                                             font=ctk.CTkFont(size=12),
                                             text_color="#6d92ff")
         self.msg_count_label.pack(side="left", padx=(10, 0))
+
+        # Явная кнопка в самом окне чата для выдачи разрешения в брандмауэре.
+        if sys.platform == "win32":
+            self.firewall_permission_btn = make_sound_button(
+                right_header,
+                text="Разрешить в брандмауэре",
+                command=self.request_private_network_permission,
+                width=190, height=30,
+                fg_color="#3a3850", hover_color="#5b8ef0",
+                text_color="#e0ddf0", font=ctk.CTkFont(size=11)
+            )
+            self.firewall_permission_btn.pack(side="left", padx=(10, 0))
 
         ctk.CTkFrame(main_frame, height=2, fg_color="#6d92ff").pack(fill="x", pady=(0, 10))
 
@@ -7041,22 +7104,8 @@ class ChatWindow(ctk.CTkToplevel):
 
     def show_chat_help(self):
         self._append_plain_lines([
-            "📖 Что тут вообще умеет чат:",
-            "  /roll [20 | 2d6]  — кинуть кубик (без параметров — обычный d6)",
-            "  /flip  — подбросить монетку, пусть судьба решает",
-            "  /choose пицца | суши | шаурма  — выберу за вас, не вопрос",
-            "  /time  — сказать, сколько сейчас у тебя времени",
-            "  /me пошёл за едой  — выйдет «* Ник пошёл за едой»      /shrug [текст]  — ¯\\_(ツ)_/¯",
-            "  /search слово  — найти в переписке (или Ctrl+F)      /copy  — скопировать последнее сообщение",
-            "  /clear  — почистить чат      /export  — сохранить переписку в файл",
-            "  /mute и /unmute  — заглушить этот чат или вернуть уведомления",
-            "  ↑ / ↓ в поле ввода  — достать то, что уже писал",
-            "  @ник в сообщении  — человеку придёт уведомление, а строка подсветится",
-            "  Ссылки в чате кликаются, а по правой кнопке мыши можно копировать",
-            "  &&download-all-file=(ссылка)  — предложить всем в комнате скачать файл",
-            "  &&download-all-file-start=(ссылка)  — то же, но после скачивания получателю предложат ЗАПУСТИТЬ файл (с диалогом Да/Нет)",
-            "  &&screen-share-Ник  — попросить у «Ника» разрешение посмотреть его экран и управлять мышью/клавиатурой",
-            "  &&screen-share-stop  — остановить текущую трансляцию (свою или ту, что смотришь)",
+            "📖 Что тут вообще умеет чат:(это толька для разраба иди отсюда)",
+
             "━" * 50,
         ])
 
@@ -8963,8 +9012,8 @@ def run_game_shortcut(version, account):
 # Microsoft/Minecraft и не меняет лицензионные аккаунты.
 # Google OAuth для 67Launcher. Для desktop-приложений Google не считает
 # client_secret конфиденциальным: его нельзя надёжно скрыть внутри клиента.
-GOOGLE_CLIENT_ID = "############"
-GOOGLE_CLIENT_SECRET = "###########"
+GOOGLE_CLIENT_ID = "sssssss"
+GOOGLE_CLIENT_SECRET = "sssss"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -13894,6 +13943,40 @@ class LauncherApp(ctk.CTk):
                      font=ctk.CTkFont(size=10), text_color="#8b87a3",
                      wraplength=520, justify="center").pack(pady=(0, 8), padx=10)
 
+        # Кнопка в окне «Настройка чата», отдельной строкой под блоком релея.
+        def request_chat_private_network_permission():
+            if sys.platform != "win32":
+                messagebox.showinfo("Брандмауэр Windows", "Запрос доступен только в Windows.", parent=dialog)
+                return
+            allowed = messagebox.askyesno(
+                "Разрешение для чата",
+                "Попытаться разрешить входящие подключения 67Launcher в профиле Windows «Частная сеть»?\n\n"
+                ".",
+                parent=dialog,
+            )
+            if not allowed:
+                return
+            if add_firewall_rule():
+                messagebox.showinfo(
+                    "Запрос передан Windows",
+                    "Запущен запрос на добавление правила брандмауэра. Если появится окно UAC, подтвердите его. "
+                    "Сам запуск запроса не гарантирует, что правило уже добавлено.", parent=dialog)
+            else:
+                messagebox.showwarning(
+                    "Не удалось запросить разрешение",
+                    "Не удалось запустить запрос брандмауэра.", parent=dialog)
+
+        private_network_row = ctk.CTkFrame(group_container, fg_color="transparent")
+        private_network_row.pack(fill="x", pady=(0, 10))
+        private_network_btn = make_sound_button(
+            private_network_row,
+            text="Разрешить доступ к частным сетям",
+            command=request_chat_private_network_permission,
+            fg_color="#2b2840", hover_color="#3d3a52", text_color="#e5e2f0",
+            height=34, font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        private_network_btn.pack(anchor="center")
+
         instr_frame = ctk.CTkFrame(group_container, fg_color="#201d30", corner_radius=10)
         instr_frame.pack(fill="x", pady=(0, 10))
 
@@ -15580,3 +15663,4 @@ if __name__ == "__main__":
             else:
                 try: input("\nНажмите Enter для выхода...")
                 except Exception: pass
+#чат
